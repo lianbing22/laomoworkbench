@@ -14,7 +14,7 @@ An unofficial product layer for [DeepSeek Harness](https://github.com/deepseek-a
 
 <p align="center">
   <a href="https://github.com/asen-goat-mine/boujoy-harness/releases/download/demo-2026-08-19/Boujoy-Harness-Demo.mp4">
-    <img src="https://github.com/asen-goat-mine/boujoy-harness/releases/download/demo-2026-08-19/Boujoy-Harness-UI-Preview.gif" alt="Animated Boujoy Harness UI demo. Click for the full video." width="900">
+    <img src="docs/assets/harness-demo.gif" alt="Animated Boujoy Harness UI demo. Click for the full video." width="900">
   </a>
 </p>
 

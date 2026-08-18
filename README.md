@@ -14,7 +14,7 @@
 
 <p align="center">
   <a href="https://github.com/asen-goat-mine/boujoy-harness/releases/download/demo-2026-08-19/Boujoy-Harness-Demo.mp4">
-    <img src="https://github.com/asen-goat-mine/boujoy-harness/releases/download/demo-2026-08-19/Boujoy-Harness-UI-Preview.gif" alt="Boujoy Harness UI 动态演示。点击观看完整视频。" width="900">
+    <img src="docs/assets/harness-demo.gif" alt="Boujoy Harness UI 动态演示。点击观看完整视频。" width="900">
   </a>
 </p>
 
