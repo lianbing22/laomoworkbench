@@ -42,8 +42,11 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
+import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -251,14 +254,14 @@ class MissionLoopTest(unittest.TestCase):
 
     # -- mission lifecycle conveniences --
     def create_mission(self, objective=DEFAULT_OBJECTIVE, acceptance=None,
-                       options=None, cwd=None, mgr=None):
+                       options=None, cwd=None, mgr=None, verification=None):
         mgr = mgr or self.mgr
         try:
             result = mgr.create(objective, cwd=cwd, acceptance_criteria=acceptance,
-                                options=options)
+                                options=options, verification=verification)
         except TypeError:  # parameter naming variant (acceptanceCriteria)
             result = mgr.create(objective, cwd=cwd, acceptanceCriteria=acceptance,
-                                options=options)
+                                options=options, verification=verification)
         mid = mission_id_of(result)
         self.assertTrue(mid, "create() 应返回含 id 的 mission 摘要: %r" % (result,))
         self.track(mid, mgr=mgr)
@@ -715,9 +718,22 @@ class TestCrashResume(MissionLoopTest):
         self.assertGreaterEqual(len(job_files), 1)
         job_path = job_files[0]
         job = self.read_json(job_path)
-        # simulate "the background job outlived the gateway crash": pin the
-        # pid to this very test process so recover() must see a live pid
-        job["pid"] = os.getpid()
+        # simulate "the background job outlived the gateway crash": pin a
+        # consistent pid+pgid+start identity onto a dedicated live process so
+        # recover() must see a live, *matching* pid (an identity mismatch
+        # means the pid was recycled and the job is treated as lost). The
+        # standin must be its own process group: cancel/terminate would
+        # SIGKILL it and must never touch the test runner.
+        standin = subprocess.Popen(["sleep", "60"], start_new_session=True)
+        self.addCleanup(lambda: standin.poll() is not None or standin.kill())
+        job["pid"] = standin.pid
+        job["pgid"] = os.getpgid(standin.pid)
+        try:
+            job["startIdentity"] = subprocess.run(
+                ["ps", "-o", "lstart=", "-p", str(standin.pid)],
+                capture_output=True, text=True, timeout=5).stdout.strip()
+        except OSError:
+            job["startIdentity"] = ""
         tmp = Path(str(job_path) + ".tmp")
         tmp.write_text(json.dumps(job, ensure_ascii=False), encoding="utf-8")
         os.replace(tmp, job_path)
@@ -760,6 +776,450 @@ class TestDoneTripleGate(MissionLoopTest):
         events = self.read_ndjson(self.mdir(mid) / "events.ndjson")
         self.assertFalse(any(e.get("type") == "final-verdict" for e in events),
                          "不应出现 final-verdict 事件")
+
+
+# ------------------------------------------------------------------ P1.1 suite
+
+
+def _truly_dead(pid):
+    """A pid that is gone or a zombie counts as dead (kernel-level exit)."""
+    try:
+        out = subprocess.run(["ps", "-o", "state=", "-p", str(pid)],
+                             capture_output=True, text=True, timeout=3)
+        state = out.stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        state = ""
+    return state == "" or state.startswith("Z")
+
+
+def _killpg_quiet(pgid):
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except (OSError, ProcessLookupError):
+        pass
+
+
+class TestBlockedTerminalGate(MissionLoopTest):
+    def test_14_blocked_is_real_terminal(self):
+        self.adapter.script("evaluator", verdict_block("BLOCKED", ["外部依赖不可用"]))
+        mid = self.create_mission()
+        self.mgr.start(mid)
+        self.assertTrue(self.wait_state(self.mgr, mid, ["blocked"]),
+                        "BLOCKED 应到达 blocked 终态，实际: %s" % self.state_vals(self.mgr, mid))
+        for op, name in ((self.mgr.start, "start"), (self.mgr.pause, "pause"),
+                         (self.mgr.cancel, "cancel")):
+            with self.assertRaises(MissionError, msg="终态后 %s 必须拒绝" % name):
+                op(mid)
+        fresh = MissionManager(FakeAdapter(), self.root)
+        self.assertEqual(fresh.recover(), [], "终态不应被 recover 继续推进")
+        self.assertIsNone((fresh.list() or {}).get("activeId"))
+        self.assertTrue(self.reason_has(self.mgr, mid, "blocked", "block"),
+                        "stopReason 应指明 BLOCKED: %r" % self.stop_reason(self.mgr, mid))
+
+
+class TestJobLifecycleOwnership(MissionLoopTest):
+    def test_15_cancel_terminates_waiting_job_process(self):
+        self.adapter.script("worker", job_block("sleep 60", reason="长跑作业"))
+        mid = self.create_mission()
+        self.mgr.start(mid)
+        self.assertTrue(self.wait_state(self.mgr, mid, ["waiting"]))
+        job_path = self.sub_files(mid, "jobs", "*.json")[0]
+        job = self.read_json(job_path)
+        self.assertEqual(job.get("status"), "running")
+        pid, pgid = int(job.get("pid") or 0), int(job.get("pgid") or 0)
+        self.assertGreater(pid, 0)
+        self.assertTrue(job.get("startIdentity"), "作业应记录 start identity")
+        self.assertTrue(job.get("commandHash"), "作业应记录 command hash")
+        self.mgr.cancel(mid)
+        self.assertTrue(self.wait_state(self.mgr, mid, ["cancelled"]))
+        self.assertTrue(self.wait_until(lambda: _truly_dead(pid),
+                                        timeout=10, desc="job 进程彻底退出"),
+                        "cancel 后作业进程必须真正死亡 (pid=%s pgid=%s)" % (pid, pgid))
+        for j in self.mgr.status(mid)["mission"]["jobs"]:
+            if j["jobId"] == job["jobId"]:
+                self.assertEqual(j.get("status"), "cancelled")
+                self.assertIn(j.get("exitKind"), ("terminated", "exited"))
+                break
+        else:
+            self.fail("cancel 后作业记录应保留")
+        self.assertEqual((self.mgr.list() or {}).get("activeId"), None)
+
+    def test_16_job_failed_exit_persisted(self):
+        self.adapter.script("worker", job_block("exit 5", reason="会失败的作业"),
+                            handoff_text())
+        mid = self.create_mission()
+        self.mgr.start(mid)
+        self.assertTrue(self.wait_state(self.mgr, mid, ["done"], timeout=20),
+                        "作业失败应被当成一次唤醒继续走完，实际: %s" % self.state_vals(self.mgr, mid))
+        job = self.read_json(self.sub_files(mid, "jobs", "*.json")[0])
+        self.assertEqual(job.get("status"), "failed")
+        self.assertEqual(job.get("exitCode"), 5)
+        self.assertEqual(job.get("exitKind"), "exited")
+
+    def test_17_job_orphaned_when_died_while_paused(self):
+        self.adapter.script("worker", job_block("sleep 60", reason="长跑作业"))
+        mid = self.create_mission()
+        self.mgr.start(mid)
+        self.assertTrue(self.wait_state(self.mgr, mid, ["waiting"]))
+        job = self.read_json(self.sub_files(mid, "jobs", "*.json")[0])
+        pid = int(job["pid"])
+        self.addCleanup(lambda: _killpg_quiet(int(job.get("pgid") or pid)))
+        self.mgr.pause(mid)
+        self.assertTrue(self.wait_state(self.mgr, mid, ["paused"]))
+
+        def threads_dead():
+            runner = self.mgr._runners.get(mid)
+            watcher = self.mgr._watchers.get(mid)
+            return ((runner is None or not runner.is_alive())
+                    and (watcher is None or not watcher.is_alive()))
+
+        self.assertTrue(self.wait_until(threads_dead, timeout=10,
+                                        desc="runner 与 watcher 线程完全退出"),
+                        "暂停后 runner/watcher 线程必须退出（不再观察作业）")
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+        self.assertTrue(self.wait_until(lambda: _truly_dead(pid), timeout=8,
+                                        desc="job 进程死亡"),
+                        "kill 后作业进程必须真正死亡")
+        # job finished while paused: resume must wake immediately, not hang
+        self.mgr.resume(mid)
+        self.assertTrue(self.wait_until(
+            lambda: self.read_json(self.sub_files(mid, "jobs", "*.json")[0]).get("status") == "orphaned",
+            timeout=8, desc="作业标记 orphaned"),
+            "暂停期间死亡的作业应标记 orphaned（当前: %s）"
+            % self.read_json(self.sub_files(mid, "jobs", "*.json")[0]).get("status"))
+        self.assertTrue(self.wait_state(self.mgr, mid, ["done"], timeout=20),
+                        "resume 后应继续直至 done，实际: %s" % self.state_vals(self.mgr, mid))
+
+    def test_18_waiting_pause_keeps_job_running_resume_reattaches(self):
+        self.adapter.script("worker", job_block("sleep 60", reason="长跑作业"))
+        mid = self.create_mission()
+        self.mgr.start(mid)
+        self.assertTrue(self.wait_state(self.mgr, mid, ["waiting"]))
+        job = self.read_json(self.sub_files(mid, "jobs", "*.json")[0])
+        pid = int(job["pid"])
+        self.addCleanup(lambda: _killpg_quiet(int(job.get("pgid") or pid)))
+        self.mgr.pause(mid)
+        self.assertTrue(self.wait_state(self.mgr, mid, ["paused"]))
+        time.sleep(1.0)
+        self.assertFalse(_truly_dead(pid), "暂停不终止后台作业")
+        self.mgr.resume(mid)
+        self.assertTrue(self.wait_state(self.mgr, mid, ["waiting"], timeout=10),
+                        "resume 后应回 waiting（watcher 重新挂上），实际: %s" % self.state_vals(self.mgr, mid))
+        time.sleep(1.0)
+        self.assertIn("waiting", self.state_vals(self.mgr, mid),
+                      "等待中不得自行推进; 实际: %s" % self.state_vals(self.mgr, mid))
+        # now let the watcher do its job: kill the job -> mission wakes
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+        self.assertTrue(self.wait_state(self.mgr, mid, ["done"], timeout=20),
+                        "resume 后 watcher 应重新生效，实际: %s" % self.state_vals(self.mgr, mid))
+
+
+class TestCrashRecoveryIdentity(MissionLoopTest):
+    def test_19_pid_reuse_detected_and_job_orphaned(self):
+        self.adapter.script("worker", job_block("sleep 60", reason="跨重启作业"))
+        mid = self.create_mission()
+        self.mgr.start(mid)
+        self.assertTrue(self.wait_state(self.mgr, mid, ["waiting"]))
+        job_path = self.sub_files(mid, "jobs", "*.json")[0]
+        job = self.read_json(job_path)
+        real_pid, real_pgid = int(job["pid"]), int(job.get("pgid") or job["pid"])
+        self.addCleanup(lambda: _killpg_quiet(real_pgid))
+        # the pid got recycled: a live process that is NOT ours
+        standin = subprocess.Popen(["sleep", "60"], start_new_session=True)
+        self.addCleanup(lambda: standin.poll() is not None or standin.kill())
+        job["pid"] = standin.pid
+        job["pgid"] = os.getpgid(standin.pid)
+        job["startIdentity"] = "Wed Jan  1 00:00:00 1970"
+        tmp = Path(str(job_path) + ".tmp")
+        tmp.write_text(json.dumps(job, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, job_path)
+        # old control plane's runner+watcher are out of the picture before the
+        # fresh one recovers (the old runner would otherwise sit parked)
+        old_runner = self.mgr._runners.get(mid)
+        if old_runner:
+            old_runner.request_stop()
+
+        fresh = MissionManager(self.adapter, self.root)
+        self.addCleanup(self._cancel_quiet, fresh, mid)
+        fresh.recover()
+        self.assertTrue(self.wait_until(
+            lambda: self.read_json(job_path).get("status") == "orphaned",
+            timeout=8, desc="PID 复用应标记 orphaned"),
+            "identity 不匹配的 pid 不得被当作存活作业（当前: %s）"
+            % self.read_json(job_path).get("status"))
+        self.assertTrue(self.wait_until(
+            lambda: self.read_json(self.mdir(mid) / "state.json").get("waitingJobId") is None,
+            timeout=8, desc="mission 离开 waiting"),
+            "PID 复用后 mission 应立即被唤醒，实际: %s" % self.state_vals(fresh, mid))
+
+
+class TestTimeBudget(MissionLoopTest):
+    def test_20_time_buckets_invariant_after_done(self):
+        mid = self.create_mission()
+        self.mgr.start(mid)
+        self.assertTrue(self.wait_state(self.mgr, mid, ["done"], timeout=20))
+        st = self.read_json(self.mdir(mid) / "state.json")
+        for key in ("wallElapsedMs", "agentActiveMs", "waitingMs", "pausedMs"):
+            self.assertIn(key, st, "状态桶 %s 必须持久化" % key)
+            self.assertGreaterEqual(int(st.get(key, 0) or 0), 0)
+        self.assertEqual(int(st["wallElapsedMs"]),
+                         int(st["agentActiveMs"]) + int(st["waitingMs"]),
+                         "wall = agent + waiting（paused 单独计）")
+        time_in_summary = self.status_of(self.mgr, mid)["time"]
+        self.assertEqual(int(time_in_summary["wallElapsedMs"]), int(st["wallElapsedMs"]))
+
+    def test_21_paused_time_excluded_from_wall_budget(self):
+        self.adapter.script("worker", job_block("sleep 60", reason="长跑作业"))
+        # wall budget of 2s would be blown instantly by a 2.5s pause if
+        # paused time counted against the mission wall clock
+        mid = self.create_mission(options={"maxWallTimeSec": 2})
+        self.mgr.start(mid)
+        self.assertTrue(self.wait_state(self.mgr, mid, ["waiting"]))
+        self.mgr.pause(mid)
+        self.assertTrue(self.wait_state(self.mgr, mid, ["paused"]))
+        time.sleep(2.5)
+        self.mgr.resume(mid)
+        self.assertTrue(self.wait_state(self.mgr, mid, ["waiting"], timeout=10))
+        self.mgr.cancel(mid)
+        self.assertTrue(self.wait_state(self.mgr, mid, ["cancelled"]))
+        self.assertNotIn("failed", self.state_vals(self.mgr, mid),
+                         "暂停不得消耗 wall budget，实际: %s" % self.state_vals(self.mgr, mid))
+        t = self.status_of(self.mgr, mid)["time"]
+        self.assertGreaterEqual(int(t["pausedMs"]), 2000, "pausedMs 应覆盖暂停时长")
+        self.assertLess(int(t["wallElapsedMs"]), 2000,
+                        "wallElapsedMs 不应包含暂停时间: %s" % t)
+
+
+class TestNoProgressPersist(MissionLoopTest):
+    def test_22_no_progress_survives_restart(self):
+        self.adapter.set_default("evaluator",
+                                 verdict_block("NEEDS_WORK", ["未见进展"], repair="请继续"))
+        mid = self.create_mission(options={"maxNoProgressCycles": 2})
+        # freeze the 3rd evaluator turn so we can pause mid-flight with the
+        # no-progress counter already >= 1 on disk (persisted at eval #2)
+        n = {"e": 0}
+        frozen = threading.Event()
+        release = threading.Event()
+
+        def hook(role, prompt):
+            if role == "evaluator":
+                n["e"] += 1
+                if n["e"] == 3:
+                    frozen.set()
+                    release.wait(timeout=15)
+
+        self.adapter.hook = hook
+        self.mgr.start(mid)
+        self.assertTrue(self.wait_until(lambda: frozen.is_set(), timeout=30,
+                                        desc="第 3 次 evaluation 被冻结"))
+        st = self.read_json(self.mdir(mid) / "state.json")
+        no_before = int(st.get("noProgress") or 0)
+        self.assertGreaterEqual(no_before, 1,
+                                "no-progress 计数应先持久化到磁盘（当前 %s）" % no_before)
+        self.assertTrue(st.get("progressSignature"), "progressSignature 应持久化")
+        self.mgr.pause(mid)   # control plane stops the in-flight runner
+        self.assertTrue(self.wait_state(self.mgr, mid, ["paused"]))
+        runner = self.mgr._runners.get(mid)
+        self.adapter.hook = None   # no more freezes on the post-release turns
+        release.set()
+        if runner:
+            runner.join(timeout=15)
+            self.assertFalse(runner.is_alive(), "释放后 runner 必须退出（暂停即停）")
+
+        fresh = MissionManager(self.adapter, self.root)
+        self.addCleanup(self._cancel_quiet, fresh, mid)
+        fresh.resume(mid)     # crash-recovery: same adapter, fresh control plane
+        self.assertTrue(self.wait_state(fresh, mid, ["failed"], timeout=20),
+                        "重启后无进展熔断应继续生效，实际: %s" % self.state_vals(fresh, mid))
+        st2 = self.read_json(self.mdir(mid) / "state.json")
+        self.assertGreaterEqual(int(st2.get("noProgress") or 0), no_before,
+                                "重启后计数器不得回退（%s -> %s）"
+                                % (no_before, st2.get("noProgress")))
+        self.assertLessEqual(int(st2.get("noProgress") or 0), no_before + 1,
+                             "重启后最多再计一轮: %s" % st2.get("noProgress"))
+        self.assertIn("无进展", self.stop_reason(fresh, mid))
+
+
+class TestHarnessVerificationGate(MissionLoopTest):
+    def test_23_machine_gate_fail_blocks_done_then_fix_passes(self):
+        marker = self.root / "marker.txt"
+
+        def fix(prompt):
+            if "机器验收未通过" in prompt:
+                marker.write_text("ok", encoding="utf-8")
+            return handoff_text()
+
+        self.adapter.script("worker", handoff_text(), fix)
+        self.adapter.set_default("evaluator", verdict_block("PASS", ["条件满足"]))
+        mid = self.create_mission(cwd=str(self.root), verification={
+            "commands": ["test -f marker.txt"],
+            "requiredFiles": ["marker.txt"],
+        })
+        self.mgr.start(mid)
+        self.assertTrue(self.wait_state(self.mgr, mid, ["done"], timeout=30),
+                        "修复后机器门禁应最终 PASS 并 DONE，实际: %s" % self.state_vals(self.mgr, mid)
+                        + " | " + self.stop_reason(self.mgr, mid))
+        st = self.read_json(self.mdir(mid) / "state.json")
+        self.assertEqual(st.get("verifyResult"), "pass")
+        final = self.sub_files(mid, "verdicts", "final.json")
+        self.assertTrue(final, "final evaluator 应运行过（fresh final 门禁）")
+        results = self.read_json(self.sub_files(mid, "verification", "results.json")[0])
+        self.assertTrue(results.get("passed"), "最终机器门禁应为 PASS")
+
+    def test_24_machine_gate_fail_forever_never_done(self):
+        self.adapter.set_default("evaluator", verdict_block("PASS", ["条件满足"]))
+        mid = self.create_mission(cwd=str(self.root), verification={
+            "commands": ["exit 9", "echo hi"],
+            "requiredFiles": ["nope-missing.txt"],
+        })
+        self.mgr.start(mid)
+        self.assertTrue(self.wait_state(self.mgr, mid, ["failed"], timeout=30),
+                        "机器门禁永远失败时不得 DONE，实际: %s" % self.state_vals(self.mgr, mid)
+                        + " | " + self.stop_reason(self.mgr, mid))
+        self.assertNotIn("done", self.state_vals(self.mgr, mid))
+        st = self.read_json(self.mdir(mid) / "state.json")
+        self.assertEqual(st.get("verifyResult"), "fail")
+        self.assertFalse(self.sub_files(mid, "verdicts", "final.json"),
+                         "机器门禁未过不得跑 final evaluator")
+        results = self.read_json(self.sub_files(mid, "verification", "results.json")[0])
+        self.assertFalse(results.get("passed"))
+        by_key = {(c["kind"], c["name"]): c for c in results["checks"]}
+        cmd = by_key[("command", "exit 9")]
+        self.assertEqual(cmd.get("exitCode"), 9)
+        for field in ("command", "stdoutTail", "stderrTail", "startedAt", "endedAt", "resultHash"):
+            self.assertIn(field, cmd, "每个检查结果必须包含完整字段 %s" % field)
+        self.assertEqual(cmd.get("passed"), False)
+        self.assertIn("hi", by_key[("command", "echo hi")].get("stdoutTail", ""))
+        self.assertIn("missing", by_key[("file", "nope-missing.txt")].get("error", ""))
+        self.assertTrue(self.sub_files(mid, "verification", "raw/*.stdout"),
+                        "原始 stdout 应保留")
+
+    def test_25_http_check_gate(self):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(302 if self.path.startswith("/redirect") else 200)
+                self.end_headers()
+                self.wfile.write(b"ok")
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        ok_url = "http://127.0.0.1:%d/" % server.server_port
+        self.adapter.set_default("evaluator", verdict_block("PASS", ["ok"]))
+        mid = self.create_mission(cwd=str(self.root),
+                                  verification={"httpChecks": [{"url": ok_url}]})
+        self.mgr.start(mid)
+        self.assertTrue(self.wait_state(self.mgr, mid, ["done"], timeout=20),
+                        "HTTP 检查通过应 DONE，实际: %s" % self.state_vals(self.mgr, mid))
+        results = self.read_json(self.sub_files(mid, "verification", "results.json")[0])
+        self.assertTrue(results["checks"][0]["passed"] and results["checks"][0]["kind"] == "http")
+
+
+class TestEvidenceManifest(MissionLoopTest):
+    def test_26_manifest_at_done_with_hashes_immutable(self):
+        artifact = self.root / "artifact.txt"
+        artifact.write_text("v1", encoding="utf-8")
+        mid = self.create_mission(cwd=str(self.root),
+                                  verification={"requiredFiles": ["artifact.txt"]})
+        self.mgr.start(mid)
+        self.assertTrue(self.wait_state(self.mgr, mid, ["done"], timeout=20))
+        manifest_path = self.mdir(mid) / "evidence" / "manifest.json"
+        self.assertTrue(self.wait_until(lambda: manifest_path.is_file(),
+                                        timeout=5, desc="manifest 生成"),
+                        "DONE 后 evidence manifest 应在数毫秒内落盘")
+        manifest = self.read_json(manifest_path)
+        self.assertEqual(manifest.get("state"), "done")
+        entries = manifest.get("entries") or {}
+        for rel in ("mission.json", "state.json", "plan.json",
+                    "verification/results.json", "artifact/artifact.txt"):
+            self.assertIn(rel, entries, "manifest 应包含 %s（实际有 %s）"
+                          % (rel, ", ".join(sorted(entries))))
+        for rel, entry in entries.items():
+            self.assertIn("path", entry)
+            self.assertIn("sha256", entry, "条目 %s 缺少 sha256" % rel)
+            self.assertIn("generatedAt", entry, "条目 %s 缺少 generatedAt" % rel)
+            if entry.get("sha256"):
+                self.assertEqual(len(entry["sha256"]), 64)
+        # immutability: nothing may rewrite the manifest after DONE
+        before = json.dumps(manifest, sort_keys=True, ensure_ascii=False)
+        artifact.write_text("v2", encoding="utf-8")
+        after = json.dumps(self.read_json(manifest_path), sort_keys=True, ensure_ascii=False)
+        self.assertEqual(before, after, "DONE 后 manifest 不得被后续变更覆盖")
+        self.assertEqual(entries["artifact/artifact.txt"].get("sha256"),
+                         manifest["sha256"] and entries["artifact/artifact.txt"]["sha256"])
+
+
+class TestShutdownGate(MissionLoopTest):
+    def test_27_terminal_mission_rejects_all_operations(self):
+        mid = self.create_mission()
+        self.mgr.start(mid)
+        self.assertTrue(self.wait_state(self.mgr, mid, ["done"], timeout=20))
+        for op, name in ((self.mgr.start, "start"), (self.mgr.pause, "pause"),
+                         (self.mgr.cancel, "cancel")):
+            with self.assertRaises(MissionError, msg="DONE 后 %s 必须拒绝" % name):
+                op(mid)
+        fresh = MissionManager(FakeAdapter(), self.root)
+        self.assertEqual(fresh.recover(), [], "DONE 后 recover 必须跳过")
+        self.assertEqual((fresh.list() or {}).get("activeId"), None)
+        # no managed job may still be alive after DONE terminal
+        jobs = self.mgr.status(mid)["mission"]["jobs"]
+        self.assertFalse(any(j.get("status") == "running" for j in jobs),
+                         "终态不得残留 running 作业")
+
+
+class TestWatcherReattachReap(MissionLoopTest):
+    """A watcher re-attached after pause/resume has no Popen handle; it must
+    still record the REAL exit status via waitpid (we are the parent) instead
+    of failing a healthy exit with exitCode=null (caught live in Gate A)."""
+
+    def _reattach_job(self, command):
+        self.adapter.script("worker", job_block(command, reason="重挂作业"))
+        mid = self.create_mission()
+        self.mgr.start(mid)
+        self.assertTrue(self.wait_state(self.mgr, mid, ["waiting"]))
+        job_path = self.sub_files(mid, "jobs", "*.json")[0]
+        job = self.read_json(job_path)
+        self.mgr.pause(mid)
+        self.assertTrue(self.wait_state(self.mgr, mid, ["paused"]))
+        time.sleep(1.0)  # let the runner/watcher fully stop before re-attach
+        self.mgr.resume(mid)
+        self.assertTrue(self.wait_state(self.mgr, mid, ["waiting"], timeout=10),
+                        "resume 后 watcher 必须重挂 job=%s" % job["jobId"])
+        return job_path, job
+
+    def test_28a_reattached_watcher_reaps_killed_exit_code(self):
+        job_path, job = self._reattach_job("sleep 60")
+        os.kill(int(job["pid"]), signal.SIGKILL)
+        self.assertTrue(self.wait_until(
+            lambda: self.read_json(job_path).get("status") == "failed", timeout=10,
+            desc="kill -9 后标记 failed"),
+            "重挂 watcher 后作业被杀应标记 failed")
+        j = self.read_json(job_path)
+        self.assertEqual(j.get("exitCode"), 137, "waitpid 必须取到真实退出码 128+9")
+        self.assertFalse(j.get("exitUnknown"), "同进程可回收退出码，不得标 unknown")
+        self.assertEqual(j.get("exitKind"), "exited")
+
+    def test_28b_reattached_watcher_natural_exit_completed(self):
+        job_path, job = self._reattach_job("sleep 8")
+        self.assertTrue(self.wait_until(
+            lambda: self.read_json(job_path).get("status") == "completed",
+            timeout=20, desc="自然退出应为 completed"),
+            "重挂 watcher 后健康退出必须 completed，而不是 failed/null")
+        j = self.read_json(job_path)
+        self.assertEqual(j.get("exitCode"), 0)
+        self.assertFalse(j.get("exitUnknown"))
+        self.assertEqual(j.get("exitKind"), "exited")
 
 
 if __name__ == "__main__":

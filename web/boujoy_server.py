@@ -1827,7 +1827,8 @@ class BoujoyHandler(BaseHTTPRequestHandler):
                     result = mgr.create(str(payload.get("objective") or ""),
                                         cwd=payload.get("cwd"),
                                         acceptance_criteria=payload.get("acceptanceCriteria"),
-                                        options=payload.get("options"))
+                                        options=payload.get("options"),
+                                        verification=payload.get("verification") or {})
                 elif action in ("start", "pause", "resume", "cancel"):
                     result = getattr(mgr, action)(str(payload.get("id") or ""))
                 else:

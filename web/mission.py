@@ -20,17 +20,22 @@ import hashlib
 import json
 import os
 import re
+import signal
 import subprocess
 import threading
 import time
+import urllib.parse
+import urllib.request
 import uuid
 from pathlib import Path
 from typing import Any, Callable
 
 RUNS_DIRNAME = ".laomo/runs"
-TERMINAL_STATES = {"done", "failed", "cancelled"}
+TERMINAL_STATES = {"done", "failed", "cancelled", "blocked"}
 ACTIVE_STATES = {"planning", "running", "waiting", "evaluating", "repairing",
-                 "replanning", "verifying", "paused"}
+                 "replanning", "verification", "verifying", "paused"}
+JOB_STATES = {"running", "completed", "failed", "cancelled", "orphaned"}
+ALL_PHASES = ACTIVE_STATES | TERMINAL_STATES | {"draft"}
 
 DEFAULT_STOP_POLICY = {
     "maxRepairPerTask": 3,
@@ -43,6 +48,9 @@ WORKER_TURN_TIMEOUT = 1800     # idle-tolerant: legit build turns run long
 EVALUATOR_TURN_TIMEOUT = 600   # 10 min
 JOB_POLL_INTERVAL = 2.0
 JOB_WAKE_GRACE = 300           # seconds past expectedWakeAt before forced wake
+JOB_TERMINATE_GRACE = 6.0      # SIGTERM -> SIGKILL window for managed jobs
+VERIFY_CMD_TIMEOUT = 120       # per-command timeout in the machine gate
+VERIFY_TAIL = 2000             # characters kept per stdout/stderr tail
 
 
 class MissionError(Exception):
@@ -106,10 +114,11 @@ class MissionStore:
         self.verdicts_dir = run_root / "verdicts"
         self.repairs_dir = run_root / "repairs"
         self.jobs_dir = run_root / "jobs"
+        self.verification_dir = run_root / "verification"
 
     def ensure_dirs(self) -> None:
         for d in (self.checkpoints_dir, self.evidence_dir, self.verdicts_dir,
-                  self.repairs_dir, self.jobs_dir):
+                  self.repairs_dir, self.jobs_dir, self.verification_dir):
             d.mkdir(parents=True, exist_ok=True)
 
     # -- mission (immutable) --
@@ -185,13 +194,146 @@ class MissionStore:
     def job_log(self, job_id: str) -> Path:
         return self.jobs_dir / f"{job_id}.log"
 
+    def list_jobs(self) -> list[dict[str, Any]]:
+        if not self.jobs_dir.is_dir():
+            return []
+        out = []
+        for p in sorted(self.jobs_dir.glob("*.json")):
+            job = _load_json(p, None)
+            if job:
+                out.append(job)
+        return out
+
+    def evidence_manifest(self) -> dict[str, Any] | None:
+        return _load_json(self.evidence_dir / "manifest.json", None)
+
+    def write_evidence_manifest(self, manifest: dict[str, Any]) -> None:
+        self.evidence_dir.mkdir(parents=True, exist_ok=True)
+        _atomic_write(self.evidence_dir / "manifest.json",
+                      json.dumps(manifest, ensure_ascii=False, indent=1))
+
+    def verification_results(self) -> dict[str, Any] | None:
+        return _load_json(self.verification_dir / "results.json", None)
+
+
+# --- process identity -------------------------------------------------------------
+
+
+def _ps_probe(pid: int) -> dict[str, str]:
+    """One ps call: -> {'state': 'S'|'Z'|'R'..., 'lstart': '...'}.
+    Empty values mean "no such process"; Z means zombie (dead, unreaped)."""
+    try:
+        out = subprocess.run(["ps", "-o", "state=,lstart=", "-p", str(pid)],
+                             capture_output=True, text=True, timeout=5)
+        line = out.stdout.strip()
+        if out.returncode != 0 or not line:
+            return {"state": "", "lstart": ""}
+        parts = line.split(None, 1)
+        return {"state": parts[0] if parts else "",
+                "lstart": parts[1] if len(parts) > 1 else ""}
+    except (OSError, subprocess.TimeoutExpired):
+        return {"state": "", "lstart": ""}
+
+
+def _ps_start_identity(pid: int) -> str:
+    """macOS/Linux per-process start identity (lstart). Empty when unknown."""
+    return _ps_probe(pid)["lstart"]
+
+
+def _process_identity(job: dict[str, Any]) -> dict[str, Any]:
+    """Verify a managed job's process is really the one we started.
+
+    os.kill(pid, 0) alone is not enough: the pid may have been recycled, or
+    the process may be an unreaped zombie. We check the ps state + process
+    group + start identity (lstart). A mismatch is treated as 'not our job' —
+    callers must NOT attach a watcher or kill.
+    """
+    pid = int(job.get("pid") or 0)
+    if not pid:
+        return {"alive": False, "reason": "no-pid"}
+    probe = _ps_probe(pid)
+    if not probe["state"]:
+        return {"alive": False, "reason": "dead"}
+    if probe["state"].startswith("Z"):
+        return {"alive": False, "reason": "dead"}  # zombie: exited, unreaped
+    try:
+        pgid = os.getpgid(pid)
+    except OSError:
+        return {"alive": False, "reason": "gone"}
+    expected_pgid = int(job.get("pgid") or 0)
+    if expected_pgid and pgid != expected_pgid:
+        return {"alive": False, "reason": "pgid-mismatch"}
+    lstart = probe["lstart"]
+    expected = str(job.get("startIdentity") or "")
+    if expected and lstart and expected != lstart:
+        return {"alive": False, "reason": "pid-reused"}
+    if expected and not lstart:
+        return {"alive": False, "reason": "start-identity-unreadable"}
+    return {"alive": True, "pgid": pgid, "startIdentity": lstart}
+
+
+def _terminate_job_process(job: dict[str, Any], *,
+                           proc: subprocess.Popen | None = None,
+                           grace: float = JOB_TERMINATE_GRACE) -> dict[str, Any]:
+    """SIGTERM the process group, escalate to SIGKILL after grace. Returns a
+    summary; the caller decides how to persist the job status."""
+    pid = int(job.get("pid") or 0)
+    pgid = int(job.get("pgid") or 0) or pid
+    ident = _process_identity(job)
+    if not ident["alive"]:
+        return {"killed": False, "reason": ident["reason"]}
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except OSError as exc:
+        return {"killed": False, "reason": f"sigterm {exc}"}
+    deadline = time.time() + grace
+    while time.time() < deadline:
+        if proc is not None:
+            if proc.poll() is not None:
+                return {"killed": True, "mode": "term"}
+        elif not _process_identity(job)["alive"]:
+            return {"killed": True, "mode": "term"}
+        time.sleep(0.2)
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except OSError as exc:
+        return {"killed": False, "reason": f"sigkill {exc}"}
+    for _ in range(15):
+        if proc is not None:
+            if proc.poll() is not None:
+                return {"killed": True, "mode": "kill"}
+        elif not _process_identity(job)["alive"]:
+            return {"killed": True, "mode": "kill"}
+        time.sleep(0.2)
+    return {"killed": True, "mode": "kill", "linger": True}
+
 
 # --- JobWatcher -------------------------------------------------------------------
 
 
+def _reap_exit_code(pid: int) -> int:
+    """Reap our own child and return its shell-convention exit code
+    (128+signal when signaled). Raises ValueError when the code is
+    unobtainable: not our child (e.g. control-plane restart) or no
+    exit status yet."""
+    try:
+        wpid, status = os.waitpid(pid, os.WNOHANG)
+    except (ChildProcessError, ProcessLookupError):
+        raise ValueError("not our child")
+    if wpid != pid:
+        raise ValueError("no exit status yet")
+    if os.WIFEXITED(status):
+        return os.WEXITSTATUS(status)
+    if os.WIFSIGNALED(status):
+        return 128 + os.WTERMSIG(status)
+    raise ValueError("no exit status")
+
+
 class JobWatcher(threading.Thread):
     """Watch one BackgroundJob at the OS level and wake the runner when it
-    exits (or overstays expectedWakeAt). The model never polls."""
+    exits (or overstays expectedWakeAt). The model never polls. Exit is
+    persisted (status/exitCode/finishedAt) BEFORE the wake so a crash or a
+    pause between exit and wake cannot lose the result."""
 
     def __init__(self, job: dict[str, Any], store: MissionStore,
                  on_wake: Callable[[dict[str, Any]], None],
@@ -206,24 +348,55 @@ class JobWatcher(threading.Thread):
         self.proc = proc
         self._stopped = threading.Event()
 
-    def _alive(self, pid: int) -> bool:
+    def _alive(self) -> bool:
         if self.proc is not None:
             return self.proc.poll() is None
-        try:
-            os.kill(pid, 0)
-            return True
-        except OSError:
-            return False
+        return _process_identity(self.job)["alive"]
+
+    def _mark_exit(self, exit_code: int | None, unknown: bool = False) -> dict[str, Any]:
+        job = self.store.load_job(self.job.get("jobId") or "")
+        if not job:
+            # run dir already gone (mission deleted); nothing to persist
+            return self.job
+        job.update({
+            # completed ONLY with known exit code 0; an unreapable exit is
+            # never claimed as success (default-fail, honest evidence)
+            "status": "completed" if (not unknown and exit_code == 0) else "failed",
+            "exitCode": exit_code,
+            "exitKind": "exited",
+            "exitUnknown": unknown,
+            "finishedAt": _now_ms(),
+        })
+        self.store.save_job(job)
+        return job
 
     def run(self) -> None:
         pid = int(self.job.get("pid") or 0)
         expected_wake = float(self.job.get("expectedWakeAt") or 0)
         while not self._stopped.is_set():
-            if not self._alive(pid):
-                # bounded wake payload: exit code (when we own the child) +
-                # kind; the log tail is attached by the runner from logPath.
-                code = self.proc.returncode if self.proc is not None else None
-                self.on_wake({**self.job, "exitKind": "exited", "exitCode": code})
+            if not self._alive():
+                code: int | None
+                unknown = False
+                if self.proc is not None:
+                    code = self.proc.returncode
+                    if code is not None and code < 0:
+                        # Popen convention (-SIG) -> shell convention (128+SIG)
+                        code = 128 - code
+                else:
+                    # re-attached watcher (pause/resume): we are still the
+                    # parent, so waitpid reaps the real exit status instead of
+                    # turning a healthy exit into a bogus failure. When the
+                    # process is not our child (restarted control plane) the
+                    # code is honestly unknown and never claimed as success.
+                    try:
+                        code = _reap_exit_code(pid)
+                    except ValueError:
+                        if self._alive():
+                            continue  # race between probe and waitpid
+                        code = None
+                        unknown = True
+                job = self._mark_exit(code, unknown=unknown)
+                self.on_wake({**job, "exitKind": "exited", "exitCode": code, "exitUnknown": unknown})
                 return
             if expected_wake and time.time() > expected_wake + JOB_WAKE_GRACE:
                 self.on_wake({**self.job, "exitKind": "overdue"})
@@ -257,13 +430,202 @@ class StopPolicy:
     def check(self, state: dict[str, Any]) -> str | None:
         if state.get("cycles", 0) >= self.max_cycles:
             return f"maxMissionCycles 达到上限（{self.max_cycles}）"
-        if float(state.get("activeMs", 0)) / 1000.0 >= self.max_wall_sec:
-            return f"maxWallTime 达到上限（{int(self.max_wall_sec)}s）"
+        # wallElapsedMs = mission wall clock EXCLUDING paused time (paused is
+        # deliberate inactivity; pausing must stop the budget). Doc'd contract.
+        wall_ms = float(state.get("wallElapsedMs") or state.get("activeMs") or 0)
+        if wall_ms / 1000.0 >= self.max_wall_sec:
+            return f"maxWallTime 达到上限（{int(self.max_wall_sec)}s，不含暂停）"
         if state.get("noProgress", 0) >= self.max_no_progress:
             return f"连续 {self.max_no_progress} 个循环无进展"
         if self.token_budget and int(state.get("tokensUsed", 0)) >= int(self.token_budget):
             return f"token 预算耗尽（{self.token_budget}）"
         return None
+
+
+# --- wall-clock accounting ---------------------------------------------------------
+# Four persisted buckets: wallElapsedMs (mission wall time EXCLUDING paused),
+# agentActiveMs (model turns + phases), waitingMs (background jobs), pausedMs.
+# maxWallTimeSec is checked against wallElapsedMs — pausing a mission genuinely
+# freezes its wall budget; waiting does NOT (the mission is still advancing).
+
+AGENT_PHASES = {"planning", "running", "evaluating", "repairing",
+                "replanning", "verification", "verifying"}
+
+
+def _accrue_state(state: dict[str, Any]) -> None:
+    now = _now_ms()
+    started = int(state.get("phaseStartedAt") or 0)
+    if started:
+        delta = now - started
+        if delta > 0:
+            phase = str(state.get("state"))
+            if phase == "paused":
+                state["pausedMs"] = int(state.get("pausedMs", 0)) + delta
+            elif phase == "waiting":
+                state["waitingMs"] = int(state.get("waitingMs", 0)) + delta
+            elif phase in AGENT_PHASES:
+                state["agentActiveMs"] = int(state.get("agentActiveMs", 0)) + delta
+    state["phaseStartedAt"] = now
+    state["wallElapsedMs"] = int(state.get("agentActiveMs", 0)) + int(state.get("waitingMs", 0))
+    state["activeMs"] = state["wallElapsedMs"]  # legacy alias
+
+
+def _file_sha256(path: Path, cap: int = 64 * 1024 * 1024) -> str:
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            while True:
+                chunk = fh.read(1024 * 1024)
+                if not chunk:
+                    break
+                h.update(chunk)
+                if fh.tell() > cap:
+                    return ""
+        return h.hexdigest()
+    except OSError:
+        return ""
+
+
+def _tail(text: str, limit: int = VERIFY_TAIL) -> str:
+    return text[-limit:] if len(text) > limit else text
+
+
+# --- Harness Verification Gate --------------------------------------------------------
+
+
+class VerificationRunner:
+    """Machine verification executed by the Control Plane (no model involved).
+
+    Config (from mission.json -> verification):
+      commands:      list of shell commands; passed iff exitCode == 0
+      requiredFiles: list of paths (relative to mission cwd); passed iff file exists
+      httpChecks:    list of {url, expectStatus?}; passed iff status == expectStatus (default 200)
+
+    Every check is persisted under <run>/verification/ with full fields
+    (kind/name/command/exitCode/stdoutTail/stderrTail/startedAt/endedAt/resultHash)
+    plus raw stdout/stderr. The gate itself is resumable and re-runnable —
+    it only ever reads the workspace and writes under the run dir.
+    """
+
+    def __init__(self, store: MissionStore, config: dict[str, Any], cwd: str) -> None:
+        self.store = store
+        self.config = config or {}
+        self.cwd = cwd
+
+    def run(self) -> dict[str, Any]:
+        started = _now_ms()
+        checks = (self._run_commands() + self._check_files() + self._check_http())
+        passed = all(c.get("passed") for c in checks)
+        summary = {"passed": passed, "checks": checks,
+                   "startedAt": started, "endedAt": _now_ms()}
+        summary["resultHash"] = hashlib.sha256(json.dumps(
+            [c.get("resultHash") or "" for c in checks], sort_keys=True).encode()).hexdigest()[:16]
+        self.store.verification_dir.mkdir(parents=True, exist_ok=True)
+        text = json.dumps(summary, ensure_ascii=False, indent=1)
+        _atomic_write(self.store.verification_dir / "results.json", text)
+        # keep every gate run: evidence must survive a later PASS overwrite
+        _atomic_write(self.store.verification_dir / f"results-{started}.json", text)
+        return summary
+
+    def _record(self, kind: str, name: str, check: dict[str, Any],
+                stdout: str = "", stderr: str = "") -> dict[str, Any]:
+        result = {
+            "kind": kind, "name": name, "passed": bool(check.get("passed")),
+            "startedAt": check.get("startedAt"), "endedAt": check.get("endedAt"),
+            "error": check.get("error"),
+            "stdoutTail": _tail(stdout), "stderrTail": _tail(stderr),
+        }
+        if "command" in check:
+            result["command"] = check["command"]
+        if "exitCode" in check:
+            result["exitCode"] = check["exitCode"]
+        if "url" in check:
+            result["url"] = check["url"]
+        result["resultHash"] = hashlib.sha256(json.dumps(
+            {k: v for k, v in result.items() if k not in ("startedAt", "endedAt")},
+            sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16]
+        raw_dir = self.store.verification_dir / "raw"
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        slug = re.sub(r"[^A-Za-z0-9._-]", "_", f"{len(list(raw_dir.glob('*'))) // 2}-{name}")[:80]
+        try:
+            (raw_dir / f"{slug}.stdout").write_text(stdout, "utf-8")
+            (raw_dir / f"{slug}.stderr").write_text(stderr, "utf-8")
+        except OSError:
+            pass
+        return result
+
+    def _run_commands(self) -> list[dict[str, Any]]:
+        out = []
+        for cmd in (self.config.get("commands") or []):
+            started = _now_ms()
+            entry: dict[str, Any] = {"command": str(cmd), "startedAt": started}
+            try:
+                proc = subprocess.run(["/bin/zsh", "-lc", str(cmd)], cwd=self.cwd,
+                                      capture_output=True, text=True, timeout=VERIFY_CMD_TIMEOUT)
+                entry["exitCode"] = proc.returncode
+                entry["passed"] = proc.returncode == 0
+                stdout, stderr = proc.stdout or "", proc.stderr or ""
+            except subprocess.TimeoutExpired as exc:
+                entry["exitCode"] = None
+                entry["passed"] = False
+                entry["error"] = f"timeout>{VERIFY_CMD_TIMEOUT}s"
+                stdout, stderr = (exc.stdout or ""), (exc.stderr or "")
+                if isinstance(stdout, bytes):
+                    stdout = stdout.decode("utf-8", "replace")
+                if isinstance(stderr, bytes):
+                    stderr = stderr.decode("utf-8", "replace")
+            except OSError as exc:
+                entry["exitCode"] = None
+                entry["passed"] = False
+                entry["error"] = f"spawn: {exc}"
+                stdout, stderr = "", ""
+            entry["endedAt"] = _now_ms()
+            out.append(self._record("command", str(cmd)[:80], entry, stdout, stderr))
+        return out
+
+    def _check_files(self) -> list[dict[str, Any]]:
+        out = []
+        for rel in (self.config.get("requiredFiles") or []):
+            started = _now_ms()
+            path = Path(str(rel))
+            if not path.is_absolute():
+                path = Path(self.cwd) / path
+            exists = path.is_file()
+            out.append(self._record(
+                "file", str(rel)[:80],
+                {"passed": exists, "startedAt": started, "endedAt": _now_ms(),
+                 "error": None if exists else "missing"}))
+        return out
+
+    def _check_http(self) -> list[dict[str, Any]]:
+        out = []
+        for spec in (self.config.get("httpChecks") or []):
+            started = _now_ms()
+            url = str(spec.get("url") or "")
+            expect = int(spec.get("expectStatus") or 200)
+            try:
+                with urllib.request.urlopen(url, timeout=30) as resp:
+                    status = resp.status
+                passed = status == expect
+                error = None if passed else f"status {status} != {expect}"
+            except OSError as exc:
+                status, passed, error = None, False, f"{type(exc).__name__}: {exc}"
+            out.append(self._record(
+                "http", url[:80],
+                {"passed": passed, "url": url, "startedAt": started,
+                 "endedAt": _now_ms(), "error": error,
+                 "status": status, "expectStatus": expect}))
+        return out
+
+
+def _git_diff_summary(cwd: str) -> str | None:
+    try:
+        out = subprocess.run(["git", "-C", cwd, "diff", "--stat"],
+                             capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    text = (out.stdout or "").strip()
+    return text or None
 
 
 # --- MissionRunner -------------------------------------------------------------------
@@ -284,6 +646,9 @@ class MissionRunner(threading.Thread):
         self.wake_payload: dict[str, Any] | None = None
         self._control = threading.Event()  # set => stop loop (cancel/fail)
         self._last_progress_sig: str | None = None
+        # no-progress compare must survive crashes: seed from persisted value
+        disk = self.store.load_state()
+        self._last_progress_sig = str(disk.get("progressSignature") or "") or None
 
     # -- thread plumbing --
     def request_stop(self) -> None:
@@ -299,28 +664,103 @@ class MissionRunner(threading.Thread):
         return self.store.load_state()
 
     def _transition(self, state: dict[str, Any], new_state: str, **fields: Any) -> None:
+        if new_state in TERMINAL_STATES:
+            self.manager._stopped_watchers.pop(self.mission_id, None)
         # Races: a pause/cancel can land while a phase holds an older dict.
         # The on-disk state is the source of truth — never clobber a pause or
-        # a terminal state with a stale transition.
+        # a terminal state with a stale transition. The caller's dict carries
+        # payload fields (repairDirective/delta/lastVerdict) that disk lacks,
+        # so it is the base; disk wins on anything it also has (fresher
+        # counters/phaseStartedAt from the just-run accrue).
         disk = self.store.load_state()
+        _accrue_state(disk)
         disk_state = disk.get("state")
+        merged = {**state, **disk}
+        merged["phaseStartedAt"] = disk.get("phaseStartedAt")
+        merged.update({k: v for k, v in fields.items() if k != "state"})
         if disk_state == "paused" and new_state != "paused" and new_state not in TERMINAL_STATES:
-            state.update(fields)
-            state["state"] = "paused"
-            state["stateBeforePause"] = new_state
-            self.store.save_state(state)
-            self.store.event("transition", {"state": "paused", "deferred": new_state})
-            self.manager.broadcast(self.mission_id, state)
+            defer = new_state
+            merged["state"] = "paused"
+            merged["stateBeforePause"] = defer
+            self.store.save_state(merged)
+            self.store.event("transition", {"state": "paused", "deferred": defer})
+            self.manager.broadcast(self.mission_id, merged)
             return
         if disk_state in TERMINAL_STATES:
             self.store.event("transition-suppressed", {"wanted": new_state, "disk": disk_state})
-            state.update(disk)
             return
-        state["state"] = new_state
-        state.update(fields)
-        self.store.save_state(state)
+        merged["state"] = new_state
+        merged["wallElapsedMs"] = int(merged.get("agentActiveMs", 0)) + int(merged.get("waitingMs", 0))
+        merged["activeMs"] = merged["wallElapsedMs"]
+        self.store.save_state(merged)
         self.store.event("transition", {"state": new_state, **{k: v for k, v in fields.items()}})
-        self.manager.broadcast(self.mission_id, state)
+        self.manager.broadcast(self.mission_id, merged)
+        if new_state == "done":
+            # evidence snapshot is baked at DONE and never overwritten later
+            self._emit_evidence_manifest()
+        # A managed job may not outlive its mission: terminal states reached
+        # from waiting must take the background job down with them.
+        if new_state in TERMINAL_STATES and disk_state == "waiting":
+            self.manager.terminate_mission_jobs(self.mission_id, self.store)
+
+    def _emit_evidence_manifest(self) -> dict[str, Any]:
+        """Snapshot the evidence trail (verdicts/verification/checkpoints/
+        git diff/artifacts) with path+sha256+generatedAt. Immutable after
+        DONE: a later call returns the existing manifest unchanged."""
+        existing = self.store.evidence_manifest()
+        if existing:
+            return existing
+        mission = self.store.load_mission()
+        entries: dict[str, dict[str, Any]] = {}
+
+        def add(rel: str, path: Path, kind: str) -> None:
+            try:
+                if not path.is_file():
+                    return
+                entries[rel] = {"path": str(path.resolve()),
+                                "sha256": _file_sha256(path),
+                                "generatedAt": int(path.stat().st_mtime * 1000),
+                                "kind": kind, "size": path.stat().st_size}
+            except OSError:
+                return
+
+        for rel, kind in (("mission.json", "mission"), ("state.json", "state"),
+                          ("plan.json", "plan"), ("progress.md", "progress"),
+                          ("handoff.md", "handoff")):
+            add(rel, self.store.root / rel, kind)
+        for sub, kind in (("checkpoints", "checkpoint"), ("verdicts", "verdict"),
+                          ("repairs", "repair"), ("verification", "verification"),
+                          ("jobs", "job")):
+            base = self.store.root / sub
+            if base.is_dir():
+                for p in sorted(base.rglob("*")):
+                    if p.is_file():
+                        add(f"{sub}/{p.relative_to(base)}", p, kind)
+        for rel in (mission.get("verification") or {}).get("requiredFiles") or []:
+            p = Path(rel)
+            if not p.is_absolute():
+                p = Path(str(mission.get("cwd") or os.getcwd())) / p
+            if p.is_file():
+                add(f"artifact/{rel}", p, "artifact")
+            else:
+                entries[f"artifact/{rel}"] = {"path": str(p), "sha256": None,
+                                              "generatedAt": _now_ms(),
+                                              "kind": "artifact", "size": -1, "missing": True}
+        diff = _git_diff_summary(str(mission.get("cwd") or ""))
+        if diff:
+            p = self.store.evidence_dir / "git-diff.txt"
+            try:
+                p.write_text(diff + "\n", "utf-8")
+                add("git-diff.txt", p, "git-diff")
+            except OSError:
+                pass
+        manifest = {"state": "done", "missionId": mission.get("id"),
+                    "generatedAt": _now_ms(), "entries": entries,
+                    "sha256": hashlib.sha256(
+                        json.dumps(entries, sort_keys=True, ensure_ascii=False).encode()).hexdigest()}
+        self.store.write_evidence_manifest(manifest)
+        self.store.event("evidence", {"entries": len(entries)})
+        return manifest
 
     def _paused(self, state: dict[str, Any]) -> bool:
         return state.get("state") == "paused"
@@ -335,21 +775,28 @@ class MissionRunner(threading.Thread):
 
     def _turn(self, state: dict[str, Any], prompt: str, *,
               read_only: bool = False, timeout: int = WORKER_TURN_TIMEOUT) -> dict[str, Any]:
-        """Run one codex turn on a fresh thread. Mutates the caller's state
-        dict in place (cycles/activeMs/tokensUsed) so no transition can
-        overwrite the counters with a stale copy."""
+        """Run one codex turn on a fresh thread. Counters always accumulate on
+        a fresh disk copy: a pause/cancel landing mid-turn must never be
+        clobbered by a stale in-memory dict. Mutates the caller's state dict
+        in place afterwards so its counters stay in sync."""
         mission = self.store.load_mission()
         started = _now_ms()
-        state["cycles"] = int(state.get("cycles", 0)) + 1
         result = self.manager.adapter.run_turn(
             prompt=prompt, cwd=mission.get("cwd"), read_only=read_only,
             model=mission.get("model"), effort=mission.get("effort"), timeout=timeout)
         elapsed = _now_ms() - started
-        state["activeMs"] = int(state.get("activeMs", 0)) + elapsed
         usage = result.get("usage") or {}
         tokens = int(usage.get("uncachedInputTokens") or 0) + int(usage.get("outputTokens") or 0)
-        state["tokensUsed"] = int(state.get("tokensUsed", 0)) + tokens
-        self.store.save_state(state)
+        disk = self.store.load_state()
+        if disk.get("state") in TERMINAL_STATES:
+            # turn result is discarded: the mission is already over
+            self.store.event("turn", {"ok": result.get("ok"), "discarded": "terminal"})
+            return result
+        disk["cycles"] = int(disk.get("cycles", 0)) + 1
+        disk["activeMs"] = int(disk.get("activeMs", 0)) + elapsed
+        disk["tokensUsed"] = int(disk.get("tokensUsed", 0)) + tokens
+        self.store.save_state(disk)
+        state.update({k: disk.get(k) for k in ("cycles", "activeMs", "tokensUsed")})
         self.store.event("turn", {"ok": result.get("ok"), "elapsedMs": elapsed,
                                   "tokens": tokens, "error": (result.get("error") or "")[:200]})
         return result
@@ -394,6 +841,9 @@ class MissionRunner(threading.Thread):
                     return
             elif current == "replanning":
                 if not self._phase_replanning(state):
+                    return
+            elif current == "verification":
+                if not self._phase_verification(state):
                     return
             elif current == "verifying":
                 if not self._phase_verifying(state):
@@ -510,12 +960,13 @@ class MissionRunner(threading.Thread):
         mission = self.store.load_mission()
         job_id = uuid.uuid4().hex[:12]
         cwd = str(job_spec.get("cwd") or mission.get("cwd") or os.getcwd())
+        command = str(job_spec.get("command"))
         log_path = self.store.job_log(job_id)
         log_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             with open(log_path, "wb") as log_fh:
                 proc = subprocess.Popen(
-                    ["/bin/zsh", "-lc", str(job_spec.get("command"))],
+                    ["/bin/zsh", "-lc", command],
                     stdout=log_fh, stderr=subprocess.STDOUT, cwd=cwd,
                     start_new_session=True)
         except OSError as exc:
@@ -524,17 +975,19 @@ class MissionRunner(threading.Thread):
             self._transition(state, "evaluating")
             return
         expected = time.time() + max(30, int(job_spec.get("expectedSeconds") or 600))
-        job = {"jobId": job_id, "pid": proc.pid, "command": str(job_spec.get("command")),
-               "cwd": cwd, "logPath": str(log_path), "startedAt": _now_ms(),
-               "expectedWakeAt": expected,
+        job = {"jobId": job_id, "pid": proc.pid, "pgid": proc.pid,  # start_new_session => session leader
+               "command": command, "cwd": cwd, "logPath": str(log_path),
+               "startedAt": _now_ms(), "expectedWakeAt": expected,
                "completionCondition": str(job_spec.get("reason") or "process exit"),
-               "unitIndex": unit_index}
+               "unitIndex": unit_index, "status": "running",
+               "startIdentity": _ps_start_identity(proc.pid),
+               "commandHash": hashlib.sha256(command.encode()).hexdigest()[:16]}
         self.store.save_job(job)
         watcher = JobWatcher(job, self.store, self._on_job_wake, proc=proc)
         self.manager.attach_watcher(self.mission_id, watcher)
         watcher.start()
         self.store.event("job", {"jobId": job_id, "pid": proc.pid,
-                                 "command": job["command"][:120], "expectedWakeAt": expected})
+                                 "command": command[:120], "expectedWakeAt": expected})
         self._transition(state, "waiting", waitingJobId=job_id)
 
     def _on_job_wake(self, woken: dict[str, Any]) -> None:
@@ -558,6 +1011,9 @@ class MissionRunner(threading.Thread):
         self.wake_payload = None
         job_id = woken.get("jobId") or state.get("waitingJobId")
         exit_kind = woken.get("exitKind") or "unknown"
+        persisted = self.store.load_job(str(job_id)) if job_id else {}
+        if persisted:
+            woken = {**persisted, **woken}
         tail = job_log_tail(Path(woken.get("logPath") or self.store.job_log(job_id or "")))
         delta = (f"后台作业已{'超时(仍在运行,被强制唤醒)' if exit_kind == 'overdue' else '结束'}："
                  f"{woken.get('command') or job_id}\n--- 日志尾部 ---\n{tail}")
@@ -600,17 +1056,23 @@ class MissionRunner(threading.Thread):
         state["lastVerdict"] = {"unit": index, **{k: verdict.get(k) for k in ("verdict", "reasons")}}
         self.store.event("verdict", state["lastVerdict"])
 
-        # no-progress signature: unit status map + handoff hash
+        # no-progress signature: unit status map + handoff hash. Persisted so
+        # a crash between cycles cannot reset the counter (crash-resumable).
         plan = self.store.load_plan()
         sig = hashlib.sha1(json.dumps({
             "statuses": [u.get("status") for u in plan["units"]],
             "handoff": hashlib.sha1(self.store.load_handoff().encode()).hexdigest()[:12],
         }, sort_keys=True).encode()).hexdigest()
         if sig == self._last_progress_sig:
-            state["noProgress"] = int(state.get("noProgress", 0)) + 1
+            no_progress = int(state.get("noProgress", 0)) + 1
         else:
-            state["noProgress"] = 0
+            no_progress = 0
         self._last_progress_sig = sig
+        disk = self.store.load_state()
+        disk["noProgress"] = no_progress
+        disk["progressSignature"] = sig
+        self.store.save_state(disk)
+        state.update({"noProgress": no_progress, "progressSignature": sig})
 
         v = verdict.get("verdict")
         if v == "PASS":
@@ -622,7 +1084,7 @@ class MissionRunner(threading.Thread):
             nxt = self._next_pending(plan_index=self.store.load_plan(), current=index)
             self._update_progress_md()
             if nxt is None:
-                self._transition(state, "verifying")
+                self._transition(state, "verification")
             else:
                 state.pop("repairDirective", None)
                 self._transition(state, "running", currentUnit=nxt)
@@ -710,9 +1172,43 @@ class MissionRunner(threading.Thread):
         self._transition(state, "running", currentUnit=next_index - 1 if next_index else 0)
         return True
 
+    def _phase_verification(self, state: dict[str, Any]) -> bool:
+        """Harness Verification Gate — machine-only, no model turn. A failing
+        gate sends the mission back to repair; it can never reach DONE."""
+        mission = self.store.load_mission()
+        gateway = VerificationRunner(self.store, mission.get("verification") or {},
+                                     str(mission.get("cwd") or os.getcwd()))
+        result = gateway.run()
+        disk = self.store.load_state()
+        disk["verifyResult"] = "pass" if result["passed"] else "fail"
+        disk["verifyChecks"] = len(result["checks"])
+        self.store.save_state(disk)
+        state.update({"verifyResult": disk["verifyResult"], "verifyChecks": disk["verifyChecks"]})
+        self.store.event("verification", {"passed": result["passed"], "checks": len(result["checks"])})
+        if result["passed"]:
+            self._transition(state, "verifying")
+            return True
+        failed = [c for c in result["checks"] if not c.get("passed")]
+        lines = []
+        for c in failed[:8]:
+            detail = (c.get("error") or c.get("stdoutTail") or "").strip()
+            detail = detail[-200:] if detail else ""
+            lines.append(f"- [{c['kind']}] {c['name']}：{detail}")
+        state["repairDirective"] = (
+            "Harness 机器验收未通过（原始验证命令/文件/HTTP 检查必须全部通过后才能 DONE）：\n"
+            + "\n".join(lines)[:2000])
+        self._transition(state, "repairing")
+        return True
+
     def _phase_verifying(self, state: dict[str, Any]) -> bool:
         mission = self.store.load_mission()
         plan = self.store.load_plan()
+        # triple gate: the machine gate must have PASSED before the final
+        # evaluator runs — nobody may reach DONE without machine evidence
+        if state.get("verifyResult") != "pass":
+            self.store.event("final-verdict", {"gate": "machine-not-passed"})
+            self._transition(state, "verification")
+            return True
         criteria = mission.get("acceptanceCriteria") or []
         for u in plan["units"]:
             criteria.extend(u.get("acceptance") or [])
@@ -764,6 +1260,11 @@ class MissionManager:
         self._lock = threading.RLock()
         self._runners: dict[str, MissionRunner] = {}
         self._watchers: dict[str, JobWatcher] = {}
+        # Watchers stopped while their job is still running. They keep the
+        # Popen handle referenced: a re-attached watcher reuses it so proc.poll()
+        # reaps the real exit status (a dropped Popen would let Python's
+        # subprocess._cleanup() reap the zombie before os.waitpid sees it).
+        self._stopped_watchers: dict[str, JobWatcher] = {}
 
     # -- paths --
     def runs_root(self, cwd: Path | None) -> Path:
@@ -838,12 +1339,19 @@ class MissionManager:
         with self._lock:
             self._runners.pop(mission_id, None)
             watcher = self._watchers.pop(mission_id, None)
+            if watcher is not None:
+                self._stopped_watchers.setdefault(mission_id, watcher)
         if watcher:
             watcher.stop()
 
     def attach_watcher(self, mission_id: str, watcher: JobWatcher) -> None:
         with self._lock:
+            old = self._watchers.get(mission_id)
             self._watchers[mission_id] = watcher
+            if old is not None:
+                self._stopped_watchers[mission_id] = old
+        if old is not None:
+            old.stop()
 
     # -- summaries --
     def _summary(self, store: MissionStore) -> dict[str, Any]:
@@ -869,6 +1377,11 @@ class MissionManager:
             "stopReason": state.get("stopReason"),
             "createdAt": mission.get("createdAt"), "updatedAt": state.get("updatedAt"),
             "tokensUsed": state.get("tokensUsed", 0),
+            "verifyResult": state.get("verifyResult"),
+            "time": {"wallElapsedMs": int(state.get("wallElapsedMs") or active_ms or 0),
+                     "agentActiveMs": int(state.get("agentActiveMs", 0)),
+                     "waitingMs": int(state.get("waitingMs", 0)),
+                     "pausedMs": int(state.get("pausedMs", 0))},
         }
 
     def list(self) -> dict[str, Any]:
@@ -884,6 +1397,9 @@ class MissionManager:
         summary = self._summary(store)
         summary["plan"] = store.load_plan()
         summary["events"] = store.events_tail(40)
+        summary["jobs"] = store.list_jobs()
+        summary["verification"] = store.verification_results()
+        summary["evidence"] = store.evidence_manifest()
         checkpoint = ""
         if store.checkpoints_dir.is_dir():
             files = sorted(store.checkpoints_dir.glob("*.md"))
@@ -895,10 +1411,20 @@ class MissionManager:
         summary["lastCheckpoint"] = checkpoint
         return {"ok": True, "mission": summary}
 
+    def verify_gate(self, mission_id: str) -> dict[str, Any]:
+        """Re-run the machine verification gate on demand. Inspection only:
+        writes under verification/ but never touches mission state."""
+        store = self.store_for(mission_id)
+        mission = store.load_mission()
+        gateway = VerificationRunner(store, mission.get("verification") or {},
+                                     str(mission.get("cwd") or os.getcwd()))
+        return {"ok": True, "result": gateway.run()}
+
     # -- lifecycle --
     def create(self, objective: str, cwd: str | None = None,
                acceptance_criteria: list[str] | None = None,
-               options: dict[str, Any] | None = None) -> dict[str, Any]:
+               options: dict[str, Any] | None = None,
+               verification: dict[str, Any] | None = None) -> dict[str, Any]:
         objective = str(objective or "").strip()
         if not objective:
             raise MissionError("objective 不能为空")
@@ -911,10 +1437,13 @@ class MissionManager:
             "id": mission_id, "objective": objective,
             "acceptanceCriteria": [str(a) for a in (acceptance_criteria or [])],
             "cwd": run_cwd, "options": options or {},
+            "verification": verification or {},
             "createdAt": _now_ms(),
         })
-        store.save_state({"state": "draft", "cycles": 0, "activeMs": 0, "currentUnit": 0,
-                          "noProgress": 0, "tokensUsed": 0})
+        store.save_state({"state": "draft", "cycles": 0, "currentUnit": 0,
+                          "noProgress": 0, "progressSignature": "", "tokensUsed": 0,
+                          "wallElapsedMs": 0, "agentActiveMs": 0,
+                          "waitingMs": 0, "pausedMs": 0, "phaseStartedAt": 0})
         store.event("created", {"objective": objective[:120], "cwd": run_cwd})
         return {"ok": True, "mission": self._summary(store)}
 
@@ -962,14 +1491,28 @@ class MissionManager:
             raise MissionError("mission 已结束", "terminal")
         if state.get("state") == "paused":
             return {"ok": True, "mission": self._summary(store)}
+        # Charge the pre-pause phase time now and reset the phase clock so the
+        # paused duration lands in pausedMs (paused time never counts against
+        # the wall budget; the runner exits and nothing can auto-advance).
+        _accrue_state(state)
         state["stateBeforePause"] = state.get("state")
         self._save_state_state(store, state, "paused")
+        store.event("pause", {"from": state.get("stateBeforePause")})
         return {"ok": True, "mission": self._summary(store)}
 
     @staticmethod
     def _save_state_state(store: MissionStore, state: dict[str, Any], new_state: str) -> None:
-        state["state"] = new_state
-        store.save_state(state)
+        # Save without clobbering a concurrent writer: disk wins on counters
+        # (a mid-turn _turn save may add newer values), the caller wins on its
+        # own writes (phaseStartedAt / stateBeforePause).
+        merged = {**state, **store.load_state()}
+        merged["pausedMs"] = max(int(merged.get("pausedMs", 0) or 0),
+                                 int(state.get("pausedMs", 0) or 0))
+        merged["phaseStartedAt"] = state.get("phaseStartedAt")
+        merged["state"] = new_state
+        merged["wallElapsedMs"] = int(merged.get("agentActiveMs", 0)) + int(merged.get("waitingMs", 0))
+        merged["activeMs"] = merged["wallElapsedMs"]
+        store.save_state(merged)
         store.event("transition", {"state": new_state})
 
     def resume(self, mission_id: str) -> dict[str, Any]:
@@ -980,6 +1523,7 @@ class MissionManager:
         if state.get("state") != "paused":
             return {"ok": True, "mission": self._summary(store)}
         previous = state.pop("stateBeforePause", None) or "running"
+        _accrue_state(state)  # idle time while paused => pausedMs
         self._reap_runner(mission_id)
         self._ensure_not_active(exclude=mission_id)
         self._save_state_state(store, state, previous)
@@ -987,7 +1531,35 @@ class MissionManager:
         with self._lock:
             self._runners[mission_id] = runner
         runner.start()
+        if previous == "waiting" and state.get("waitingJobId"):
+            self._attach_waiting_wake(mission_id, store, state, runner)
         return {"ok": True, "mission": self._summary(store)}
+
+    def _attach_waiting_wake(self, mission_id: str, store: MissionStore,
+                             state: dict[str, Any], runner: MissionRunner) -> None:
+        """Resuming a waiting mission: re-attach a watcher to the managed job
+        if it is still alive; if it finished while paused, wake immediately
+        instead of waiting forever for a wake that never comes."""
+        job_id = state.get("waitingJobId")
+        job = store.load_job(job_id) if job_id else {}
+        ident = _process_identity(job) if job.get("pid") else {"alive": False, "reason": "no-pid"}
+        if ident["alive"]:
+            old = self._stopped_watchers.pop(mission_id, None)
+            proc = old.proc if old is not None else None
+            watcher = JobWatcher(job, store, lambda w, mid=mission_id: self._wake_resume(mid, w),
+                                 proc=proc)
+            self.attach_watcher(mission_id, watcher)
+            watcher.start()
+            store.event("resume", "waiting: watcher re-attached")
+            return
+        if job.get("status") == "running":
+            # its exit was never observed (watcher stopped while paused) —
+            # the control plane found it dead on resume
+            job["status"] = "orphaned"
+            job["orphanReason"] = ident.get("reason")
+            job["finishedAt"] = _now_ms()
+            store.save_job(job)
+        runner.wake({**job, "exitKind": "exited"})
 
     def cancel(self, mission_id: str) -> dict[str, Any]:
         store = self.store_for(mission_id)
@@ -998,10 +1570,48 @@ class MissionManager:
             runner = self._runners.get(mission_id)
         if runner:
             runner.request_stop()
+        # Background job lifecycle is owned by the Control Plane: a cancelled
+        # mission must take its managed jobs down (grace terminate then kill).
+        self.terminate_mission_jobs(mission_id, store, mark="cancelled")
         state.pop("waitingJobId", None)
         self._save_state_state(store, state, "cancelled")
         store.event("cancelled", None)
         return {"ok": True, "mission": self._summary(store)}
+
+    def terminate_mission_jobs(self, mission_id: str, store: MissionStore,
+                               mark: str = "cancelled") -> list[dict[str, Any]]:
+        """SIGTERM -> grace -> SIGKILL every managed job still running.
+        The mission's watcher is stopped and joined FIRST: the Control Plane
+        owns the job lifecycle, and a watcher racing the termination could
+        persist a different status (e.g. failed) after we persist the mark.
+        Returns per-job outcomes; terminal jobs are left untouched."""
+        with self._lock:
+            watcher = self._watchers.pop(mission_id, None)
+        if watcher:
+            watcher.stop()
+            watcher.join(timeout=5.0)
+        self._stopped_watchers.pop(mission_id, None)
+        outcomes: list[dict[str, Any]] = []
+        for job in store.list_jobs():
+            if job.get("status") in ("completed", "failed", "cancelled", "orphaned"):
+                continue
+            result = _terminate_job_process(job)
+            if result.get("killed"):
+                job["status"] = mark
+                job["exitKind"] = "terminated"
+                job["finishedAt"] = _now_ms()
+                job["terminateMode"] = result.get("mode") or ("kill" if result.get("linger") else "term")
+            elif result.get("reason") in ("dead", "gone", "no-pid"):
+                # process already gone without anyone observing the exit
+                job["status"] = "orphaned"
+                job["orphanReason"] = result.get("reason")
+                job["finishedAt"] = _now_ms()
+            else:
+                result["status"] = job.get("status") or "running"
+            store.save_job(job)
+            outcomes.append({"jobId": job.get("jobId"), **result})
+            store.event("job-terminate", {"jobId": job.get("jobId"), **result})
+        return outcomes
 
     # -- crash recovery --
     def recover(self) -> list[str]:
@@ -1020,27 +1630,27 @@ class MissionManager:
             if name == "waiting":
                 job_id = state.get("waitingJobId")
                 job = store.load_job(job_id) if job_id else {}
-                pid = int(job.get("pid") or 0)
-                alive = False
-                if pid:
-                    try:
-                        os.kill(pid, 0)
-                        alive = True
-                    except OSError:
-                        alive = False
-                if alive:
+                ident = _process_identity(job) if job.get("pid") else {"alive": False, "reason": "no-pid"}
+                if ident["alive"]:
                     watcher = JobWatcher(job, store, lambda w, mid=mission_id: self._wake_resume(mid, w))
                     self.attach_watcher(mission_id, watcher)
                     watcher.start()
                     store.event("recover", "waiting: job alive, rewatching")
                 else:
+                    # PID reuse / dead process: neither kill nor attach may
+                    # touch it — wake the runner and let the worker repair.
                     tail = job_log_tail(Path(job.get("logPath") or ""))
-                    state["delta"] = (f"网关重启期间后台作业已结束：{job.get('command') or job_id}\n"
-                                      f"--- 日志尾部 ---\n{tail}")
+                    state["delta"] = (f"网关重启期间后台作业已结束（{ident.get('reason')}）："
+                                      f"{job.get('command') or job_id}\n--- 日志尾部 ---\n{tail}")
+                    if job.get("pid"):
+                        # whose exit nobody observed: it is no longer runnable
+                        job["status"] = "orphaned"
+                        job["orphanReason"] = ident.get("reason")
+                        store.save_job(job)
                     state.pop("waitingJobId", None)
                     state["state"] = "running"
                     store.save_state(state)
-                    store.event("recover", "waiting: job gone, waking")
+                    store.event("recover", f"waiting: job gone ({ident.get('reason')}), waking")
             else:
                 store.event("recover", f"resuming from {name}")
             self._ensure_not_active_quiet(mission_id)
