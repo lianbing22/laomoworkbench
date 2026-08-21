@@ -68,6 +68,8 @@ class EventTranslator:
         self._seq_lock = threading.Lock()
         self._seqs: dict[str, int] = {}
         self._stream_state: dict[str, dict[str, Any]] = {}
+        self._finalized: dict[str, set[str]] = {}  # session -> emitted item ids
+        self._current_turn: dict[str, str] = {}    # session -> turn id
 
     # -- seq allocation ------------------------------------------------------
     def next_seq(self, session_id: str) -> int:
@@ -171,6 +173,7 @@ class EventTranslator:
                 turn_id = turn.get("id", "")
                 ctx.registry.set_running(sid, True)
                 ctx.registry.set_turn(sid, turn_id)
+                self._current_turn[sid] = turn_id
                 out.append(self.session_event(sid, "turn/start", {"turn": turn_id}))
                 out.append(self.host_status(sid, True))
             elif method == "turn/completed":
@@ -195,7 +198,9 @@ class EventTranslator:
             elif method == "error":
                 out.append(self.agent_error(str(params.get("message", "Codex runtime error"))))
             elif method == "warning":
-                out.append(self.session_event(sid, "llm/retry", {"message": str(params.get("message", ""))}))
+                # Codex warnings (skill budget notes, deprecations) would render
+                # as retry notices in the UI; log and drop instead.
+                ctx._debug_log(f"warning: {str(params.get('message', ''))[:120]}")
             elif method == "item/commandExecution/outputDelta":
                 # live terminal output: append to open command stream (best effort)
                 out.append(self._tool_call_update(sid, params.get("itemId", ""),
@@ -215,6 +220,11 @@ class EventTranslator:
         data["type"] = chunk_type
         data["index"] = 0
         data.setdefault("callId", item_id)
+        # Stream identity ({turn}:{step}) lets the frontend correlate chunks
+        # with the finalizing assistant/message and swap the plain-text
+        # streaming bubble for the markdown-rendered final one.
+        data.setdefault("turn", self._current_turn.get(sid, ""))
+        data.setdefault("step", item_id or "0")
         return self.session_event(sid, "assistant/chunk", data)
 
     def _thread_status(self, sid: str, params: dict[str, Any], ctx: "CodexRuntimeAdapter") -> list[dict[str, Any]]:
@@ -272,8 +282,27 @@ class EventTranslator:
         item_id = item.get("id", "")
         frames: list[dict[str, Any]] = []
         if itype == "agentMessage":
+            # item/completed and the turn/completed replay both carry the same
+            # item; finalize it exactly once per session.
+            done = self._finalized.setdefault(sid, set())
+            if item_id and item_id in done:
+                return frames
+            if item_id:
+                done.add(item_id)
             text = item.get("text", "") or ""
             frames.append(self._assistant_message(sid, item_id, text))
+        elif itype == "userMessage":
+            # Live echo of the user's own message (pending-bubble confirm).
+            done = self._finalized.setdefault(sid, set())
+            if item_id and item_id in done:
+                return frames
+            if item_id:
+                done.add(item_id)
+            frames.append(self.session_event(sid, "user/message", {
+                "content": HistoryFolder._user_content(item.get("content", "")),
+                "source": {"kind": "user", "rpcId": item.get("clientId") or item_id},
+                "deliveryMode": "queue",
+            }))
         elif itype == "commandExecution":
             frames.append(self.session_event(sid, "tool/result", {
                 "callId": item_id, "message": "",
@@ -307,9 +336,12 @@ class EventTranslator:
         st = self._stream(sid, item_id)
         st["open"].add("final")
         content = [{"type": "text", "text": text}] if text else []
-        return self.session_event(sid, "assistant/message", {
+        data = {
             "message": {"content": content, "usage": {}, "timing": {}},
-        })
+            "turn": self._current_turn.get(sid, ""),
+            "step": item_id or "0",
+        }
+        return self.session_event(sid, "assistant/message", data)
 
     def _token_usage(self, sid: str, params: dict[str, Any]) -> dict[str, Any]:
         info = params.get("tokenUsage", {}) or params.get("usage", {}) or {}
@@ -361,7 +393,11 @@ class HistoryFolder:
             turn_id = turn.get("id", "")
             started = turn.get("startedAt") or 0
             events.append(ev("turn/start", {"turn": turn_id}, started))
-            for entry in turn.get("items", []) or []:
+            # The user's message leads every turn; rollout order is normally
+            # user-first already, but keep it stable defensively.
+            entries = turn.get("items", []) or []
+            entries = sorted(entries, key=lambda e: 0 if (e.get("item", e) or {}).get("type") == "userMessage" else 1)
+            for entry in entries:
                 item = entry.get("item", entry if "type" in entry else {})
                 if not isinstance(item, dict) or not item:
                     continue
@@ -913,12 +949,13 @@ class CodexRuntimeAdapter:
             self._workspace_cwd = path
 
     # -- rpc surface ----------------------------------------------------------
-    def rpc(self, mode: str, endpoint: str, body: dict[str, Any] | None) -> dict[str, Any]:
-        """Translate a DSH-shaped HTTP RPC. Returns the server-response dict."""
+    def rpc(self, mode: str, endpoint: str, body: dict[str, Any] | None, rpc_id: str = "") -> dict[str, Any]:
+        """Translate a DSH-shaped HTTP RPC. rpc_id carries the frontend
+        envelope's rpcId (the submission id) when present."""
         try:
             handler = getattr(self, f"_rpc_{endpoint.replace('/', '_').replace('.', '_')}", None)
             if handler:
-                return handler(body or {})
+                return handler(body or {}, rpc_id)
             return self._rpc_generic(endpoint, body or {})
         except AdapterUnavailable as exc:
             return err_value(str(exc), "runtime-unavailable")
@@ -931,7 +968,7 @@ class CodexRuntimeAdapter:
             return err_value(f"codex adapter error: {exc}", "adapter-error")
 
     # host.describe
-    def _rpc_host_describe(self, body: dict[str, Any]) -> dict[str, Any]:
+    def _rpc_host_describe(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
         proc = self._ensure_process()
         cfg = {}
         try:
@@ -952,7 +989,7 @@ class CodexRuntimeAdapter:
         return "gpt-5.6-luna"
 
     # session.list
-    def _rpc_session_list(self, body: dict[str, Any]) -> dict[str, Any]:
+    def _rpc_session_list(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
         proc = self._ensure_process()
         data = proc.rpc.request("thread/list", {"limit": 100}, timeout=30) or {}
         items = []
@@ -974,7 +1011,7 @@ class CodexRuntimeAdapter:
         return ok_value({"sessions": items, "items": items})
 
     # session.create -> thread/start
-    def _rpc_session_create(self, body: dict[str, Any]) -> dict[str, Any]:
+    def _rpc_session_create(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
         proc = self._ensure_process()
         params: dict[str, Any] = {"cwd": self.workspace_cwd()}
         model, effort = self._session_model_overrides(body.get("sessionId") or "")
@@ -992,7 +1029,7 @@ class CodexRuntimeAdapter:
         return ok_value({"sessionId": tid, "id": tid})
 
     # session.prompt -> turn/start | turn/steer
-    def _rpc_session_prompt(self, body: dict[str, Any]) -> dict[str, Any]:
+    def _rpc_session_prompt(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
         proc = self._ensure_process()
         sid = str(body.get("sessionId", ""))
         if not sid:
@@ -1006,7 +1043,7 @@ class CodexRuntimeAdapter:
             res = proc.rpc.request("turn/steer", params, timeout=30) or {}
             return ok_value({"accepted": True, "submissionId": res.get("turnId") or ""})
         params = {"threadId": sid, "input": input_items,
-                  "clientUserMessageId": body.get("rpcId") or str(uuid.uuid4())}
+                  "clientUserMessageId": rpc_id or str(uuid.uuid4())}
         model, effort = self._session_model_overrides(sid)
         if model:
             params["model"] = model
@@ -1040,7 +1077,7 @@ class CodexRuntimeAdapter:
         return ok_value({"accepted": True, "submissionId": res.get("turnId") or ""})
 
     # session.cancel -> turn/interrupt
-    def _rpc_session_cancel(self, body: dict[str, Any]) -> dict[str, Any]:
+    def _rpc_session_cancel(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
         proc = self._ensure_process()
         sid = str(body.get("sessionId", ""))
         reg = self.registry.get(sid) or {}
@@ -1052,7 +1089,7 @@ class CodexRuntimeAdapter:
         return ok_value({"cancelled": True})
 
     # session.history -> thread/read + fold
-    def _rpc_session_history(self, body: dict[str, Any]) -> dict[str, Any]:
+    def _rpc_session_history(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
         proc = self._ensure_process()
         sid = str(body.get("sessionId", ""))
         res = proc.rpc.request("thread/read", {"threadId": sid, "includeTurns": True}, timeout=60) or {}
@@ -1073,7 +1110,7 @@ class CodexRuntimeAdapter:
         return ok_value({"events": events, "hasMore": has_more, "projections": {"asOfSeq": len(events), "values": {}}})
 
     # session.models -> model/list
-    def _rpc_session_models(self, body: dict[str, Any]) -> dict[str, Any]:
+    def _rpc_session_models(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
         proc = self._ensure_process()
         data = proc.rpc.request("model/list", {}, timeout=30) or {}
         models = []
@@ -1092,19 +1129,19 @@ class CodexRuntimeAdapter:
         })
 
     # session.selectModel
-    def _rpc_session_selectModel(self, body: dict[str, Any]) -> dict[str, Any]:
+    def _rpc_session_selectModel(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
         sid = str(body.get("sessionId", ""))
         self.registry.set_model(sid, body.get("model"), body.get("reasoningEffort"))
         return ok_value({"selected": True})
 
     # workspace.*
-    def _rpc_workspace_list(self, body: dict[str, Any]) -> dict[str, Any]:
+    def _rpc_workspace_list(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
         cwd = self.workspace_cwd()
         name = os.path.basename(cwd.rstrip("/")) or cwd
         return ok_value({"items": [{"workspaceId": "laomo-clean", "id": "laomo-clean",
                                     "title": name, "path": cwd, "archivedSessionIds": []}]})
 
-    def _rpc_workspace_create(self, body: dict[str, Any]) -> dict[str, Any]:
+    def _rpc_workspace_create(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
         path = str(body.get("path", "")).strip()
         if not path:
             return err_value("path required")
@@ -1115,7 +1152,7 @@ class CodexRuntimeAdapter:
         name = os.path.basename(path.rstrip("/")) or path
         return ok_value({"workspaceId": "laomo-clean", "id": "laomo-clean", "title": name, "path": path})
 
-    def _rpc_workspace_archiveSession(self, body: dict[str, Any]) -> dict[str, Any]:
+    def _rpc_workspace_archiveSession(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
         try:
             proc = self._ensure_process()
             proc.rpc.request("thread/archive", {"threadId": str(body.get("sessionId", ""))}, timeout=15)
@@ -1124,7 +1161,7 @@ class CodexRuntimeAdapter:
         return ok_value({"archived": True})
 
     # respond -> answer pending codex server request
-    def _rpc_respond(self, body: dict[str, Any]) -> dict[str, Any]:
+    def _rpc_respond(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
         proc = self._ensure_process()
         rpc_id = str(body.get("rpcId", ""))
         descriptor = proc.rpc.pop_server_request(rpc_id)
@@ -1155,19 +1192,19 @@ class CodexRuntimeAdapter:
         return {"decision": "decline"}
 
     # --- stubs (P0: safely empty) ---
-    def _rpc_session_search(self, body: dict[str, Any]) -> dict[str, Any]:
+    def _rpc_session_search(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
         return ok_value({"items": []})
 
-    def _rpc_session_rename(self, body: dict[str, Any]) -> dict[str, Any]:
+    def _rpc_session_rename(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
         return err_value("rename is not supported on the codex runtime in P0", "unsupported")
 
-    def _rpc_session_fork(self, body: dict[str, Any]) -> dict[str, Any]:
+    def _rpc_session_fork(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
         return err_value("fork is not supported on the codex runtime in P0", "unsupported")
 
-    def _rpc_session_updateQueue(self, body: dict[str, Any]) -> dict[str, Any]:
+    def _rpc_session_updateQueue(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
         return err_value("queue is owned by the workbench, not codex (P0)", "unsupported")
 
-    def _rpc_session_attachment(self, body: dict[str, Any]) -> dict[str, Any]:
+    def _rpc_session_attachment(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
         return err_value("attachments are not supported on the codex runtime in P0", "unsupported")
 
     def _generic_empty_ok(self, body: dict[str, Any]) -> dict[str, Any]:
@@ -1181,6 +1218,11 @@ class CodexRuntimeAdapter:
     def _session_model_overrides(self, sid: str) -> tuple[str | None, str | None]:
         reg = self.registry.get(sid) or {}
         return reg.get("model"), reg.get("effort")
+
+    @staticmethod
+    def _prompt_text(content: list[Any]) -> str:
+        return " ".join(str(b.get("text", "")) for b in content or []
+                        if isinstance(b, dict) and b.get("type") == "text").strip()
 
     @staticmethod
     def _content_to_input(content: list[Any]) -> list[dict[str, Any]]:

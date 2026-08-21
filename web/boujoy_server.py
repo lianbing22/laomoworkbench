@@ -83,7 +83,10 @@ class RuntimeManager:
     def health(self) -> dict:
         runtimes = {"knowledge": {"runtime": "dsh", "status": "ready"}}
         if self.codex_adapter is not None:
-            runtimes["clean"] = self.codex_adapter.health()
+            info = self.codex_adapter.health()
+            with self.codex_adapter._sub_lock:
+                info["wsSubscribers"] = len(self.codex_adapter._subscribers)
+            runtimes["clean"] = info
         else:
             runtimes["clean"] = {"runtime": "dsh", "status": "ready"}
         return runtimes
@@ -1672,7 +1675,8 @@ class BoujoyHandler(BaseHTTPRequestHandler):
                     result = payload.get("result") or envelope.get("result") or {}
                     response = adapter.rpc(mode, "respond", {"rpcId": rpc_id, "result": result})
                 else:
-                    response = adapter.rpc(mode, endpoint, envelope.get("payload") or {})
+                    response = adapter.rpc(mode, endpoint, envelope.get("payload") or {},
+                                           rpc_id=str(envelope.get("rpcId", "")))
                 data = json.dumps(response, ensure_ascii=False).encode("utf-8")
                 self._headers(200, "application/json", len(data))
                 self.wfile.write(data)
