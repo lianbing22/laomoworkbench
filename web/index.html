@@ -150,6 +150,7 @@
                   <select id="presetSelect" class="inline-select" aria-label="Agent 预设"><option value="">标准模式</option></select>
                 </div>
                 <div class="composer-right">
+                  <button id="providerButton" class="composer-tool attach-tool provider-tool" type="button" title="模型服务" aria-label="模型服务"><span>⚙</span><small>服务</small></button>
                   <select id="modelSelect" class="inline-select model-select" aria-label="模型"><option>读取模型…</option></select>
                   <select id="effortSelect" class="inline-select effort-select" aria-label="推理强度" title="推理强度"><option value="">强度…</option></select>
                   <button id="cancelButton" class="stop-button hidden" type="button">■ 停止</button>
@@ -335,6 +336,55 @@
       <div class="settings-tabs"><button type="button" class="active" data-settings="general">通用</button><button type="button" data-settings="projects">项目</button><button type="button" data-settings="models">模型</button><button type="button" data-settings="presets">预设</button><button type="button" data-settings="skills">Skills</button></div>
       <div id="settingsContent" class="settings-content"></div>
       <footer><button value="cancel" class="primary-cut">完成</button></footer>
+    </form>
+  </dialog>
+
+  <!-- Provider profile manager: list view + edit form in one dialog -->
+  <dialog id="providerDialog" class="boujoy-dialog provider-dialog">
+    <form id="providerForm" novalidate>
+      <header><div><p id="providerKicker">MODEL PROVIDERS</p><h2 id="providerTitle">模型服务</h2></div><button type="button" class="dialog-close" data-close-dialog="providerDialog" aria-label="关闭">×</button></header>
+
+      <div id="providerListPanel">
+        <div class="provider-toolbar">
+          <span id="providerSummary" class="provider-summary">读取中…</span>
+          <button type="button" id="providerNewButton" class="mini-cut">＋ 新建服务</button>
+        </div>
+        <div id="providerList" class="provider-list"><div class="skeleton-lines"></div></div>
+      </div>
+
+      <div id="providerFormPanel" class="hidden">
+        <input id="providerId" type="hidden"><input id="providerType" type="hidden" value="custom">
+        <label>名称<input id="providerName" required maxlength="60" placeholder="例如：DeepSeek 官方"></label>
+        <label>Base URL<input id="providerBaseUrl" placeholder="https://api.example.com/v1" autocomplete="off" spellcheck="false"></label>
+        <div id="providerSecretWrap">
+          <label>API Key<input id="providerSecret" type="password" autocomplete="new-password" placeholder="留空表示保留已保存的 Key"><small class="provider-field-hint" id="providerSecretHint"></small></label>
+          <p class="dialog-note hidden" id="providerSecretNote">ChatGPT 内置服务使用本机 Codex 登录凭证，无需填写 API Key。</p>
+        </div>
+        <div class="provider-models-head">
+          <label>模型列表</label>
+          <button type="button" id="providerModelAdd" class="mini-cut">＋ 添加模型</button>
+        </div>
+        <div id="providerModelRows"></div>
+        <p class="dialog-note hidden" id="providerModelsNote">ChatGPT 内置服务的模型列表由 Codex 动态获取，无需手工配置。</p>
+        <label>默认模型<select id="providerDefaultModel"><option value="">（跟随服务默认）</option></select></label>
+        <label class="check-row"><input id="providerEnabled" type="checkbox" checked><span>启用这个服务</span></label>
+        <details class="provider-advanced" id="providerAdvanced">
+          <summary>高级选项</summary>
+          <div class="provider-advanced-body">
+            <div class="provider-readonly-row"><span>Wire API（只读）</span><code>responses</code></div>
+            <div class="provider-readonly-row"><span>envKey（只读）</span><code id="providerEnvKey">—</code></div>
+            <p class="dialog-note">当前仅支持 Responses 协议；API Key 直连端点，不读取环境变量。</p>
+          </div>
+        </details>
+      </div>
+
+      <p class="provider-safe-note">API Key 仅保存在本机安全存储（macOS 钥匙串）</p>
+
+      <footer>
+        <button type="button" id="providerEditCancel" class="ghost-button hidden">返回列表</button>
+        <button type="button" id="providerListDone" class="primary-cut">完成</button>
+        <button type="submit" id="providerSaveButton" class="primary-cut hidden">保存服务</button>
+      </footer>
     </form>
   </dialog>
 

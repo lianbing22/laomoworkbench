@@ -222,6 +222,7 @@ class EventTranslator:
                             out.append(frame)
                 out.append(self._turn_completed(sid, turn))
                 out.append(self.host_status(sid, False))
+                ctx._maybe_apply_pending_restart()
             elif method == "item/started":
                 out.extend(self._item_started(sid, params, ctx))
             elif method == "item/completed":
@@ -553,7 +554,7 @@ class SessionRegistry:
             s = self._sessions.get(thread_id)
             if s is None:
                 s = {"running": False, "turnId": "", "cwd": cwd, "title": title, "model": None, "effort": None,
-                     "permission": None, "updated": int(time.time() * 1000)}
+                     "permission": None, "providerId": None, "updated": int(time.time() * 1000)}
                 self._sessions[thread_id] = s
             else:
                 if cwd:
@@ -588,6 +589,11 @@ class SessionRegistry:
         s = self.ensure(thread_id)
         with self._lock:
             s["goal"] = view
+
+    def set_provider(self, thread_id: str, provider_id: str) -> None:
+        s = self.ensure(thread_id)
+        with self._lock:
+            s["providerId"] = provider_id
 
     def set_permission(self, thread_id: str, permission: str) -> None:
         s = self.ensure(thread_id)
@@ -715,12 +721,14 @@ class CodexProcess:
     """Spawn `codex app-server --stdio`, handshake, read loop, restart."""
 
     def __init__(self, bin_path: str, debug: Callable[[str], None], on_notification: Callable[[dict[str, Any]], None],
-                 on_server_request: Callable[[dict[str, Any]], None], cwd: str | None = None) -> None:
+                 on_server_request: Callable[[dict[str, Any]], None], cwd: str | None = None,
+                 extra_env: dict[str, str] | None = None) -> None:
         self.bin_path = bin_path
         self.debug = debug
         self.on_notification = on_notification
         self.on_server_request = on_server_request
         self.cwd = cwd
+        self.extra_env = extra_env or {}
         self.proc: subprocess.Popen | None = None
         self.rpc: RpcClient | None = None
         self.status = "stopped"  # stopped|starting|ready|degraded
@@ -741,6 +749,7 @@ class CodexProcess:
                 [self.bin_path, "app-server", "--stdio"],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 cwd=self.cwd or None,
+                env={**os.environ, **self.extra_env},
             )
         except OSError as exc:
             with self._lock:
@@ -896,10 +905,12 @@ class CodexRuntimeAdapter:
     DEFAULT_EFFORTS = ["low", "medium", "high"]
 
     def __init__(self, bin_path: str | None = None, default_cwd: str | None = None,
-                 debug_log: Callable[[str], None] | None = None) -> None:
+                 debug_log: Callable[[str], None] | None = None,
+                 providers: Any = None) -> None:
         self.bin_path = bin_path or shutil.which("codex") or os.path.expanduser("~/.local/bin/codex")
         self.default_cwd = default_cwd or os.getcwd()
         self._debug_sink = debug_log or (lambda m: None)
+        self.providers = providers  # ProviderProfileManager | None
         self.translator = EventTranslator()
         self.registry = SessionRegistry()
         self.folder = HistoryFolder()
@@ -911,6 +922,7 @@ class CodexRuntimeAdapter:
         self._workspace_cwd: str = self.default_cwd
         self._workspace_lock = threading.Lock()
         self._ws_counter = 0
+        self._pending_restart = False  # provider env changed; restart when idle
 
     # -- infra --
     def _debug_log(self, msg: str) -> None:
@@ -925,7 +937,8 @@ class CodexRuntimeAdapter:
                 proc = CodexProcess(self.bin_path, self._debug_log,
                                     on_notification=self._on_notification,
                                     on_server_request=self._on_server_request,
-                                    cwd=self.default_cwd)
+                                    cwd=self.default_cwd,
+                                    extra_env=(self.providers.env_for_process() if self.providers else None))
                 self.process = proc
             if proc.status == "degraded" and not proc.maybe_restart():
                 raise AdapterUnavailable("codex runtime degraded (restart budget exhausted)")
@@ -934,6 +947,33 @@ class CodexRuntimeAdapter:
             if proc.status != "ready":
                 raise AdapterUnavailable(f"codex runtime not ready: {proc.status}")
             return proc
+
+    def note_provider_change(self) -> None:
+        """Provider secret/config changed: restart the codex subprocess when
+        it is safe (no active turns). Running work is never killed silently."""
+        with self._proc_lock:
+            proc = self.process
+            if proc is None:
+                return
+            if any_running := any(s.get("running") for s in self.registry._sessions.values()):
+                self._pending_restart = True
+                self._debug_log("provider change deferred: active turns running")
+                return
+            proc.stop()
+            self.process = None
+            self._debug_log("provider changed: codex runtime stopped, will lazily restart with new env")
+
+    def _maybe_apply_pending_restart(self) -> None:
+        if not self._pending_restart:
+            return
+        if any(s.get("running") for s in self.registry._sessions.values()):
+            return
+        self._pending_restart = False
+        with self._proc_lock:
+            if self.process:
+                self.process.stop()
+                self.process = None
+        self._debug_log("pending provider restart applied")
 
     def health(self) -> dict[str, Any]:
         proc = self.process
@@ -1095,7 +1135,12 @@ class CodexRuntimeAdapter:
     # session.create -> thread/start
     def _rpc_session_create(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
         proc = self._ensure_process()
+        provider_id = "chatgpt"
+        if self.providers is not None:
+            provider_id = self.providers.active_id()
+            self._register_active_provider(provider_id)
         params: dict[str, Any] = {"cwd": self.workspace_cwd()}
+        params.update(self._provider_thread_params(provider_id))
         model, effort = self._session_model_overrides(body.get("sessionId") or "")
         if model:
             params["model"] = model
@@ -1107,8 +1152,128 @@ class CodexRuntimeAdapter:
             return err_value("thread/start returned no id")
         self.registry.ensure(tid, cwd=self.workspace_cwd())
         self.registry.set_loaded(tid, True)
+        self.registry.set_provider(tid, provider_id)
         self._emit(self.translator.session_added(tid))
-        return ok_value({"sessionId": tid, "id": tid})
+        return ok_value({"sessionId": tid, "id": tid, "providerId": provider_id})
+
+    def test_provider(self, managers: Any, provider_id: str) -> dict[str, Any]:
+        """Real E2E provider validation: register, ephemeral thread, minimal
+        turn, classify the outcome. Never returns secrets."""
+        import tempfile
+        profile = managers.get(provider_id)
+        if not profile:
+            return {"ok": False, "outcome": "runtime-error", "message": "Provider 不存在"}
+        if profile.get("type") == "chatgpt":
+            provider_id = "chatgpt"
+        if profile.get("type") == "custom" and not managers.credentials.has(provider_id):
+            return {"ok": False, "outcome": "auth-failed", "message": "尚未配置 API Key"}
+        proc = self._ensure_process()
+        if profile.get("type") == "custom":
+            if not self._write_provider_config(profile):
+                return {"ok": False, "outcome": "runtime-error",
+                        "message": "Provider 注册失败（Codex 配置写入被拒，详见网关日志）"}
+        with tempfile.TemporaryDirectory(prefix="laomo-provider-test-") as isolated:
+            start: dict[str, Any] = {"cwd": isolated, "ephemeral": True}
+            start.update(self._provider_thread_params(provider_id) or {})
+            if provider_id != "chatgpt" and "model" not in start:
+                start["model"] = profile.get("defaultModel") or (profile.get("models") or [{}])[0].get("id")
+            try:
+                res = proc.rpc.request("thread/start", start, timeout=30) or {}
+            except RuntimeError as exc:
+                return self._classify_provider_error(str(exc))
+            tid = res.get("threadId") or res.get("id") or (res.get("thread") or {}).get("id", "")
+            if not tid:
+                return {"ok": False, "outcome": "runtime-error", "message": "测试线程创建失败"}
+            try:
+                proc.rpc.request("turn/start", {
+                    "threadId": tid, "cwd": isolated,
+                    "input": [{"type": "text", "text": "Reply exactly: OK"}],
+                }, timeout=30)
+            except RuntimeError as exc:
+                return self._classify_provider_error(str(exc))
+            deadline = time.time() + 60
+            final_turn: dict[str, Any] = {}
+            while time.time() < deadline:
+                time.sleep(2)
+                try:
+                    thread = proc.rpc.request("thread/read", {"threadId": tid, "includeTurns": True}, timeout=30)
+                    turns = (thread.get("thread") or {}).get("turns") or []
+                except (TimeoutError, RuntimeError):
+                    turns = []
+                if turns:
+                    final_turn = turns[-1]
+                    if final_turn.get("status") in ("completed", "failed", "interrupted"):
+                        break
+            try:
+                proc.rpc.request("thread/delete", {"threadId": tid}, timeout=15)
+            except (TimeoutError, RuntimeError):
+                pass
+            if not final_turn:
+                return {"ok": False, "outcome": "timeout", "message": "测试回合 60 秒内未完成"}
+            if final_turn.get("status") == "failed":
+                err = (final_turn.get("error") or {}).get("message", "")
+                return self._classify_provider_error(err or "turn failed")
+            answered = any((e.get("item", {}) or {}).get("type") == "agentMessage"
+                           for e in final_turn.get("items", []) or [])
+            if not answered:
+                return {"ok": False, "outcome": "protocol-incompatible",
+                        "message": "回合完成但未返回模型回复（协议或模型不兼容）"}
+            return {"ok": True, "outcome": "ok", "message": "连接与推理正常"}
+
+    @staticmethod
+    def _classify_provider_error(message: str) -> dict[str, Any]:
+        msg = message.lower()
+        if "401" in msg or "unauthorized" in msg or "authentication" in msg or "api key" in msg or "invalid token" in msg:
+            return {"ok": False, "outcome": "auth-failed", "message": "鉴权失败：API Key 无效或过期"}
+        if "404" in msg or "model not found" in msg or "unknown model" in msg:
+            return {"ok": False, "outcome": "model-not-found", "message": "模型不存在：检查 Model ID"}
+        if "connect" in msg or "unreachable" in msg or "refused" in msg or "dns" in msg or "timed out" in msg:
+            return {"ok": False, "outcome": "unreachable", "message": "端点不可达：检查 Base URL"}
+        if "responses" in msg and ("unsupported" in msg or "not found" in msg or "405" in msg):
+            return {"ok": False, "outcome": "protocol-incompatible",
+                    "message": "该服务不兼容当前 Codex Runtime（需 OpenAI Responses API）"}
+        return {"ok": False, "outcome": "runtime-error", "message": f"Codex 运行时错误: {message[:140]}"}
+
+    def _register_active_provider(self, provider_id: str) -> None:
+        """Push custom provider definitions into the codex runtime before a
+        thread binds them. Verified protocol (docs/codex-protocol-notes.md):
+        config/value/write {keyPath: "model_providers.<id>", mergeStrategy:
+        "upsert", value: ModelProviderInfo(snake_case)}; upsert appends a
+        table and never touches unrelated config."""
+        if self.providers is None or provider_id == "chatgpt":
+            return
+        profile = self.providers.get(provider_id)
+        if not profile or profile.get("type") != "custom":
+            return
+        self._write_provider_config(profile)
+
+    def _write_provider_config(self, profile: dict[str, Any]) -> bool:
+        proc = self._ensure_process()
+        try:
+            proc.rpc.request("config/value/write", {
+                "keyPath": f"model_providers.{profile.get('id')}",
+                "mergeStrategy": "upsert",
+                "value": {
+                    "name": profile.get("name") or profile.get("id"),
+                    "base_url": profile.get("baseUrl"),
+                    "env_key": profile.get("envKey"),
+                    "wire_api": profile.get("wireApi") or "responses",
+                },
+            }, timeout=15)
+            return True
+        except (TimeoutError, RuntimeError) as exc:
+            self._debug_log(f"provider registration failed: {str(exc)[:160]}")
+            return False
+
+    def _provider_thread_params(self, provider_id: str) -> dict[str, Any]:
+        if provider_id and provider_id != "chatgpt":
+            profile = self.providers.get(provider_id) if self.providers else None
+            if profile:
+                params: dict[str, Any] = {"modelProvider": provider_id}
+                if profile.get("defaultModel"):
+                    params["model"] = profile["defaultModel"]
+                return params
+        return {}
 
     # session.prompt -> turn/start | turn/steer
     def _rpc_session_prompt(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
@@ -1226,51 +1391,71 @@ class CodexRuntimeAdapter:
         return ok_value({"events": events, "hasMore": has_more,
                          "projections": {"asOfSeq": len(events), "values": projections}})
 
-    # session.models -> model/list
+    # session.models -> provider-aware model catalogue
     def _rpc_session_models(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
-        proc = self._ensure_process()
-        data = proc.rpc.request("model/list", {}, timeout=30) or {}
-        cfg = {}
-        try:
-            cfg = proc.rpc.request("config/read", {}, timeout=15).get("config", {}) or {}
-        except (TimeoutError, RuntimeError):
-            pass
-        models: list[dict[str, Any]] = []
-        current_efforts = ["low", "medium", "high"]
-        current_default: str | None = None
-        current_model = None
         sid = str(body.get("sessionId", ""))
         reg = self.registry.get(sid) or {}
-        for m in data.get("data", []) or []:
-            mid = m.get("id") or m.get("model")
-            if not mid:
-                continue
-            # Real per-model effort catalogue (schema: supportedReasoningEfforts
-            # [{reasoningEffort, description}] + defaultReasoningEffort).
-            sup = [e for e in m.get("supportedReasoningEfforts", []) or [] if isinstance(e, dict)]
-            efforts = [{"name": e.get("reasoningEffort", ""), "description": e.get("description", "")} for e in sup]
-            names = [e["name"] for e in efforts if e["name"]]
-            default_eff = m.get("defaultReasoningEffort") or (names[-1] if names else None)
-            models.append({"model": mid, "name": m.get("displayName") or mid,
-                           "reasoning": {"efforts": efforts, "defaultEffort": default_eff}})
-            if mid == cfg.get("model"):
-                current_model = mid
-                if names:
-                    current_efforts = names
-                current_default = default_eff
-        current_model = reg.get("model") or current_model or cfg.get("model") or "gpt-5.6-luna"
-        self._last_model_list = models
+        # Bound sessions only ever see their own provider's models; fresh
+        # sessions see the active provider's.
+        provider_id = reg.get("providerId") or (self.providers.active_id() if self.providers else "chatgpt")
+        profile = self.providers.get(provider_id) if self.providers else None
+        if profile is None:  # no manager (tests) or unknown id -> builtin
+            profile = {"id": "chatgpt", "name": "ChatGPT / Codex", "type": "chatgpt"}
+        current_default: str | None = None
+        if profile.get("type") == "chatgpt":
+            proc = self._ensure_process()
+            data = proc.rpc.request("model/list", {}, timeout=30) or {}
+            cfg = {}
+            try:
+                cfg = proc.rpc.request("config/read", {}, timeout=15).get("config", {}) or {}
+            except (TimeoutError, RuntimeError):
+                pass
+            models: list[dict[str, Any]] = []
+            efforts = ["low", "medium", "high"]
+            current_default = None
+            for m in data.get("data", []) or []:
+                mid = m.get("id") or m.get("model")
+                if not mid:
+                    continue
+                sup = [e for e in m.get("supportedReasoningEfforts", []) or [] if isinstance(e, dict)]
+                eff_objs = [{"name": e.get("reasoningEffort", ""), "description": e.get("description", "")} for e in sup]
+                names = [e["name"] for e in eff_objs if e["name"]]
+                models.append({"model": mid, "name": m.get("displayName") or mid,
+                               "reasoning": {"efforts": eff_objs,
+                                             "defaultEffort": m.get("defaultReasoningEffort") or (names[-1] if names else None)}})
+                if mid == cfg.get("model"):
+                    current_default = mid
+                    if names:
+                        efforts = names
+                    current_default_eff = m.get("defaultReasoningEffort")
+            current_model = reg.get("model") or current_default or cfg.get("model") or "gpt-5.6-luna"
+            group_name = "ChatGPT / Codex"
+            default_effort = current_default_eff if current_default else efforts[-1]
+        else:
+            models = [{"model": m.get("id"), "name": m.get("label") or m.get("id"),
+                       "reasoning": {"efforts": [], "defaultEffort": None}}
+                      for m in profile.get("models", []) if m.get("id")]
+            current_model = reg.get("model") or profile.get("defaultModel") or (models[0]["model"] if models else None)
+            group_name = profile.get("name") or provider_id
+            efforts = []
+            default_effort = None
         return ok_value({
-            "groups": [{"id": "codex", "name": "Codex", "models": models}],
-            "current": {"model": current_model, "provider": "codex",
+            "groups": [{"id": provider_id, "name": group_name, "models": models}],
+            "current": {"model": current_model, "provider": provider_id,
                         "reasoningEffort": reg.get("effort"),
-                        "reasoning": {"efforts": current_efforts,
-                                      "defaultEffort": current_default or current_efforts[-1]}},
+                        "reasoning": {"efforts": efforts, "defaultEffort": default_effort or (efforts[-1] if efforts else None)}},
         })
 
     # session.selectModel
     def _rpc_session_selectModel(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
         sid = str(body.get("sessionId", ""))
+        reg = self.registry.get(sid) or {}
+        target_provider = str(body.get("provider") or "")
+        bound_provider = reg.get("providerId")
+        # Cross-provider switching on an existing session is rejected: the
+        # conversation history belongs to its provider.
+        if bound_provider and target_provider and target_provider != bound_provider:
+            return err_value("模型服务变更将在新会话中生效", "provider-change-requires-new-session")
         self.registry.set_model(sid, body.get("model"), body.get("reasoningEffort"))
         return ok_value({"selected": True})
 

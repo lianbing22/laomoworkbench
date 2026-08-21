@@ -65,11 +65,16 @@ class RuntimeManager:
         self.clean_runtime = clean_runtime if clean_runtime in {"dsh", "codex"} else "dsh"
         if self.clean_runtime == "codex":
             from codex_adapter import CodexRuntimeAdapter
+            providers = _provider_manager()
             self.codex_adapter = CodexRuntimeAdapter(
                 bin_path=codex_bin,
                 default_cwd=codex_cwd,
                 debug_log=lambda m: print(m, file=sys.stderr, flush=True),
+                providers=providers,
             )
+            # Provider edits restart the codex subprocess (deferred while
+            # turns are active) so new env_key secrets take effect.
+            providers.on_change(lambda event: self.codex_adapter.note_provider_change())
 
     def runtime_for(self, mode: str) -> str:
         return self.codex_adapter.NAME if (mode == "clean" and self.codex_adapter) else "dsh"
@@ -100,6 +105,30 @@ class RuntimeManager:
 
 
 RUNTIMES = RuntimeManager()
+
+
+# --- Provider Profile control plane (P0.5) -----------------------------------
+# Gateway-local surface: provider CRUD/activate/test. Never routed through
+# /api/harness — provider management belongs to the workbench control plane.
+
+
+def _provider_manager() -> Any:
+    """Lazily build the ProviderProfileManager against the product state dir
+    (same location rules as AppConfig.product_state)."""
+    global _PROVIDERS
+    if _PROVIDERS is None:
+        from provider_profile import ProviderProfileManager, CredentialStore
+        if os.name == "nt":
+            local_app_data = os.environ.get("LOCALAPPDATA")
+            state_base = Path(local_app_data) if local_app_data else Path.home() / "AppData" / "Local"
+            root = state_base / "Boujoy" / "BoujoyHarness"
+        else:
+            root = Path.home() / "Library" / "Application Support" / "Boujoy" / "BoujoyHarness"
+        _PROVIDERS = ProviderProfileManager(root, CredentialStore())
+    return _PROVIDERS
+
+
+_PROVIDERS: Any = None
 # CORS allow-list: only loopback product surfaces may call this gateway's APIs.
 # Any other Origin (e.g. an arbitrary website open in the browser) must not be
 # able to read the vault or drive write endpoints. "null" covers file:// pages.
@@ -1455,6 +1484,13 @@ class BoujoyHandler(BaseHTTPRequestHandler):
         if path == "/api/session/deleted":
             self._json({"ok": True, "sessionIds": sorted(self._deleted_session_ids())})
             return
+        if path == "/api/providers":
+            from provider_profile import ProviderError
+            try:
+                self._json(_provider_manager().public_list())
+            except ProviderError as exc:
+                self._error(400, str(exc))
+            return
         if path == "/api/records":
             kind = urllib.parse.parse_qs(parsed.query).get("kind", ["expert"])[0]
             try:
@@ -1485,6 +1521,47 @@ class BoujoyHandler(BaseHTTPRequestHandler):
             self._proxy(f"{HARNESS_ORIGINS[mode]}/api/{endpoint}", stream=True)
             return
         self._serve_static(path)
+
+    def _providers_route(self, path: str, body: bytes) -> None:
+        """Provider profile control plane: list/save/delete/activate/test."""
+        from provider_profile import ProviderError
+        managers = _provider_manager()
+        action = path[len("/api/providers"):].strip("/")
+        try:
+            payload = json.loads(body or b"{}") if action else {}
+        except json.JSONDecodeError:
+            self._error(400, "无效 JSON")
+            return
+        try:
+            if not action:
+                self._json(managers.public_list())
+                return
+            if action == "save":
+                provider = managers.save_profile(payload)
+                self._json({"ok": True, "provider": provider,
+                            "secretStorage": managers.credentials.storage_description()})
+                return
+            if action == "delete":
+                managers.delete_profile(str(payload.get("id", "")))
+                self._json({"ok": True})
+                return
+            if action == "activate":
+                active = managers.activate(str(payload.get("id", "")))
+                self._json({"ok": True, "activeProviderId": active})
+                return
+            if action == "test":
+                adapter = RUNTIMES.adapter_for("clean")
+                if adapter is None:
+                    self._error(400, "clean 模式未使用 Codex Runtime")
+                    return
+                result = adapter.test_provider(managers, str(payload.get("id", "")))
+                self._json(result)
+                return
+            self._error(404, "未知 provider 操作")
+        except ProviderError as exc:
+            self._error(400 if exc.code != "not-found" else 404, str(exc))
+        except (OSError, ValueError) as exc:
+            self._error(400, str(exc))
 
     def _ws_upgrade(self, mode: str, path: str) -> None:
         """Answer the browser's WebSocket upgrade, then bridge to Harness."""
@@ -1690,6 +1767,9 @@ class BoujoyHandler(BaseHTTPRequestHandler):
                 body=body,
                 filter_deleted=endpoint in {"session.list", "session.search", "workspace.list"},
             )
+            return
+        if path == "/api/providers" or path.startswith("/api/providers/"):
+            self._providers_route(path, body)
             return
         if path == "/api/session/delete":
             try:

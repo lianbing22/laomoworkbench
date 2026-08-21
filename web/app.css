@@ -1269,3 +1269,42 @@ html[data-theme="light"] .composer textarea:focus, html[data-theme="light"] #pro
 html[data-theme="light"] .skeleton-card { background: linear-gradient(100deg, transparent, rgba(8,10,13,.12), transparent); }
 html[data-theme="light"] button:focus-visible, html[data-theme="light"] input:focus-visible,
 html[data-theme="light"] textarea:focus-visible, html[data-theme="light"] select:focus-visible { outline-color: var(--blue); }
+
+/* --- provider profile manager (P0.5): list / badges / model rows --- */
+.provider-tool span { font-size: 15px; }
+.provider-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 16px 0 12px; }
+.provider-summary { color: var(--muted); font: 800 8px var(--mono); letter-spacing: .06em; }
+.provider-list { display: flex; flex-direction: column; gap: 9px; max-height: min(430px, calc(100vh - 340px)); overflow: auto; }
+.provider-item { padding: 13px; border: 1px solid var(--line); background: rgba(255,255,255,.035); }
+.provider-item.active { border-color: var(--acid); background: color-mix(in srgb, var(--acid) 8%, transparent); box-shadow: 4px 4px 0 var(--blue); }
+.provider-item-head { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.provider-item-head strong { font-size: 12px; }
+.provider-type-badge { padding: 3px 6px; border: 1px solid var(--line); color: var(--muted); font: 800 7px var(--mono); letter-spacing: .06em; }
+.provider-status { display: inline-flex; align-items: center; gap: 5px; margin-left: auto; padding: 3px 7px; border: 1px solid var(--line); color: var(--muted); font: 800 7px var(--mono); }
+.provider-status i { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.provider-status.s-configured { color: var(--yellow); }
+.provider-status.s-testing { color: var(--cyan); }
+.provider-status.s-testing i { animation: blink .8s steps(2) infinite; }
+.provider-status.s-ok { color: var(--acid); }
+.provider-status.s-failed { color: var(--pink); }
+.provider-current-mark { padding: 2px 6px; color: var(--ink); background: var(--acid); font: 900 7px var(--mono); transform: rotate(-2deg); }
+.provider-item small { display: block; margin-top: 6px; color: var(--muted); font: 750 8px/1.7 var(--mono); word-break: break-all; }
+.provider-test-error { margin: 8px 0 0; padding: 8px 10px; border-left: 3px solid var(--pink); color: var(--pink); background: color-mix(in srgb, var(--pink) 8%, transparent); font: 750 8px/1.6 var(--mono); }
+.provider-test-ok { margin: 8px 0 0; padding: 8px 10px; border-left: 3px solid var(--acid); color: var(--acid); background: color-mix(in srgb, var(--acid) 8%, transparent); font: 750 8px/1.6 var(--mono); }
+.provider-models-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 16px; }
+.provider-models-head label { margin-top: 0; }
+.provider-model-row { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr) 34px; gap: 7px; margin-top: 8px; }
+.provider-model-row input { min-width: 0; margin-top: 0 !important; padding: 9px 10px !important; font-family: var(--mono) !important; font-size: 11px !important; }
+.provider-model-remove { border: 1px solid var(--line); color: inherit; background: transparent; font: 1000 14px var(--mono); }
+.provider-model-remove:hover { color: var(--paper); background: var(--pink); }
+.provider-field-hint { display: block; margin-top: 6px; color: var(--muted); font: 750 8px/1.5 var(--mono); }
+.provider-advanced { margin-top: 16px; border: 1px solid var(--line); }
+.provider-advanced summary { padding: 10px 12px; color: var(--muted); font: 800 9px var(--mono); cursor: pointer; }
+.provider-advanced[open] summary { border-bottom: 1px solid var(--line); }
+.provider-advanced-body { padding: 2px 12px 12px; }
+.provider-readonly-row { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-top: 9px; color: var(--muted); font: 750 8px var(--mono); }
+.provider-readonly-row code { color: var(--text); font: 800 9px var(--mono); }
+.provider-safe-note { margin-top: 18px; padding: 10px 12px; border: 1px dashed var(--line); color: var(--muted); font: 800 8px/1.5 var(--mono); letter-spacing: .05em; text-align: center; }
+html[data-theme="light"] .provider-item { background: rgba(8,10,13,.04); }
+html[data-theme="light"] .provider-status.s-ok { color: #55731a; }
+html[data-theme="light"] .provider-item.active { background: color-mix(in srgb, #d2ff00 14%, transparent); }

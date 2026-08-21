@@ -66,6 +66,10 @@ const state = {
   readerStack: [],
   queue: [],
   subagents: [],
+  providers: [],
+  activeProviderId: null,
+  providerTesting: {},
+  providerTestResults: {},
   sessionSearchResults: null,
   sessionSearchToken: 0,
 };
@@ -2905,6 +2909,7 @@ async function loadSettings(tab = "general") {
       content.innerHTML = `
         <div class="setting-card"><strong>运行模式</strong><small>${state.mode === "clean" ? "纯净模式 · 与 Vault 隔离" : "知识模式 · 已连接 Markdown Vault"}</small></div>
         <div class="setting-card"><strong>本地引擎</strong><small>${escapeHtml(host.provider || "-")} / ${escapeHtml(host.model || "-")} · Harness ${escapeHtml(host.version || "-")}</small></div>
+        <div class="setting-card"><strong>模型服务</strong><small>管理 API 供应商、密钥与模型列表，可测试连接并切换当前服务。</small><div class="setting-actions"><button data-open-providers>打开模型服务管理</button></div></div>
         <div class="setting-card"><strong>忙碌时 Enter 行为</strong><small>选择把新任务排队，或立即引导当前执行。</small><div class="setting-actions"><button data-setting-busy="queue">排队</button><button data-setting-busy="steer">立即引导</button></div></div>
         <div class="setting-card"><strong>设置文档</strong><small>${settings.namespaces?.length || 0} 个可写命名空间 · 敏感字段始终脱敏</small><div class="setting-actions"><button data-open-settings-document>打开 Harness 设置文件</button></div></div>`;
     } else if (tab === "projects") {
@@ -2978,7 +2983,244 @@ async function settingsAction(target) {
     if (target.matches("[data-credential-set]")) { const value = $("#credentialInput")?.value.trim(); if (!value) return; await rpc("credentials.set", { ref: "DEEPSEEK_API_KEY", value }); $("#credentialInput").value = ""; toast("凭证已保存到 Harness 本地凭证库"); }
     if (target.matches("[data-credential-unset]")) { if (!confirm("清除 DeepSeek API 凭证？")) return; await rpc("credentials.unset", { ref: "DEEPSEEK_API_KEY" }); toast("凭证已清除"); }
     if (target.matches("[data-discover-models]")) { const value = await rpc("llm.discoverModels", { settingsNs: "llm-deepseek", provider: "deepseek-official" }); toast(`发现 ${value.models?.length || 0} 个模型`); }
+    if (target.matches("[data-open-providers]")) { $("#settingsDialog")?.close(); openProviderDialog(); }
   } catch (error) { toast(error.message, true); }
+}
+
+// -- Provider profiles (P0.5) -------------------------------------------------
+// Model service management: list / create / edit / delete / activate / test,
+// all against the gateway control plane (/api/providers). Secrets only go in;
+// the API never returns them, so the edit form shows a "leave blank to keep"
+// password field instead of echoing a stored key.
+
+const PROVIDER_OUTCOME_LABELS = {
+  "auth-failed": "鉴权失败",
+  "unreachable": "端点不可达",
+  "protocol-incompatible": "协议不兼容",
+  "model-not-found": "模型不存在",
+  "timeout": "超时",
+  "runtime-error": "运行时错误",
+};
+
+function providerOutcomeLabel(outcome) {
+  return PROVIDER_OUTCOME_LABELS[outcome] || "运行时错误";
+}
+
+function providerIsBuiltin(provider = {}) {
+  return Boolean(provider.builtin) || provider.type === "chatgpt";
+}
+
+function providerStatus(provider) {
+  if (state.providerTesting[provider.id]) return { key: "testing", label: "测试中" };
+  const result = state.providerTestResults[provider.id];
+  if (result?.outcome === "ok") return { key: "ok", label: "可用" };
+  if (result) return { key: "failed", label: providerOutcomeLabel(result.outcome) };
+  return provider.secretConfigured ? { key: "configured", label: "已配置" } : { key: "unconfigured", label: "未配置" };
+}
+
+async function loadProviders() {
+  const list = $("#providerList");
+  if (list && !state.providers.length) list.innerHTML = '<div class="skeleton-lines"></div>';
+  try {
+    const value = await jsonFetch("/api/providers");
+    state.providers = value.providers || [];
+    state.activeProviderId = value.activeProviderId || null;
+    renderProviders();
+  } catch (error) {
+    if (list) list.innerHTML = `<div class="setting-card"><strong>读取失败</strong><small>${escapeHtml(error.message)}</small></div>`;
+  }
+}
+
+function renderProviders() {
+  const list = $("#providerList");
+  if (!list) return;
+  const active = state.providers.find(item => item.id === state.activeProviderId);
+  const summary = $("#providerSummary");
+  if (summary) summary.textContent = `${state.providers.length} 个服务${active ? ` · 当前：${active.name || active.id}` : ""}`;
+  list.innerHTML = state.providers.map(provider => {
+    const status = providerStatus(provider);
+    const isActive = provider.id === state.activeProviderId;
+    const testing = Boolean(state.providerTesting[provider.id]);
+    const result = state.providerTestResults[provider.id];
+    const meta = [
+      providerIsBuiltin(provider) ? "内置 · Codex 登录" : (provider.baseUrl || "未设置 Base URL"),
+      `${(provider.models || []).length} 个模型`,
+      provider.defaultModel ? `默认 ${provider.defaultModel}` : "未设默认模型",
+      provider.enabled === false ? "已停用" : "",
+    ].filter(Boolean).join(" · ");
+    const errorLine = result && result.outcome !== "ok"
+      ? `<p class="provider-test-error">${escapeHtml(providerOutcomeLabel(result.outcome))}${result.message ? `：${escapeHtml(result.message)}` : ""}</p>` : "";
+    const okLine = result && result.outcome === "ok"
+      ? `<p class="provider-test-ok">测试通过${result.message ? `：${escapeHtml(result.message)}` : ""}</p>` : "";
+    return `
+    <article class="provider-item ${isActive ? "active" : ""}">
+      <div class="provider-item-head">
+        <strong>${escapeHtml(provider.name || provider.id)}</strong>
+        <span class="provider-type-badge">${providerIsBuiltin(provider) ? "内置" : "自定义"}</span>
+        ${isActive ? '<span class="provider-current-mark">当前</span>' : ""}
+        <span class="provider-status s-${status.key}"><i></i>${escapeHtml(status.label)}</span>
+      </div>
+      <small>${escapeHtml(meta)}</small>
+      ${errorLine}${okLine}
+      <div class="setting-actions">
+        <button data-provider-activate="${escapeHtml(provider.id)}" ${isActive || provider.enabled === false ? "disabled" : ""}>${isActive ? "当前服务" : "设为当前"}</button>
+        <button data-provider-test="${escapeHtml(provider.id)}" ${testing ? "disabled" : ""}>${testing ? "测试中…" : "测试连接"}</button>
+        <button data-provider-edit="${escapeHtml(provider.id)}">编辑</button>
+        <button data-provider-delete="${escapeHtml(provider.id)}" ${providerIsBuiltin(provider) ? "disabled" : ""}>删除</button>
+      </div>
+    </article>`;
+  }).join("") || '<p class="muted">还没有模型服务，点击右上角「新建服务」。</p>';
+}
+
+function showProviderList() {
+  $("#providerFormPanel")?.classList.add("hidden");
+  $("#providerListPanel")?.classList.remove("hidden");
+  $("#providerListDone")?.classList.remove("hidden");
+  $("#providerEditCancel")?.classList.add("hidden");
+  $("#providerSaveButton")?.classList.add("hidden");
+  $("#providerKicker").textContent = "MODEL PROVIDERS";
+  $("#providerTitle").textContent = "模型服务";
+}
+
+function openProviderDialog() {
+  const dialog = $("#providerDialog");
+  if (!dialog) return;
+  showProviderList();
+  if (!dialog.open) dialog.showModal();
+  loadProviders();
+}
+
+function addProviderModelRow(id = "", label = "") {
+  const row = document.createElement("div");
+  row.className = "provider-model-row";
+  row.innerHTML = `
+    <input class="provider-model-id" placeholder="模型 ID，如 gpt-5.6-luna" value="${escapeHtml(id)}" autocomplete="off" spellcheck="false">
+    <input class="provider-model-label" placeholder="显示名（可选）" value="${escapeHtml(label)}" autocomplete="off">
+    <button type="button" class="provider-model-remove" data-provider-model-remove title="移除这行">×</button>`;
+  $("#providerModelRows")?.append(row);
+  return row;
+}
+
+function collectProviderModels() {
+  return $$("#providerModelRows .provider-model-row").map(row => {
+    const id = $(".provider-model-id", row).value.trim();
+    const label = $(".provider-model-label", row).value.trim();
+    return id ? { id, label: label || id } : null;
+  }).filter(Boolean);
+}
+
+function syncProviderDefaultModelOptions(preferred = null, modelsOverride = null) {
+  const select = $("#providerDefaultModel");
+  if (!select) return;
+  const current = preferred ?? select.value;
+  const models = modelsOverride || collectProviderModels();
+  select.innerHTML = ['<option value="">（跟随服务默认）</option>', ...models.map(model => `<option value="${escapeHtml(model.id)}">${escapeHtml(model.label === model.id ? model.id : `${model.label}（${model.id}）`)}</option>`)].join("");
+  select.value = models.some(model => model.id === current) ? current : "";
+}
+
+function openProviderForm(provider = null) {
+  const builtin = providerIsBuiltin(provider || {});
+  $("#providerId").value = provider?.id || "";
+  $("#providerType").value = provider?.type || "custom";
+  $("#providerName").value = provider?.name || "";
+  $("#providerBaseUrl").value = provider?.baseUrl || "";
+  $("#providerBaseUrl").disabled = builtin;
+  $("#providerBaseUrl").placeholder = builtin ? "内置 Codex 登录，无需 Base URL" : "https://api.example.com/v1";
+  $("#providerSecret").value = "";
+  $("#providerSecretWrap label")?.classList.toggle("hidden", builtin);
+  $("#providerSecretNote").classList.toggle("hidden", !builtin);
+  $("#providerSecretHint").textContent = provider?.secretConfigured ? "已保存 API Key；留空保存即保留原值。" : "尚未保存 API Key。";
+  $("#providerModelRows").innerHTML = "";
+  (provider?.models || []).forEach(model => addProviderModelRow(model.id, model.label || model.id));
+  if (!builtin && !(provider?.models || []).length) addProviderModelRow();
+  $("#providerModelRows").classList.toggle("hidden", builtin);
+  $("#providerModelAdd").classList.toggle("hidden", builtin);
+  $("#providerModelsNote").classList.toggle("hidden", !builtin);
+  syncProviderDefaultModelOptions(provider?.defaultModel || "", builtin ? (provider?.models || []) : null);
+  $("#providerEnabled").checked = provider?.enabled ?? true;
+  $("#providerEnvKey").textContent = provider?.envKey || "—";
+  $("#providerAdvanced").open = false;
+  $("#providerKicker").textContent = provider ? "EDIT PROVIDER" : "NEW PROVIDER";
+  $("#providerTitle").textContent = provider ? "编辑模型服务" : "新建模型服务";
+  $("#providerListPanel").classList.add("hidden");
+  $("#providerFormPanel").classList.remove("hidden");
+  $("#providerListDone").classList.add("hidden");
+  $("#providerEditCancel").classList.remove("hidden");
+  $("#providerSaveButton").classList.remove("hidden");
+  $("#providerName").focus();
+}
+
+async function saveProvider(event) {
+  event.preventDefault();
+  const button = $("#providerSaveButton");
+  const type = $("#providerType").value || "custom";
+  const name = $("#providerName").value.trim();
+  if (!name) { toast("请填写服务名称", true); return; }
+  const baseUrl = $("#providerBaseUrl").value.trim();
+  if (type !== "chatgpt" && !baseUrl) { toast("自定义服务需要填写 Base URL", true); return; }
+  const payload = {
+    id: $("#providerId").value || undefined,
+    name,
+    type,
+    baseUrl: type === "chatgpt" ? null : baseUrl,
+    defaultModel: $("#providerDefaultModel").value || null,
+    enabled: $("#providerEnabled").checked,
+  };
+  // ChatGPT 的模型列表由 Codex 动态获取，不回传静态列表覆盖。
+  if (type !== "chatgpt") payload.models = collectProviderModels();
+  // secret 只进不出：输入留空则整个字段不传，后端保留原值。
+  const secret = $("#providerSecret").value.trim();
+  if (secret && type !== "chatgpt") payload.secret = secret;
+  button.disabled = true;
+  try {
+    const value = await jsonFetch("/api/providers/save", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+    if (value.provider?.id) delete state.providerTestResults[value.provider.id];
+    $("#providerSecret").value = "";
+    toast("模型服务已保存");
+    showProviderList();
+    await loadProviders();
+  } catch (error) { toast(error.message, true); }
+  finally { button.disabled = false; }
+}
+
+async function deleteProvider(id) {
+  const provider = state.providers.find(item => item.id === id);
+  if (!provider) return;
+  if (!confirm(`删除模型服务“${provider.name || provider.id}”？已保存的 API Key 也会一并移除。`)) return;
+  try {
+    await jsonFetch("/api/providers/delete", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id }) });
+    delete state.providerTestResults[id];
+    toast("模型服务已删除");
+    await loadProviders();
+  } catch (error) { toast(error.message, true); }
+}
+
+async function activateProvider(id) {
+  try {
+    const value = await jsonFetch("/api/providers/activate", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id }) });
+    state.activeProviderId = value.activeProviderId || id;
+    renderProviders();
+    toast("模型服务已切换，将在新会话中生效");
+    // 已有会话的绑定不变；刷新一次模型目录让选择器与新默认值对齐。
+    loadModels();
+  } catch (error) { toast(error.message, true); }
+}
+
+async function testProvider(id) {
+  if (state.providerTesting[id]) return;
+  state.providerTesting[id] = true;
+  renderProviders();
+  try {
+    // 真实 ephemeral E2E 调用，放宽超时。
+    const value = await jsonFetch("/api/providers/test", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id }) }, 120000);
+    state.providerTestResults[id] = { outcome: value.outcome || "runtime-error", message: value.message || "" };
+    if (value.outcome === "ok") toast(`连接正常：${value.message || "回复正常"}`);
+  } catch (error) {
+    state.providerTestResults[id] = { outcome: "runtime-error", message: error.message };
+  } finally {
+    delete state.providerTesting[id];
+    renderProviders();
+  }
 }
 
 const COMMANDS = [
@@ -2988,6 +3230,7 @@ const COMMANDS = [
   { name: "打开风格", hint: "04", run: () => showPage("styles") },
   { name: "新建会话", hint: "⌘ N", run: createSession },
   { name: "选择新项目", hint: "⌘ O", run: pickProject },
+  { name: "模型服务管理", hint: "Provider", run: openProviderDialog },
   { name: "切换明暗主题", hint: "", run: () => setTheme(state.theme === "dark" ? "light" : "dark") },
   { name: "切换知识 / 纯净模式", hint: "", run: () => setMode(state.mode === "knowledge" ? "clean" : "knowledge") },
   { name: "重启老墨工作台", hint: "安全重启", run: restartBoujoy },
@@ -3079,7 +3322,7 @@ function bindEvents() {
     if (workspaceActionButton) { const [action, id] = workspaceActionButton.dataset.workspaceAction.split(":"); workspaceAction(action, id); return; }
     const presetActionButton = event.target.closest("[data-preset-action]");
     if (presetActionButton) { const [action, id] = presetActionButton.dataset.presetAction.split(":"); presetAction(action, id); return; }
-    const settingsActionButton = event.target.closest("[data-open-settings-document],[data-setting-busy],[data-credential-set],[data-credential-unset],[data-discover-models]");
+    const settingsActionButton = event.target.closest("[data-open-settings-document],[data-setting-busy],[data-credential-set],[data-credential-unset],[data-discover-models],[data-open-providers]");
     if (settingsActionButton) { settingsAction(settingsActionButton); return; }
     const goalActionButton = event.target.closest("[data-goal-action]");
     if (goalActionButton) { goalAction(goalActionButton.dataset.goalAction); return; }
@@ -3292,6 +3535,30 @@ function bindEvents() {
     if (dialog?.open) dialog.close();
   }));
   $("#settingsButton").addEventListener("click", () => { $("#settingsDialog").showModal(); loadSettings(); });
+  // Provider profile dialog: composer entry + list/form actions.
+  $("#providerButton")?.addEventListener("click", openProviderDialog);
+  $("#providerNewButton")?.addEventListener("click", () => openProviderForm(null));
+  $("#providerListDone")?.addEventListener("click", () => $("#providerDialog")?.close());
+  $("#providerEditCancel")?.addEventListener("click", showProviderList);
+  $("#providerForm")?.addEventListener("submit", saveProvider);
+  $("#providerModelAdd")?.addEventListener("click", () => addProviderModelRow());
+  $("#providerModelRows")?.addEventListener("click", event => {
+    const remove = event.target.closest("[data-provider-model-remove]");
+    if (!remove) return;
+    remove.closest(".provider-model-row")?.remove();
+    syncProviderDefaultModelOptions();
+  });
+  $("#providerModelRows")?.addEventListener("input", () => syncProviderDefaultModelOptions());
+  $("#providerList")?.addEventListener("click", event => {
+    const activateButton = event.target.closest("[data-provider-activate]");
+    if (activateButton) { activateProvider(activateButton.dataset.providerActivate); return; }
+    const testButton = event.target.closest("[data-provider-test]");
+    if (testButton) { testProvider(testButton.dataset.providerTest); return; }
+    const editButton = event.target.closest("[data-provider-edit]");
+    if (editButton) { openProviderForm(state.providers.find(item => item.id === editButton.dataset.providerEdit) || null); return; }
+    const deleteButton = event.target.closest("[data-provider-delete]");
+    if (deleteButton) { deleteProvider(deleteButton.dataset.providerDelete); }
+  });
   $$("[data-settings]").forEach(button => button.addEventListener("click", () => {
     $$("[data-settings]").forEach(item => item.classList.toggle("active", item === button)); loadSettings(button.dataset.settings);
   }));
