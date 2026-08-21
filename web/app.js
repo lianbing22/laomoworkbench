@@ -11,7 +11,9 @@ const HISTORY_FETCH_LIMIT = 50;
 const state = {
   page: "agent",
   theme: localStorage.getItem("boujoy-theme") || "dark",
-  mode: localStorage.getItem("boujoy-mode") === "clean" ? "clean" : "knowledge",
+  // Default to clean: this deployment's knowledge runtime (DSH 3080) may be
+  // absent; an explicit knowledge choice is still remembered.
+  mode: localStorage.getItem("boujoy-mode") === "knowledge" ? "knowledge" : "clean",
   host: null,
   sessions: [],
   workspaces: [],
@@ -1072,6 +1074,36 @@ async function loadModels() {
     const effort = item.reasoning?.defaultEffort || state.modelDirectory?.current?.reasoningEffort;
     return `<option value="${escapeHtml(JSON.stringify({ model, provider, reasoningEffort: effort }))}" ${model === current ? "selected" : ""}>${escapeHtml(item.name || item.label || item.displayName || model || "模型")}</option>`;
   }).join("") || `<option>${escapeHtml(current || "默认模型")}</option>`;
+  renderEffortOptions(current);
+}
+
+// Reasoning-effort dropdown beside the model selector. Options come from the
+// selected model's catalogue (state.models[].reasoning.efforts) with the
+// session-wide list as fallback.
+function renderEffortOptions(modelId) {
+  const effortSelect = $("#effortSelect");
+  if (!effortSelect) return;
+  const entry = state.models.find(item => (item.model || item.id) === modelId);
+  let efforts = (entry?.reasoning?.efforts || []).map(e => (typeof e === "string" ? e : e?.name)).filter(Boolean);
+  if (!efforts.length) efforts = state.modelDirectory?.current?.reasoning?.efforts || ["low", "medium", "high"];
+  const currentEffort = state.modelDirectory?.current?.reasoningEffort
+    || entry?.reasoning?.defaultEffort
+    || state.modelDirectory?.current?.reasoning?.defaultEffort || "";
+  effortSelect.innerHTML = ['<option value="">默认强度</option>', ...efforts.map(e => `<option value="${escapeHtml(String(e))}" ${String(e) === String(currentEffort) ? "selected" : ""}>${escapeHtml(String(e))}</option>`)].join("");
+}
+
+async function applyEffort() {
+  try {
+    const effort = $("#effortSelect").value;
+    if (!state.sessionId) { toast("请先创建会话", true); return; }
+    if (!effort) { toast("已恢复默认推理强度"); return; }
+    let model = null, provider = null;
+    try { const selected = JSON.parse($("#modelSelect").value); model = selected.model; provider = selected.provider; } catch (_) {}
+    const current = state.modelDirectory?.current || {};
+    await rpc("session.selectModel", { sessionId: state.sessionId, model: model || current.model, provider: provider || current.provider, reasoningEffort: effort });
+    if (state.modelDirectory?.current) state.modelDirectory.current.reasoningEffort = effort;
+    toast(`推理强度已设为 ${effort}`);
+  } catch (error) { toast(error.message, true); }
 }
 
 async function createSession() {
@@ -2150,6 +2182,8 @@ async function selectModel() {
     const selected = JSON.parse($("#modelSelect").value);
     if (!state.sessionId || !selected.model) return;
     await rpc("session.selectModel", { sessionId: state.sessionId, model: selected.model, provider: selected.provider, reasoningEffort: selected.reasoningEffort || undefined });
+    if (state.modelDirectory?.current) state.modelDirectory.current.model = selected.model;
+    renderEffortOptions(selected.model);
     toast(`已切换到 ${selected.model}`);
   } catch (error) { toast(error.message, true); }
 }
@@ -3196,6 +3230,7 @@ function bindEvents() {
   }, { passive: true });
   $("#cancelButton").addEventListener("click", cancelRun);
   $("#modelSelect").addEventListener("change", selectModel);
+  $("#effortSelect").addEventListener("change", applyEffort);
   $("#permissionSelect").addEventListener("change", selectPermission);
   $("#presetSelect").addEventListener("change", selectPreset);
   $("#attachButton").addEventListener("click", () => $("#imageInput").click());
