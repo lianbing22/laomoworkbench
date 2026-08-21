@@ -3,7 +3,35 @@
 本文件记录 `lianbing22/laomoworkbench` 自品牌化以来的全部功能更新。协议细节见
 [docs/codex-protocol-notes.md](docs/codex-protocol-notes.md)，P1 待办见 [P1_NOTES.md](P1_NOTES.md)。
 
-## 2026-08-22 — P0 Clean Runtime Migration 及后续增强
+## 2026-08-22（二）— P0.5 Model Provider Profiles（多 agent 并行实施）
+
+在 P0 基础上产品化模型服务配置：用户不碰 Codex 配置文件，即可配置/验证/启用
+模型服务 Provider，新会话真正绑定 Provider + Model。
+
+- **ProviderProfileManager**（`web/provider_profile.py`）：ProfileStore（JSON、
+  永不含 secret）+ CredentialStore（macOS 钥匙串；不可用时仅本次运行并明示）
+  + CRUD/激活/env 注入/公开视图只回 `secretConfigured`；空 secret 保留旧值；
+  内置不可删的 ChatGPT Profile（零配置沿用现有登录）。
+- **Codex 集成**（协议实测驱动）：`config/value/write` upsert 注册
+  ModelProviderInfo（snake_case、追加式不碰用户其它配置）；`thread/start.modelProvider`
+  线程级绑定；`LAOMO_CODEX_PROVIDER_<ID>_KEY` 环境变量注入子进程；Provider 变更
+  空闲时优雅重启（运行中回合绝不静默杀）；`provider test` 真实 ephemeral E2E
+  （事件总线等完成，6s 实测）+ 六类错误分类。
+- **会话语义**：`session.create` 绑定 providerId；`session.models` Provider 化
+  投影（已绑定会话只见本 Provider 模型）；`selectModel` 跨 Provider 拦截
+  （`provider-change-requires-new-session`）。
+- **前端**：⚙"服务"入口 + Provider 管理 Drawer（状态徽章/编辑表单/测试连接/
+  激活，错误按 outcome 映射中文，Key 安全提示）。
+- **协议边界（诚实声明）**：当前 Codex `wire_api` 仅支持 `responses`——
+  自定义服务必须实现 OpenAI Responses API；Chat Completions 兼容服务会被明确
+  判定"协议不兼容"，不做协议转换。
+- **测试**：`tests/provider_test.py` 34 项（secret 零泄漏/钥匙串零触碰 tripwire/
+  注册参数断言/错误分类表/跨 Provider 拦截等）+ `tests/mock_responses_server.py`
+  （最小 Responses API mock，SSE 可选）；Gate A（ChatGPT 零回归）与
+  Gate B（Mock Provider 全链路：真实 Codex 请求打到 Mock、鉴权与模型正确、
+  回合返回）双 PASS；smoke 16/16、codex 单测 28 保持。
+
+## 2026-08-22（一）— P0 Clean Runtime Migration 及后续增强
 
 ### 核心架构：Codex 接管纯净模式（`2b39173`）
 

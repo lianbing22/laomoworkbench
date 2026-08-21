@@ -1184,38 +1184,46 @@ class CodexRuntimeAdapter:
             tid = res.get("threadId") or res.get("id") or (res.get("thread") or {}).get("id", "")
             if not tid:
                 return {"ok": False, "outcome": "runtime-error", "message": "测试线程创建失败"}
+            # Ephemeral threads cannot be polled via thread/read; watch the
+            # event bus instead — turn/end + assistant/message frames arrive
+            # from the same translator pipeline as normal sessions.
+            completed: dict[str, Any] = {}
+            done = threading.Event()
+
+            def on_frame(frame: dict[str, Any]) -> None:
+                payload = frame.get("payload", {})
+                if payload.get("type") != "session/event" or payload.get("sessionId") != tid:
+                    return
+                event = payload.get("event", {})
+                if event.get("type") == "turn/end":
+                    reason = (event.get("data") or {}).get("reason") or {}
+                    completed["status"] = "failed" if reason.get("kind") == "error" else "completed"
+                    completed["error"] = (reason.get("error") or {}).get("message", "")
+                    done.set()
+                elif event.get("type") == "assistant/message":
+                    content = ((event.get("data") or {}).get("message") or {}).get("content") or []
+                    completed["answered"] = any((b or {}).get("text") for b in content if isinstance(b, dict))
+
+            unsubscribe = self.subscribe(on_frame)
             try:
                 proc.rpc.request("turn/start", {
                     "threadId": tid, "cwd": isolated,
                     "input": [{"type": "text", "text": "Reply exactly: OK"}],
                 }, timeout=30)
+                done.wait(60)
             except RuntimeError as exc:
                 return self._classify_provider_error(str(exc))
-            deadline = time.time() + 60
-            final_turn: dict[str, Any] = {}
-            while time.time() < deadline:
-                time.sleep(2)
-                try:
-                    thread = proc.rpc.request("thread/read", {"threadId": tid, "includeTurns": True}, timeout=30)
-                    turns = (thread.get("thread") or {}).get("turns") or []
-                except (TimeoutError, RuntimeError):
-                    turns = []
-                if turns:
-                    final_turn = turns[-1]
-                    if final_turn.get("status") in ("completed", "failed", "interrupted"):
-                        break
+            finally:
+                unsubscribe()
             try:
                 proc.rpc.request("thread/delete", {"threadId": tid}, timeout=15)
             except (TimeoutError, RuntimeError):
                 pass
-            if not final_turn:
+            if not completed:
                 return {"ok": False, "outcome": "timeout", "message": "测试回合 60 秒内未完成"}
-            if final_turn.get("status") == "failed":
-                err = (final_turn.get("error") or {}).get("message", "")
-                return self._classify_provider_error(err or "turn failed")
-            answered = any((e.get("item", {}) or {}).get("type") == "agentMessage"
-                           for e in final_turn.get("items", []) or [])
-            if not answered:
+            if completed.get("status") == "failed":
+                return self._classify_provider_error(completed.get("error") or "turn failed")
+            if not completed.get("answered"):
                 return {"ok": False, "outcome": "protocol-incompatible",
                         "message": "回合完成但未返回模型回复（协议或模型不兼容）"}
             return {"ok": True, "outcome": "ok", "message": "连接与推理正常"}
