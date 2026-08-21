@@ -1,7 +1,7 @@
 {
-  "name": "Boujoy Harness",
-  "short_name": "Boujoy",
-  "description": "Boujoy Harness 手机端 — 实时监控与操作你的本地 Agent 与第二大脑",
+  "name": "老墨工作台",
+  "short_name": "老墨",
+  "description": "老墨工作台（LAOMO WORKBENCH）手机端 — 实时监控与操作你的本地 Agent 与第二大脑",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
