@@ -318,7 +318,9 @@ class TestAdapterStatics(unittest.TestCase):
         r = adapter.rpc("clean", "subagent.list", {})
         self.assertTrue(r["result"]["ok"])          # safe stub, no crash
         self.assertFalse(r["result"]["value"]["supported"])
-        r = adapter.rpc("clean", "goal.create", {"objective": "x"})
+        # goal.* is a real handler now; its stub-era generic path is covered
+        # by another method (search with empty query returns ok).
+        r = adapter.rpc("clean", "session.search", {"query": ""})
         self.assertTrue(r["result"]["ok"])
 
     def test_workspace_cwd_roundtrip(self):

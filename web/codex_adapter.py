@@ -167,7 +167,21 @@ class EventTranslator:
         out: list[dict[str, Any]] = []
         sid = params.get("threadId") or ""
         try:
-            if method == "item/agentMessage/delta":
+            if method == "turn/plan/updated":
+                steps = params.get("plan", []) or []
+                items = [{"step": str(s.get("step", "")), "status": s.get("status", "pending")}
+                         for s in steps if isinstance(s, dict)]
+                ctx.registry.set_plan(sid, items)
+                out.append(self.session_projection(sid, "plan", {"items": items}))
+            elif method == "thread/goal/updated":
+                goal = params.get("goal", {}) or {}
+                view = self._goal_view(sid, goal)
+                ctx.registry.set_goal(sid, view)
+                out.append(self.session_projection(sid, "goal", view))
+            elif method == "thread/goal/cleared":
+                ctx.registry.set_goal(sid, None)
+                out.append(self.session_projection(sid, "goal", {"objective": None}))
+            elif method == "item/agentMessage/delta":
                 delta = params.get("delta", "")
                 if delta:
                     call = params.get("callId") or params.get("itemd") or ""
@@ -361,6 +375,14 @@ class EventTranslator:
             "step": item_id or "0",
         }
         return self.session_event(sid, "assistant/message", data)
+
+    @staticmethod
+    def _goal_view(sid: str, goal: dict[str, Any]) -> dict[str, Any]:
+        # DSH-shaped goal projection; ref enables the pause/complete/clear
+        # action buttons in the signal card.
+        return {"objective": goal.get("objective", ""),
+                "phase": goal.get("status", "active"),
+                "ref": {"id": sid, "revision": int(goal.get("updatedAt") or 1)}}
 
     def _token_usage(self, sid: str, params: dict[str, Any], ctx: "CodexRuntimeAdapter") -> list[dict[str, Any]]:
         # Schema: {tokenUsage: {last: breakdown, total: breakdown, modelContextWindow}}
@@ -556,6 +578,16 @@ class SessionRegistry:
         with self._lock:
             s["usage"] = usage
             s["pressure"] = pressure
+
+    def set_plan(self, thread_id: str, items: list[dict[str, Any]]) -> None:
+        s = self.ensure(thread_id)
+        with self._lock:
+            s["plan"] = {"items": items}
+
+    def set_goal(self, thread_id: str, view: dict[str, Any] | None) -> None:
+        s = self.ensure(thread_id)
+        with self._lock:
+            s["goal"] = view
 
     def set_permission(self, thread_id: str, permission: str) -> None:
         s = self.ensure(thread_id)
@@ -1089,9 +1121,21 @@ class CodexRuntimeAdapter:
             return err_value("empty prompt content")
         reg = self.registry.ensure(sid)
         if reg.get("running"):
-            params = {"threadId": sid, "input": input_items}
-            res = proc.rpc.request("turn/steer", params, timeout=30) or {}
-            return ok_value({"accepted": True, "submissionId": res.get("turnId") or ""})
+            # Schema: steer requires expectedTurnId (active turn precondition).
+            params = {"threadId": sid, "input": input_items,
+                      "expectedTurnId": reg.get("turnId") or "",
+                      "clientUserMessageId": rpc_id or str(uuid.uuid4())}
+            try:
+                res = proc.rpc.request("turn/steer", params, timeout=30) or {}
+            except RuntimeError as exc:
+                # The registry can lag behind a turn that just completed;
+                # fall back to a fresh turn instead of failing the message.
+                if "expectedTurnId" not in str(exc) and "does not match" not in str(exc):
+                    raise
+                self.registry.set_running(sid, False)
+                res = None
+            if res is not None:
+                return ok_value({"accepted": True, "submissionId": res.get("turnId") or ""})
         params = {"threadId": sid, "input": input_items,
                   "clientUserMessageId": rpc_id or str(uuid.uuid4())}
         model, effort = self._session_model_overrides(sid)
@@ -1175,6 +1219,10 @@ class CodexRuntimeAdapter:
             projections["tokenUsage"] = reg["usage"]
         if reg.get("pressure"):
             projections["contextPressure"] = reg["pressure"]
+        if reg.get("plan"):
+            projections["plan"] = reg["plan"]
+        if reg.get("goal"):
+            projections["goal"] = reg["goal"]
         return ok_value({"events": events, "hasMore": has_more,
                          "projections": {"asOfSeq": len(events), "values": projections}})
 
@@ -1251,6 +1299,54 @@ class CodexRuntimeAdapter:
         except (AdapterUnavailable, TimeoutError, RuntimeError) as exc:
             self._debug_log(f"archive failed (ignored): {exc}")
         return ok_value({"archived": True})
+
+    # goal.* -> thread/goal/set|clear (objective tracking with phase buttons)
+    def _goal_set(self, body: dict[str, Any], status: str | None = None) -> dict[str, Any]:
+        sid = str(body.get("sessionId", ""))
+        if not sid:
+            return err_value("sessionId required")
+        objective = str(body.get("objective", "")).strip()
+        reg = self.registry.get(sid) or {}
+        current = reg.get("goal") or {}
+        if not objective:
+            objective = str(current.get("objective", "") or "")
+        if not objective:
+            return err_value("objective required")
+        proc = self._ensure_process()
+        params: dict[str, Any] = {"threadId": sid, "objective": objective}
+        if status:
+            params["status"] = status
+        proc.rpc.request("thread/goal/set", params, timeout=20)
+        view = {"objective": objective, "phase": status or str(current.get("phase", "active")),
+                "ref": {"id": sid, "revision": int(time.time() * 1000)}}
+        self.registry.set_goal(sid, view)
+        self._emit(self.translator.session_projection(sid, "goal", view))
+        return ok_value({"goal": view})
+
+    def _rpc_goal_create(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
+        return self._goal_set(body, status="active")
+
+    def _rpc_goal_edit(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
+        return self._goal_set(body)
+
+    def _rpc_goal_pause(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
+        return self._goal_set(body, status="paused")
+
+    def _rpc_goal_resume(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
+        return self._goal_set(body, status="active")
+
+    def _rpc_goal_complete(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
+        return self._goal_set(body, status="complete")
+
+    def _rpc_goal_clear(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
+        sid = str(body.get("sessionId", ""))
+        if not sid:
+            return err_value("sessionId required")
+        proc = self._ensure_process()
+        proc.rpc.request("thread/goal/clear", {"threadId": sid}, timeout=20)
+        self.registry.set_goal(sid, None)
+        self._emit(self.translator.session_projection(sid, "goal", {"objective": None}))
+        return ok_value({"cleared": True})
 
     # commands/execute -> /permission <level> (the only line the UI sends)
     _SANDBOX_MAP = {
