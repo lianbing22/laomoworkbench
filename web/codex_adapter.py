@@ -174,7 +174,9 @@ class EventTranslator:
                 ctx.registry.set_running(sid, True)
                 ctx.registry.set_turn(sid, turn_id)
                 self._current_turn[sid] = turn_id
-                out.append(self.session_event(sid, "turn/start", {"turn": turn_id}))
+                # No turn id in the notice payload: the UI prints it verbatim
+                # ("回合 <id> 开始"), and Codex UUIDs are pure noise there.
+                out.append(self.session_event(sid, "turn/start", {}))
                 out.append(self.host_status(sid, True))
             elif method == "turn/completed":
                 turn = params.get("turn", {}) or {}
@@ -244,7 +246,7 @@ class EventTranslator:
         turn_status = turn.get("status")
         if turn_status == "interrupted":
             reason = {"kind": "stop", "interrupted": True}
-        return self.session_event(sid, "turn/end", {"turn": turn.get("id", ""), "reason": reason})
+        return self.session_event(sid, "turn/end", {"reason": reason})
 
     def _item_started(self, sid: str, params: dict[str, Any], ctx: "CodexRuntimeAdapter") -> list[dict[str, Any]]:
         item = params.get("item", {}) or {}
@@ -392,7 +394,7 @@ class HistoryFolder:
         for turn in turns:
             turn_id = turn.get("id", "")
             started = turn.get("startedAt") or 0
-            events.append(ev("turn/start", {"turn": turn_id}, started))
+            events.append(ev("turn/start", {}, started))
             # The user's message leads every turn; rollout order is normally
             # user-first already, but keep it stable defensively.
             entries = turn.get("items", []) or []
@@ -404,7 +406,7 @@ class HistoryFolder:
                 events.extend(HistoryFolder._fold_item(item, ev, started, turn))
             error = turn.get("error")
             reason = {"kind": "error", "error": {"message": str(error.get("message", ""))}} if error else {"kind": "stop"}
-            events.append(ev("turn/end", {"turn": turn_id, "reason": reason}, turn.get("completedAt") or started))
+            events.append(ev("turn/end", {"reason": reason}, turn.get("completedAt") or started))
         return events
 
     @staticmethod
