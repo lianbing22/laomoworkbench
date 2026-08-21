@@ -242,24 +242,25 @@ def _ws_relay(browser: socket.socket, upstream: socket.socket) -> None:
 # Fetched from public RSS feeds on demand, cached locally. No keys, no third-party
 # services; the browser only ever reads the cached JSON from this gateway.
 
-# 新闻源（行业动态 / 研究突破）
+# 新闻源（行业动态 / 研究突破）。AIHOT 是中文 AI 动态聚合（去重+打分），
+# 作为主源；其余为补充。
 NEWS_SOURCES = [
+    {"name": "AIHOT", "url": "https://aihot.virxact.com/feed/all.xml"},
     {"name": "量子位", "url": "https://www.qbitai.com/feed"},
-    {"name": "MIT Tech", "url": "https://www.technologyreview.com/topic/artificial-intelligence/feed"},
     {"name": "HN ML", "url": "https://hnrss.org/newest?q=machine+learning"},
 ]
 
-# 工具与主流模型动向源（产品更新 / 发布）。HuggingFace 在本机网络不可达，
-# Anthropic 无公开 RSS（404），已移除；Google AI 响应慢，超时放宽。
+# 工具与主流模型动向源（产品更新 / 发布）。AIHOT 日报作主源；HuggingFace
+# 在本机网络不可达，Anthropic 无公开 RSS（404），已移除。
 TOOLS_SOURCES = [
-    {"name": "OpenAI", "url": "https://openai.com/news/rss.xml"},
-    {"name": "Google AI", "url": "https://blog.google/technology/ai/rss/"},
-    {"name": "TechCrunch AI", "url": "https://techcrunch.com/category/artificial-intelligence/feed/"},
+    {"name": "AIHOT 日报", "url": "https://aihot.virxact.com/feed/daily.xml"},
+    {"name": "OpenAI", "url": "https://www.openai.com/news/rss.xml"},
+    {"name": "TechCrunch AI", "url": "https://www.techcrunch.com/category/artificial-intelligence/feed/"},
 ]
 
 _NEWS_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 _NEWS_OPENER.addheaders = [("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) BoujoyHarness/1.0")]
-_NEWS_CACHE_SCHEMA = 3
+_NEWS_CACHE_SCHEMA = 4  # 4: AIHOT 主源（all + daily），替换 MIT Tech / Google AI
 
 
 def _parse_rss_date(value: str) -> datetime | None:

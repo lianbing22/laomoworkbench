@@ -793,10 +793,8 @@ function setTheme(theme) {
 }
 
 function showPage(page) {
-  if (state.mode === "clean" && page !== "agent") {
-    toast("纯净模式与知识库完全隔离；先切回知识模式。", true);
-    return;
-  }
+  // All pages are gateway-local features available in both modes; the clean
+  // mode only swaps the agent runtime and vault context injection.
   state.page = page;
   $$('[data-page-panel]').forEach(panel => panel.classList.toggle("active", panel.dataset.pagePanel === page));
   $$(".nav-cut").forEach(button => button.classList.toggle("active", button.dataset.page === page));
@@ -822,7 +820,10 @@ async function setMode(mode) {
   $("#agentEyebrow").textContent = clean ? "PURE HARNESS / NO MEMORY" : "KNOWLEDGE-LINKED AGENT";
   $("#agentHeadline").textContent = clean ? "新项目，不读取过去。" : "把想法变成行动。";
   configureStarterCards(clean);
-  $$(".nav-cut").forEach(button => { if (button.dataset.page !== "agent") button.disabled = clean; });
+  // All pages stay reachable in both modes: knowledge/expert/style are
+  // gateway-local vault features and the news/monitor pages are runtime
+  // independent. The mode only switches the agent runtime + vault context.
+  $$(".nav-cut").forEach(button => { button.disabled = false; });
   showPage("agent");
   state.sessions = [];
   state.sessionId = null;
