@@ -24,6 +24,10 @@ const state = {
   modelDirectory: null,
   presets: [],
   pendingImages: [],
+  imageUrls: new Map(),
+  imageLoads: new Map(),
+  imageErrors: new Map(),
+  imageRefs: new Map(),
   knowledge: [],
   knowledgeLoading: false,
   knowledgeFilter: "all",
@@ -743,8 +747,8 @@ function native(action, extra = {}) {
 }
 
 async function restartBoujoy() {
-  if (!confirm("重启 Boujoy Harness？当前运行中的任务会停止。")) return;
-  toast("正在重启 Boujoy Harness…");
+  if (!confirm("重启老墨工作台？当前运行中的任务会停止。")) return;
+  toast("正在重启老墨工作台…");
   if (native("restart")) return;
   try {
     const result = await jsonFetch("/api/app/restart", { method: "POST" });
@@ -1155,6 +1159,7 @@ function resetSessionView(nextSessionId, { loading = false } = {}) {
   if (state.liveScrollFrame) cancelAnimationFrame(state.liveScrollFrame);
   state.livePumpTimer = null;
   state.liveScrollFrame = null;
+  clearMessageImageCache();
   state.sessionId = nextSessionId;
   state.loadingHistory = loading;
   state.userScrolledUp = false;
@@ -1368,10 +1373,122 @@ async function mutateQueue(id, kind) {
 function eventType(event) { return event.type || event.kind || event.event?.type || ""; }
 function eventData(event) { return event.data || event.event?.data || event.payload || event.event || {}; }
 
+function imageRefsFromContent(content) {
+  const images = [];
+  const visit = blocks => {
+    if (!Array.isArray(blocks)) return;
+    for (const part of blocks) {
+      if (!part || typeof part !== "object") continue;
+      if (part.type === "image" && part.attachment?.attachmentId) {
+        images.push({ attachment: part.attachment });
+      } else if (part.type === "tool-result") {
+        visit(part.content);
+      }
+    }
+  };
+  visit(content);
+  return images;
+}
+
+function visibleTextFromContent(content) {
+  if (typeof content === "string") return stripRecallInjection(content);
+  if (!Array.isArray(content)) return "";
+  return content.map(part => {
+    if (typeof part === "string") return stripRecallInjection(part);
+    if (!part || typeof part !== "object") return "";
+    if (part.type === "text" || part.type === "input_text" || part.type === "output_text") return stripRecallInjection(part.text);
+    if (part.type === "tool-result") return visibleTextFromContent(part.content);
+    return "";
+  }).filter(Boolean).join("\n");
+}
+
 function textFromContent(content) {
   if (typeof content === "string") return stripRecallInjection(content);
   if (!Array.isArray(content)) return "";
   return content.map(part => typeof part === "string" ? stripRecallInjection(part) : (part.type === "text" || part.type === "input_text" || part.type === "output_text") ? stripRecallInjection(part.text) : part.type?.includes("image") ? "〔图片〕" : "").filter(Boolean).join("\n");
+}
+
+function clearMessageImageCache() {
+  for (const url of state.imageUrls.values()) {
+    try { URL.revokeObjectURL(url); } catch (_) {}
+  }
+  state.imageUrls.clear();
+  state.imageLoads.clear();
+  state.imageErrors.clear();
+  state.imageRefs.clear();
+}
+
+function messageImageKey(image) {
+  const attachment = image?.attachment || image;
+  const attachmentId = attachment?.attachmentId;
+  return attachmentId ? `${state.sessionId || "session"}:${String(attachmentId)}` : "";
+}
+
+function decodeBase64(value) {
+  const binary = atob(String(value || ""));
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+  return bytes;
+}
+
+function loadMessageImage(image) {
+  const attachment = image?.attachment || image;
+  const key = messageImageKey(image);
+  if (!key || !attachment?.attachmentId || state.imageUrls.has(key)) return;
+  if (state.imageErrors.has(key)) return;
+  const existing = state.imageLoads.get(key);
+  if (existing) return existing;
+  const sessionId = state.sessionId;
+  const load = rpc("session.attachment", { sessionId, attachmentId: attachment.attachmentId })
+    .then(value => {
+      const resolved = value?.attachment || attachment;
+      if (!value?.data) throw new Error("图片附件没有返回数据");
+      const bytes = decodeBase64(value?.data);
+      const blob = new Blob([bytes], { type: resolved.mediaType || attachment.mediaType || "image/png" });
+      const url = URL.createObjectURL(blob);
+      if (sessionId !== state.sessionId) {
+        try { URL.revokeObjectURL(url); } catch (_) {}
+        return;
+      }
+      state.imageUrls.set(key, url);
+      state.imageRefs.set(key, { attachment: resolved });
+    })
+    .catch(error => {
+      state.imageErrors.set(key, error?.message || "图片加载失败");
+      throw error;
+    })
+    .finally(() => { state.imageLoads.delete(key); });
+  state.imageLoads.set(key, load);
+  return load;
+}
+
+function messageImagesHtml(images, align) {
+  const valid = (Array.isArray(images) ? images : []).filter(image => messageImageKey(image));
+  if (!valid.length) return "";
+  const variant = valid.length === 1 ? "single" : "tile";
+  const body = valid.map(image => {
+    const attachment = image.attachment || image;
+    const key = messageImageKey(image);
+    const source = state.imageUrls.get(key);
+    const error = state.imageErrors.get(key);
+    state.imageRefs.set(key, { attachment });
+    if (error) return `<button type="button" class="message-image-retry" data-message-image="${escapeHtml(key)}" aria-label="${escapeHtml(error)}">图片加载失败 · 点击重试</button>`;
+    if (!source) return `<span class="message-image-loading" data-message-image="${escapeHtml(key)}">正在加载图片…</span>`;
+    const label = attachment.name || "DSH 图片";
+    return `<a class="message-image-link" data-message-image="${escapeHtml(key)}" href="${escapeHtml(source)}" target="_blank" rel="noopener noreferrer" title="打开原图"><img src="${escapeHtml(source)}" alt="${escapeHtml(label)}" loading="lazy" decoding="async"></a>`;
+  }).join("");
+  return `<div class="message-images message-images-${variant} message-images-${align}" aria-label="DSH 原生图片">${body}</div>`;
+}
+
+function hydrateMessageImages(items) {
+  const sessionId = state.sessionId;
+  const images = items.flatMap(item => Array.isArray(item.images) ? item.images : []);
+  const loads = images.map(image => loadMessageImage(image)).filter(Boolean);
+  if (!loads.length) return;
+  Promise.allSettled(loads).then(() => {
+    if (sessionId !== state.sessionId) return;
+    renderHistory(state.history, { force: true });
+  });
 }
 
 // Remove legacy recall injections already persisted by older Boujoy builds,
@@ -1617,27 +1734,31 @@ function foldHistory(events) {
       // user-role events for model context. They are engine internals, not
       // messages authored by the person using Boujoy.
       if (data.source?.kind && data.source.kind !== "user") continue;
-      const text = textFromContent(data.content || data.message?.content);
+      const content = data.content || data.message?.content;
+      const text = visibleTextFromContent(content);
+      const images = imageRefsFromContent(content);
       if (/^\/permission\s+(read-only|workspace-write|danger-full-access)\s*$/i.test(text)) continue;
-      if (text) {
+      if (text || images.length) {
         turnToolCount = 0;
         const id = data.id || event.id;
         const prior = output.findIndex(item => item.role === "user" && item.id === id);
         if (prior >= 0) output.splice(prior, 1);
-        output.push({ role: "user", text, delivery: data.deliveryMode || null, time, id, sourceRpcId: data.source?.rpcId });
+        output.push({ role: "user", text, images, delivery: data.deliveryMode || null, time, id, sourceRpcId: data.source?.rpcId });
       }
     } else if (type === "agent/inbox/spliced") {
       for (const message of data.inserted || []) {
         if (message.source?.kind !== "user") continue;
-        const text = textFromContent(message.content);
-        if (!text) continue;
+        const text = visibleTextFromContent(message.content);
+        const images = imageRefsFromContent(message.content);
+        if (!text && !images.length) continue;
         const prior = output.findIndex(item => item.role === "user" && item.id === message.id);
         if (prior >= 0) output.splice(prior, 1);
-        output.push({ role: "user", text, delivery: "steer", accepted: true, time, id: message.id, sourceRpcId: message.source?.rpcId });
+        output.push({ role: "user", text, images, delivery: "steer", accepted: true, time, id: message.id, sourceRpcId: message.source?.rpcId });
       }
     } else if (type === "assistant/message") {
       const message = data.message || data;
-      const text = textFromContent(message.content);
+      const text = visibleTextFromContent(message.content);
+      const images = imageRefsFromContent(message.content);
       const hasReasoning = Array.isArray(message.content) && message.content.some(part => part && part.type === "reasoning");
       const usage = message.usage || data.usage || null;
       const timing = message.timing || data.timing || null;
@@ -1648,7 +1769,7 @@ function foldHistory(events) {
       const thought = timing?.stepStartTime && timing?.completedTime
         ? `模型生成 ${formatDuration(Math.max(0, timing.completedTime - timing.stepStartTime))}`
         : (turnToolCount ? `已完成 ${turnToolCount} 个工具步骤` : "已完成回答");
-      if (text) output.push({ role: "assistant", text, thought, hasReasoning, usage, timing, id: message.id || event.id });
+      if (text || images.length) output.push({ role: "assistant", text, images, thought, hasReasoning, usage, timing, id: message.id || event.id });
     } else if (type === "tool/call") {
       const view = event.view || data.view || {};
       const title = view.title || data.name || data.toolName || "工具调用";
@@ -1657,6 +1778,11 @@ function foldHistory(events) {
       activities.push(activity);
       turnToolCount += 1;
     } else if (type === "tool/result") {
+      const resultMessage = data.message || {};
+      const images = imageRefsFromContent(resultMessage.content);
+      if (images.length) {
+        output.push({ role: "assistant", text: "", images, thought: "工具已生成图片", id: `tool-image-${resultMessage.id || event.id}` });
+      }
       const view = event.view || data.view || {};
       const title = view.title || data.name || data.toolName || "工具结果";
       // ToolResultView has 6 variants; each carries the content in a
@@ -1754,11 +1880,13 @@ function renderHistory(events, { force = false } = {}) {
     }
     const stamp = messageTimeStamp(item.time);
     const stats = item.role === "assistant" ? messageStatsHtml(item) : "";
+    const imagesHtml = messageImagesHtml(item.images, item.role === "user" ? "end" : "start");
     const bodyHtml = item.streaming
       ? `${escapeHtml(item.text)}<span class="stream-cursor" aria-hidden="true"></span>`
-      : `${markdown(item.text)}${item.streaming ? '<span class="stream-cursor" aria-hidden="true"></span>' : ""}`;
+      : `${imagesHtml}${item.text ? markdown(item.text) : ""}${item.streaming ? '<span class="stream-cursor" aria-hidden="true"></span>' : ""}`;
     return `<article class="message ${item.role}${item.pending ? " pending" : ""}${item.waiting ? " waiting" : ""}${item.streaming ? " streaming" : ""}"><div class="message-label">${item.role === "user" ? `YOU / 你${item.delivery ? ` · ${item.delivery === "steer" ? "引导当前任务" : "排到下一条"}` : ""}${item.pending ? " · 发送中" : item.phase === "steering" ? " · 已送入下一步，等待当前步骤结束" : item.phase === "queued" ? " · 已排队" : item.accepted ? " · 已进入当前执行" : ""}` : `BOUJOY AGENT${item.streaming ? " · 正在生成" : ""}`}${stamp ? `<span class="message-stamp">${stamp}</span>` : ""}</div>${item.role === "assistant" && item.thought ? `<div class="thought-summary"><b>${item.hasReasoning ? "推理摘要" : "执行摘要"}</b><span>${escapeHtml(item.thought)}</span></div>` : ""}<div class="message-body">${bodyHtml}</div>${stats}<div class="message-actions"><button type="button" class="message-copy" data-copy-text="${escapeHtml(item.text)}" title="复制这条消息">⧉ 复制</button></div></article>`;
   }).join("");
+  hydrateMessageImages(visibleOutput);
   // The user card intentionally has a cut-paper bottom edge. Its original
   // percentage-height diagonal looks identical for normal prompts, but can
   // overlap the last lines of a very long paste. Measure after layout so the
@@ -2826,7 +2954,7 @@ const COMMANDS = [
   { name: "选择新项目", hint: "⌘ O", run: pickProject },
   { name: "切换明暗主题", hint: "", run: () => setTheme(state.theme === "dark" ? "light" : "dark") },
   { name: "切换知识 / 纯净模式", hint: "", run: () => setMode(state.mode === "knowledge" ? "clean" : "knowledge") },
-  { name: "重启 Boujoy Harness", hint: "安全重启", run: restartBoujoy },
+  { name: "重启老墨工作台", hint: "安全重启", run: restartBoujoy },
 ];
 
 function renderCommands(query = "") {
@@ -2895,6 +3023,12 @@ function bindEvents() {
     if (command) { $("#commandDialog").close(); COMMANDS[Number(command.dataset.commandIndex)].run(); }
     const removeImage = event.target.closest("[data-remove-image]");
     if (removeImage) { state.pendingImages.splice(Number(removeImage.dataset.removeImage), 1); renderPendingImages(); }
+    const retryImage = event.target.closest("button[data-message-image]");
+    if (retryImage) {
+      state.imageErrors.delete(retryImage.dataset.messageImage || "");
+      renderHistory(state.history, { force: true });
+      return;
+    }
     const subagentOpen = event.target.closest("[data-subagent-open]");
     if (subagentOpen) { const [id, mode] = subagentOpen.dataset.subagentOpen.split(":"); openSubagent(id, mode); return; }
     const subagentPromptButton = event.target.closest("[data-subagent-prompt]");

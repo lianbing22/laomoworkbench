@@ -286,7 +286,7 @@ def isolated_gateway_checks() -> list[str]:
             passed.append("session log deletion + recoverable trash")
 
             status, page = request(origin + "/")
-            assert status == 200 and "Boujoy Harness" in page
+            assert status == 200 and "老墨工作台" in page
             assert "iframe" not in page.lower() and "预览版" not in page
             passed.append("new product shell (no embedded legacy UI)")
 
@@ -345,6 +345,10 @@ def isolated_gateway_checks() -> list[str]:
             assert 'data-close-dialog="dispatchDialog"' in index_html
             assert 'if (eventStreamConnected("events.mux")) continue;' in app_js
             assert "...state.pendingImages.map(image" in app_js
+            assert "function imageRefsFromContent" in app_js
+            assert 'rpc("session.attachment"' in app_js
+            assert "data-message-image" in app_js
+            assert "URL.createObjectURL" in app_js
             assert "if (type === \"llm/retry\" || type === \"llm/retry-started\")" in app_js
             assert "textBlocks" in app_js
             assert "function safeHttpHref" in app_js
