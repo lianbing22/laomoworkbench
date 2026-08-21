@@ -957,7 +957,9 @@ class BoujoyHandler(BaseHTTPRequestHandler):
         instructions = str(payload.get("instructions", "")).strip()
         if not name or not instructions:
             raise ValueError("名称和指令不能为空")
-        record_id = str(payload.get("id", "")).strip()
+        # `str(None)` would produce a literal "None.md" when clients send an
+        # explicit id:null on create — normalize to the slug path instead.
+        record_id = str(payload.get("id") or "").strip()
         if record_id and not re.fullmatch(r"[\w\-\u4e00-\u9fff]+", record_id):
             raise ValueError("无效记录 ID")
         if not record_id:
