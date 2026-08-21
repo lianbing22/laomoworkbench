@@ -72,6 +72,16 @@ const state = {
   providerTestResults: {},
   sessionSearchResults: null,
   sessionSearchToken: 0,
+  // Durable Mission Loop (P0.6): summary comes from GET /api/missions, the
+  // richer plan/verdict/checkpoint/events view from GET /api/missions/status,
+  // and live transitions from mission/update frames on the mux bridge.
+  mission: null,
+  missionList: [],
+  missionActiveId: null,
+  missionStickyId: null,
+  missionDetail: null,
+  missionDetailTimer: null,
+  missionElapsedBase: null,
 };
 
 const PAGE_META = {
@@ -558,6 +568,8 @@ function handleServerFrame(message) {
     renderWorkspaces(); renderSessions();
   } else if (frame.type === "host/agent-error") {
     toast(frame.message || "Agent 运行错误", true);
+  } else if (frame.type === "mission/update") {
+    handleMissionUpdate(frame);
   }
 }
 
@@ -810,6 +822,9 @@ function showPage(page) {
   if (page === "styles") loadRecords("style");
   if (page === "monitor") renderMonitor();
   if (page === "news") loadNews();
+  // The durable mission card lives on the agent page; re-sync it each visit so
+  // state changed while the page was hidden (or in another client) shows up.
+  if (page === "agent") loadMissions({ quiet: true });
 }
 
 async function setMode(mode) {
@@ -2375,18 +2390,62 @@ async function editGoal() {
   $("#goalDialogTitle").textContent = currentGoalRef(current) ? "编辑当前目标" : "设定当前目标";
   $("#goalObjective").value = current?.objective || "";
   $("#goalRounds").value = current?.maxGoalRounds || "";
+  $("#goalMissionMode").checked = false;
+  syncGoalMissionMode();
   $("#goalDialog").showModal();
   setTimeout(() => $("#goalObjective").focus(), 0);
 }
 
+// Mission mode swaps the dialog into "create durable mission" mode: rounds are
+// meaningless there (StopPolicy owns the limits) and the submit label changes.
+function syncGoalMissionMode() {
+  const asMission = $("#goalMissionMode").checked;
+  $("#goalRounds").disabled = asMission;
+  $("#goalMissionNote").classList.toggle("hidden", !asMission);
+  $("#goalForm button[type='submit']").textContent = asMission ? "创建 Mission" : "保存目标";
+}
+
+// Durable mission path: POST /api/missions/create then /api/missions/start.
+// The mission loop is owned by the gateway control plane, not this session,
+// so no sessionId / goal ref is involved.
+async function saveGoalAsMission(objective) {
+  const submit = $("#goalForm button[type='submit']");
+  submit.disabled = true;
+  try {
+    const created = await jsonFetch("/api/missions/create", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ objective, acceptanceCriteria: [] }),
+    });
+    const mission = created.mission || created || {};
+    try {
+      await jsonFetch("/api/missions/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: mission.id }),
+      });
+      toast("Mission 已创建并启动");
+    } catch (startError) {
+      toast(`Mission 已创建，但启动失败：${startError.message}`, true);
+    }
+    $("#goalDialog").close();
+    await loadMissions({ quiet: true });
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    submit.disabled = false;
+  }
+}
+
 async function saveGoal(event) {
   event.preventDefault();
+  const objective = $("#goalObjective").value.trim();
+  if (!objective) return;
+  if ($("#goalMissionMode").checked) { await saveGoalAsMission(objective); return; }
   if (!state.sessionId) return;
   const current = currentGoal();
   const ref = currentGoalRef(current);
-  const objective = $("#goalObjective").value.trim();
   const rounds = Number($("#goalRounds").value || 0);
-  if (!objective) return;
   const submit = $("#goalForm button[type='submit']");
   submit.disabled = true;
   try {
@@ -2408,6 +2467,304 @@ async function goalAction(action) {
   if (["complete", "clear"].includes(action) && !confirm(action === "complete" ? "把当前目标标记为完成？" : "清除当前目标？")) return;
   try { await rpc(`goal.${action}`, { sessionId: state.sessionId, ref }); setTimeout(() => loadSession(state.sessionId, { quiet: true }), 220); }
   catch (error) { toast(error.message, true); }
+}
+
+
+// -- Mission loop (P0.6 durable mission control) ------------------------------
+// Mission state lives in the gateway control plane (disk-backed .laomo/runs/),
+// not in the harness session projection. These helpers talk to /api/missions*,
+// render the signal-card mission view, and follow live mission/update frames.
+
+const MISSION_TERMINAL_STATES = ["done", "failed", "cancelled"];
+const MISSION_ACTIVE_STATES = ["planning", "running", "waiting", "evaluating", "repairing", "replanning", "verifying"];
+const MISSION_PHASE_LABELS = {
+  draft: "草稿", planning: "规划中", running: "执行中", waiting: "等待作业",
+  evaluating: "评估中", repairing: "修复中", replanning: "重规划", verifying: "终验中",
+  paused: "已暂停", blocked: "受阻", done: "已完成", failed: "失败", cancelled: "已取消",
+};
+const MISSION_PHASE_TONES = {
+  draft: "tone-muted", planning: "tone-hold", running: "tone-active", waiting: "tone-wait",
+  evaluating: "tone-info", repairing: "tone-wait", replanning: "tone-hold", verifying: "tone-info",
+  paused: "tone-hold", blocked: "tone-danger", done: "tone-pass", failed: "tone-danger", cancelled: "tone-muted",
+};
+
+function missionTerminal(mission) {
+  return MISSION_TERMINAL_STATES.includes(mission?.state);
+}
+
+// Which mission owns the signal card: the active one first, then the most
+// recently updated non-terminal one. A mission that just reached a terminal
+// state stays sticky so the final verdict stays readable; a fresh page load
+// with only old terminal missions falls back to the classic goal view.
+function pickMission(missions, activeId) {
+  if (!Array.isArray(missions) || !missions.length) return null;
+  if (activeId) {
+    const active = missions.find(item => item.id === activeId);
+    if (active) return active;
+  }
+  const live = missions
+    .filter(item => !missionTerminal(item))
+    .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+  if (live.length) return live[0];
+  return missions.find(item => item.id === state.missionStickyId) || null;
+}
+
+async function loadMissions({ quiet = false } = {}) {
+  let data = null;
+  try {
+    data = await jsonFetch("/api/missions");
+  } catch (error) {
+    // Older gateway without the mission endpoints (or a transient failure):
+    // keep the classic goal view instead of hijacking the signal card.
+    state.missionList = [];
+    state.missionActiveId = null;
+    state.mission = null;
+    state.missionDetail = null;
+    renderMission();
+    if (!quiet) toast(`Mission 状态读取失败：${error.message}`, true);
+    return;
+  }
+  state.missionList = Array.isArray(data.missions) ? data.missions : [];
+  state.missionActiveId = data.activeId ?? null;
+  const picked = pickMission(state.missionList, state.missionActiveId);
+  state.mission = picked;
+  state.missionStickyId = picked?.id || null;
+  if (!picked) state.missionDetail = null;
+  renderMission();
+  // The list payload only carries summary fields; pull plan/verdict/
+  // checkpoint once per newly selected mission.
+  if (picked && state.missionDetail?.id !== picked.id) {
+    state.missionDetail = null;
+    refreshMissionDetail().catch(() => {});
+  }
+}
+
+async function refreshMissionDetail() {
+  const mission = state.mission;
+  if (!mission?.id) return;
+  const data = await jsonFetch(`/api/missions/status?id=${encodeURIComponent(mission.id)}`);
+  const detail = data.mission || {};
+  if (!state.mission || state.mission.id !== mission.id) return;
+  state.missionDetail = { id: mission.id, ...detail };
+  // The status payload is the freshest source for the summary fields too.
+  for (const key of ["state", "phase", "currentTask", "cycles", "waiting", "elapsedSec", "updatedAt"]) {
+    if (detail[key] !== undefined) state.mission[key] = detail[key];
+  }
+  renderMission();
+}
+
+// mission/update frames only carry summary fields; plan/checkpoint/events come
+// from the status endpoint. Debounce so a burst of transitions costs one call.
+function scheduleMissionDetailRefresh(delayMs = 900) {
+  if (state.missionDetailTimer) clearTimeout(state.missionDetailTimer);
+  state.missionDetailTimer = setTimeout(() => {
+    state.missionDetailTimer = null;
+    refreshMissionDetail().catch(() => {});
+  }, delayMs);
+}
+
+function handleMissionUpdate(frame) {
+  const missionId = frame.missionId || frame.id;
+  if (!missionId) return;
+  if (!state.mission || state.mission.id !== missionId) {
+    // A mission we are not showing moved (maybe started in another client):
+    // re-pull the list so the card follows the control plane.
+    loadMissions({ quiet: true });
+    return;
+  }
+  state.mission = {
+    ...state.mission,
+    state: frame.state || state.mission.state,
+    phase: frame.phase ?? state.mission.phase,
+    currentTask: frame.currentTask ?? state.mission.currentTask,
+    cycles: frame.cycles ?? state.mission.cycles,
+    waiting: frame.waiting === undefined ? state.mission.waiting : frame.waiting,
+    lastVerdict: frame.lastVerdict ?? state.mission.lastVerdict,
+    elapsedSec: frame.elapsedSec ?? state.mission.elapsedSec,
+  };
+  state.missionStickyId = missionId;
+  renderMission();
+  scheduleMissionDetailRefresh();
+}
+
+function missionElapsedText(mission) {
+  const seconds = Math.max(0, Math.floor(Number(mission?.elapsedSec) || 0));
+  if (seconds < 60) return `${seconds} 秒`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes} 分 ${seconds % 60} 秒`;
+  return `${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分`;
+}
+
+function missionUnitSummary(detail) {
+  const units = detail?.plan?.units;
+  if (!Array.isArray(units) || !units.length) return "";
+  const passed = units.filter(unit => ["passed", "pass", "done", "completed"].includes(String(unit.status || "").toLowerCase())).length;
+  return `单元 ${passed}/${units.length}`;
+}
+
+// Current task title: prefer the plan's in-progress unit, then the unit at the
+// current index, then the first unfinished unit, then the summary's
+// currentTask field (a title or an index).
+function missionCurrentTaskText(mission, detail) {
+  const units = detail?.plan?.units;
+  const lower = value => String(value || "").toLowerCase();
+  if (Array.isArray(units) && units.length) {
+    const active = units.find(unit => ["in_progress", "in-progress", "running", "active"].includes(lower(unit.status)));
+    const byIndex = Number.isFinite(Number(detail.currentUnit)) ? units.find(unit => Number(unit.index) === Number(detail.currentUnit)) : null;
+    const focus = active || byIndex || units.find(unit => !["passed", "pass", "done", "completed", "skipped", "failed"].includes(lower(unit.status)));
+    if (focus?.title || focus?.description) return `${focus.title || focus.description}（${units.indexOf(focus) + 1}/${units.length}）`;
+  }
+  const currentTask = mission?.currentTask;
+  if (typeof currentTask === "string" && currentTask.trim()) return currentTask.trim();
+  if (Number.isFinite(Number(currentTask)) && Array.isArray(units)) {
+    const unit = units[Number(currentTask)];
+    if (unit?.title) return unit.title;
+  }
+  return "";
+}
+
+function missionVerdictInfo(mission, detail) {
+  const raw = detail?.lastVerdict ?? mission?.lastVerdict ?? null;
+  const value = typeof raw === "string" ? raw : raw?.verdict;
+  const normalized = String(value || "").toUpperCase();
+  if (!["PASS", "NEEDS_WORK", "BLOCKED"].includes(normalized)) return null;
+  const tone = normalized === "PASS" ? "is-pass" : normalized === "NEEDS_WORK" ? "is-needs" : "is-blocked";
+  const label = normalized === "PASS" ? "PASS 通过" : normalized === "NEEDS_WORK" ? "NEEDS_WORK 待改进" : "BLOCKED 受阻";
+  return { tone, label };
+}
+
+function missionCheckpointText(detail) {
+  const checkpoint = detail?.lastCheckpoint;
+  if (!checkpoint) return "";
+  if (typeof checkpoint === "string") return checkpoint;
+  const bits = [checkpoint.summary || checkpoint.title || "", checkpoint.path || checkpoint.file || ""].filter(Boolean);
+  if (bits.length) return bits.join(" · ");
+  const cycle = checkpoint.cycle;
+  const unit = checkpoint.unit ?? checkpoint.unitIndex;
+  if (cycle != null || unit != null) return `循环 ${cycle ?? "-"} · 单元 ${unit ?? "-"}`;
+  return "";
+}
+
+function missionActionsHtml(mission) {
+  const buttons = [];
+  if (mission.state === "draft") buttons.push(["start", "启动"]);
+  else if (MISSION_ACTIVE_STATES.includes(mission.state)) buttons.push(["pause", "暂停"]);
+  else if (mission.state === "paused") buttons.push(["resume", "继续"]);
+  if (!missionTerminal(mission)) buttons.push(["cancel", "取消"]);
+  else buttons.push(["new", "新目标"]);
+  buttons.push(["events", "详情"]);
+  return buttons.map(([action, label]) => `<button type="button" data-mission-action="${action}">${label}</button>`).join("");
+}
+
+// Swap the signal card between the classic goal view and the mission view via
+// the has-mission class (CSS hides #currentGoal/#goalActions). renderProjection
+// keeps writing the goal area underneath — that stays harmless while hidden.
+function renderMission() {
+  const card = $("#signalCard");
+  const view = $("#missionView");
+  const kicker = $("#signalKicker");
+  if (!card || !view) return;
+  const mission = state.mission;
+  if (!mission) {
+    card.classList.remove("has-mission");
+    if (kicker) kicker.textContent = "当前目标";
+    state.missionElapsedBase = null;
+    return;
+  }
+  card.classList.add("has-mission");
+  if (kicker) kicker.textContent = "MISSION LOOP";
+  const detail = state.missionDetail?.id === mission.id ? state.missionDetail : null;
+  $("#missionPhase").textContent = MISSION_PHASE_LABELS[mission.state] || mission.state || "未知";
+  $("#missionPhase").className = `mission-phase ${MISSION_PHASE_TONES[mission.state] || "tone-muted"}`;
+  const chips = [`循环 ${Number(mission.cycles) || 0}`];
+  const unitSummary = missionUnitSummary(detail);
+  if (unitSummary) chips.push(unitSummary);
+  $("#missionCycles").textContent = chips.join(" · ");
+  $("#missionObjective").textContent = mission.objective || "（未填写目标）";
+  const task = missionCurrentTaskText(mission, detail);
+  $("#missionTaskRow").classList.toggle("hidden", !task);
+  $("#missionTask").textContent = task || "—";
+  const waiting = mission.waiting && (mission.waiting.command || mission.waiting.jobId) ? mission.waiting : null;
+  $("#missionWaitingRow").classList.toggle("hidden", !waiting);
+  if (waiting) $("#missionWaiting").textContent = waiting.command || waiting.jobId || "";
+  const verdict = missionVerdictInfo(mission, detail);
+  $("#missionVerdictRow").classList.toggle("hidden", !verdict);
+  if (verdict) {
+    $("#missionVerdict").textContent = verdict.label;
+    $("#missionVerdict").className = `mission-verdict ${verdict.tone}`;
+  }
+  const checkpoint = missionCheckpointText(detail);
+  $("#missionCheckpointRow").classList.toggle("hidden", !checkpoint);
+  if (checkpoint) $("#missionCheckpoint").textContent = checkpoint;
+  $("#missionElapsed").textContent = missionElapsedText(mission);
+  // Tick elapsed locally between server refreshes while the loop is running.
+  state.missionElapsedBase = (!missionTerminal(mission) && mission.state !== "paused")
+    ? { sec: Number(mission.elapsedSec) || 0, at: Date.now() }
+    : null;
+  $("#missionActions").innerHTML = missionActionsHtml(mission);
+}
+
+function tickMissionElapsed() {
+  const element = $("#missionElapsed");
+  const base = state.missionElapsedBase;
+  if (!element || !base) return;
+  element.textContent = missionElapsedText({ elapsedSec: base.sec + (Date.now() - base.at) / 1000 });
+}
+
+async function missionAction(action) {
+  if (action === "events") { openMissionEvents(); return; }
+  if (action === "new") { editGoal(); return; }
+  const mission = state.mission;
+  if (!mission?.id) return;
+  if (action === "cancel" && !confirm("取消这个 Mission？取消后不可恢复。")) return;
+  const endpoints = { start: "start", pause: "pause", resume: "resume", cancel: "cancel" };
+  const messages = { start: "Mission 已启动", pause: "Mission 已暂停", resume: "Mission 已继续", cancel: "Mission 已取消" };
+  const endpoint = endpoints[action];
+  if (!endpoint) return;
+  try {
+    // Idempotency is guaranteed server-side; a duplicate click is harmless.
+    await jsonFetch(`/api/missions/${endpoint}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: mission.id }),
+    });
+    toast(messages[action] || "操作已提交");
+  } catch (error) {
+    toast(error.message, true);
+  }
+  await loadMissions({ quiet: true });
+  scheduleMissionDetailRefresh(1200);
+}
+
+function missionEventRowHtml(entry = {}) {
+  const time = entry.ts
+    ? new Date(entry.ts).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit" })
+    : "--";
+  const type = String(entry.type || "event");
+  const rawDetail = entry.detail ?? entry.summary ?? "";
+  const detail = typeof rawDetail === "string" ? rawDetail : JSON.stringify(rawDetail);
+  return `<div class="mission-event"><time>${escapeHtml(time)}</time><b>${escapeHtml(type)}</b><span>${escapeHtml(detail) || "—"}</span></div>`;
+}
+
+async function openMissionEvents() {
+  const mission = state.mission;
+  const list = $("#missionEventsList");
+  $("#missionEventsDialog").showModal();
+  if (!list) return;
+  if (!mission?.id) {
+    list.innerHTML = '<p class="muted">当前没有 Mission。</p>';
+    return;
+  }
+  list.innerHTML = '<p class="muted">读取事件中…</p>';
+  try {
+    const data = await jsonFetch(`/api/missions/status?id=${encodeURIComponent(mission.id)}`);
+    const events = (data.mission?.events || []).slice(-40);
+    list.innerHTML = events.length
+      ? events.map(missionEventRowHtml).join("")
+      : '<p class="muted">暂无事件记录。</p>';
+  } catch (error) {
+    list.innerHTML = `<p class="muted">事件读取失败：${escapeHtml(error.message)}</p>`;
+  }
 }
 
 function classifyPath(path) {
@@ -3326,6 +3683,8 @@ function bindEvents() {
     if (settingsActionButton) { settingsAction(settingsActionButton); return; }
     const goalActionButton = event.target.closest("[data-goal-action]");
     if (goalActionButton) { goalAction(goalActionButton.dataset.goalAction); return; }
+    const missionActionButton = event.target.closest("[data-mission-action]");
+    if (missionActionButton) { missionAction(missionActionButton.dataset.missionAction); return; }
     if (event.target.closest("#goalButton")) { editGoal(); return; }
     const busyModeButton = event.target.closest("[data-busy-mode]");
     if (busyModeButton) { setBusyMode(busyModeButton.dataset.busyMode); return; }
@@ -3528,6 +3887,7 @@ function bindEvents() {
   $("#recordForm").addEventListener("submit", saveRecord);
   $("#dispatchForm").addEventListener("submit", confirmDispatch);
   $("#goalForm").addEventListener("submit", saveGoal);
+  $("#goalMissionMode").addEventListener("change", syncGoalMissionMode);
   $("#permissionForm").addEventListener("submit", confirmFullAccess);
   $("#permissionDialog").addEventListener("close", () => { state.pendingPermission = null; });
   $$('[data-close-dialog]').forEach(button => button.addEventListener("click", () => {
@@ -3607,6 +3967,8 @@ async function init() {
     }
   }, 5000);
   setInterval(() => { if (!document.hidden && state.page === "knowledge") loadKnowledge(); }, 15000);
+  // Keep the mission run clock moving between server refreshes.
+  setInterval(() => { if (!document.hidden && state.mission) tickMissionElapsed(); }, 15000);
 }
 
 

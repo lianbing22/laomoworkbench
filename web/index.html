@@ -163,7 +163,7 @@
 
         <aside id="activityPanel" class="activity-panel">
           <div class="panel-label"><span>LIVE SIGNAL</span><button id="toggleActivity" title="收起">×</button></div>
-          <div class="signal-card"><small>当前目标</small><strong id="currentGoal">尚未设定</strong><div id="goalActions"><button id="goalButton">设定目标</button></div><div id="contextMeter" class="context-meter hidden"></div><button id="pendingInterruptBar" class="interrupt-bar hidden" type="button">⚠ Agent 正在等待你的审批/回答，点击处理</button><div class="capture-row"><button id="captureButton" type="button" title="让模型判断本次对话是否有长期价值，并按规则沉淀">⇣ 沉淀本次对话</button><span id="captureStatus" class="capture-status"></span></div></div>
+          <div id="signalCard" class="signal-card"><small id="signalKicker">当前目标</small><strong id="currentGoal">尚未设定</strong><div id="goalActions"><button id="goalButton">设定目标</button></div><div id="missionView" class="mission-view"><div class="mission-meta"><span id="missionPhase" class="mission-phase tone-muted">—</span><span id="missionCycles" class="mission-chip">循环 0</span></div><strong id="missionObjective">…</strong><div class="mission-rows"><div class="mission-row" id="missionTaskRow"><span>当前任务</span><b id="missionTask">—</b></div><div class="mission-row hidden" id="missionWaitingRow"><span>后台作业</span><b id="missionWaiting">—</b></div><div class="mission-row hidden" id="missionVerdictRow"><span>最近判定</span><b id="missionVerdict" class="mission-verdict">—</b></div><div class="mission-row hidden" id="missionCheckpointRow"><span>检查点</span><b id="missionCheckpoint">—</b></div><div class="mission-row"><span>运行时长</span><b id="missionElapsed">—</b></div></div><div id="missionActions" class="mission-actions"></div></div><div id="contextMeter" class="context-meter hidden"></div><button id="pendingInterruptBar" class="interrupt-bar hidden" type="button">⚠ Agent 正在等待你的审批/回答，点击处理</button><div class="capture-row"><button id="captureButton" type="button" title="让模型判断本次对话是否有长期价值，并按规则沉淀">⇣ 沉淀本次对话</button><span id="captureStatus" class="capture-status"></span></div></div>
           <div class="activity-section"><h3>计划</h3><div id="planList" class="plan-list"><p class="muted">Agent 创建计划后会显示在这里。</p></div></div>
           <div class="activity-section"><h3>任务队列</h3><div id="queueList" class="queue-list"><p class="muted">没有排队任务。</p></div></div>
           <div class="activity-section"><h3>子代理</h3><div id="subagentList" class="subagent-list"><p class="muted">没有子代理。</p></div></div>
@@ -303,8 +303,19 @@
       <header><div><p>MISSION CONTROL</p><h2 id="goalDialogTitle">设定当前目标</h2></div><button type="button" class="dialog-close" data-close-dialog="goalDialog" aria-label="关闭">×</button></header>
       <label>目标<textarea id="goalObjective" required rows="5" maxlength="1200" placeholder="写清楚最终要达到什么结果…"></textarea></label>
       <label>最大回合（可选）<input id="goalRounds" type="number" min="1" max="100" placeholder="留空表示不限制"></label>
+      <label class="check-row mission-toggle"><input id="goalMissionMode" type="checkbox"><span>作为 Mission 运行（持久循环，断电可恢复）</span></label>
+      <p class="dialog-note hidden" id="goalMissionNote">Mission 由老墨控制面持久维护：自动规划 → 执行 → 评估 → 修复循环，断电后可恢复；启动后可在右侧信号卡暂停 / 继续 / 取消。</p>
       <p class="dialog-note">目标由 Harness 真实维护；首次保存会立即启动第一个目标回合。暂停、继续、完成与清除都可在右侧控制。</p>
       <footer><button type="button" class="ghost-button" data-close-dialog="goalDialog">取消</button><button type="submit" class="primary-cut">保存目标</button></footer>
+    </form>
+  </dialog>
+
+  <!-- Mission events: tail of the durable mission audit log (events.ndjson) -->
+  <dialog id="missionEventsDialog" class="boujoy-dialog mission-events-dialog">
+    <form method="dialog">
+      <header><div><p>MISSION EVENTS</p><h2>Mission 事件记录</h2></div><button type="button" value="cancel" class="dialog-close" data-close-dialog="missionEventsDialog" aria-label="关闭">×</button></header>
+      <div id="missionEventsList" class="mission-events-list"><p class="muted">读取事件中…</p></div>
+      <footer><button value="cancel" class="primary-cut">关闭</button></footer>
     </form>
   </dialog>
 

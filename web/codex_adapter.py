@@ -1156,6 +1156,80 @@ class CodexRuntimeAdapter:
         self._emit(self.translator.session_added(tid))
         return ok_value({"sessionId": tid, "id": tid, "providerId": provider_id})
 
+    def run_turn(self, *, prompt: str, cwd: str | None = None, read_only: bool = False,
+                 model: str | None = None, effort: str | None = None,
+                 timeout: int = 900) -> dict[str, Any]:
+        """One turn on a fresh ephemeral thread (mission planner/worker/
+        evaluator). Completion arrives via the event bus; returns
+        {ok, text, error, usage}."""
+        proc = self._ensure_process()
+        start: dict[str, Any] = {"cwd": cwd or self.workspace_cwd(), "ephemeral": True}
+        if model:
+            start["model"] = model
+        if effort:
+            start["effort"] = effort
+        try:
+            res = proc.rpc.request("thread/start", start, timeout=30) or {}
+        except (TimeoutError, RuntimeError) as exc:
+            return {"ok": False, "text": "", "error": f"thread/start 失败: {str(exc)[:200]}", "usage": {}}
+        tid = res.get("threadId") or res.get("id") or (res.get("thread") or {}).get("id", "")
+        if not tid:
+            return {"ok": False, "text": "", "error": "thread/start 未返回 id", "usage": {}}
+        params: dict[str, Any] = {"threadId": tid, "cwd": start["cwd"],
+                                  "input": [{"type": "text", "text": prompt}]}
+        if model:
+            params["model"] = model
+        if effort:
+            params["effort"] = effort
+        if read_only:
+            params["sandboxPolicy"] = {"type": "readOnly"}
+            params["approvalPolicy"] = "never"
+        else:
+            # Mission turns are unattended: interactive approvals would hang
+            # the turn until timeout. Autonomous workspace-write, never-ask.
+            params["sandboxPolicy"] = {"type": "workspaceWrite"}
+            params["approvalPolicy"] = "never"
+        capture: dict[str, Any] = {"texts": [], "usage": {}, "error": None}
+        done = threading.Event()
+
+        def on_frame(frame: dict[str, Any]) -> None:
+            payload = frame.get("payload", {})
+            if payload.get("type") != "session/event" or payload.get("sessionId") != tid:
+                return
+            event = payload.get("event", {})
+            etype = event.get("type")
+            if etype == "assistant/message":
+                content = ((event.get("data") or {}).get("message") or {}).get("content") or []
+                capture["texts"] = [b.get("text", "") for b in content if isinstance(b, dict)]
+            elif etype == "assistant/chunk" and (event.get("data") or {}).get("type") == "usage":
+                capture["usage"] = (event.get("data") or {}).get("usage") or {}
+            elif etype == "turn/end":
+                reason = (event.get("data") or {}).get("reason") or {}
+                if reason.get("kind") == "error":
+                    capture["error"] = str((reason.get("error") or {}).get("message") or "turn failed")[:300]
+                done.set()
+
+        unsubscribe = self.subscribe(on_frame)
+        try:
+            proc.rpc.request("turn/start", params, timeout=30)
+            if not done.wait(timeout):
+                capture["error"] = f"turn 超时（{timeout}s）"
+                try:
+                    proc.rpc.request("turn/interrupt", {"threadId": tid, "turnId": ""}, timeout=10)
+                except (TimeoutError, RuntimeError):
+                    pass
+        except RuntimeError as exc:
+            capture["error"] = str(exc)[:300]
+        finally:
+            unsubscribe()
+            try:
+                proc.rpc.request("thread/delete", {"threadId": tid}, timeout=10)
+            except (TimeoutError, RuntimeError):
+                pass
+        return {"ok": capture["error"] is None,
+                "text": "\n".join(t for t in capture["texts"] if t),
+                "error": capture["error"], "usage": capture["usage"]}
+
     def test_provider(self, managers: Any, provider_id: str) -> dict[str, Any]:
         """Real E2E provider validation: register, ephemeral thread, minimal
         turn, classify the outcome. Never returns secrets."""

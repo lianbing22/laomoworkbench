@@ -129,6 +129,40 @@ def _provider_manager() -> Any:
 
 
 _PROVIDERS: Any = None
+
+
+def _mission_manager() -> Any:
+    """Mission control plane on the codex adapter; recovers persisted
+    missions on first construction (gateway restart resume)."""
+    global _MISSIONS
+    if _MISSIONS is None:
+        from mission import MissionManager, MissionError as _ME  # noqa: F401
+        adapter = RUNTIMES.adapter_for("clean")
+        if adapter is None:
+            raise _ME("Mission 需要 clean 模式使用 Codex Runtime", "no-runtime")
+        root = Path(adapter.default_cwd)
+
+        def broadcast(mission_id: str, state: dict) -> None:
+            try:
+                adapter._emit({"type": "server-request", "payload": {
+                    "type": "mission/update", "missionId": mission_id,
+                    "state": state.get("state"), "phase": state.get("state"),
+                    "currentTask": None, "cycles": state.get("cycles"),
+                    "waiting": bool(state.get("waitingJobId")),
+                    "lastVerdict": state.get("lastVerdict"),
+                    "elapsedSec": int(state.get("activeMs", 0)) // 1000}})
+            except Exception:
+                pass
+
+        _MISSIONS = MissionManager(adapter, root, broadcast_fn=broadcast)
+        try:
+            _MISSIONS.recover()
+        except Exception as exc:  # recovery must not block the gateway
+            print(f"[mission] recover failed: {exc}", file=sys.stderr, flush=True)
+    return _MISSIONS
+
+
+_MISSIONS: Any = None
 # CORS allow-list: only loopback product surfaces may call this gateway's APIs.
 # Any other Origin (e.g. an arbitrary website open in the browser) must not be
 # able to read the vault or drive write endpoints. "null" covers file:// pages.
@@ -1491,6 +1525,21 @@ class BoujoyHandler(BaseHTTPRequestHandler):
             except ProviderError as exc:
                 self._error(400, str(exc))
             return
+        if path == "/api/missions":
+            from mission import MissionError
+            try:
+                self._json(_mission_manager().list())
+            except MissionError as exc:
+                self._error(400 if exc.code != "no-runtime" else 503, str(exc))
+            return
+        if path == "/api/missions/status":
+            from mission import MissionError
+            try:
+                mid = urllib.parse.parse_qs(parsed.query).get("id", [""])[0]
+                self._json(_mission_manager().status(mid))
+            except MissionError as exc:
+                self._error(404 if exc.code == "not-found" else 400, str(exc))
+            return
         if path == "/api/records":
             kind = urllib.parse.parse_qs(parsed.query).get("kind", ["expert"])[0]
             try:
@@ -1767,6 +1816,29 @@ class BoujoyHandler(BaseHTTPRequestHandler):
                 body=body,
                 filter_deleted=endpoint in {"session.list", "session.search", "workspace.list"},
             )
+            return
+        if path.startswith("/api/missions/"):
+            from mission import MissionError
+            action = path[len("/api/missions/"):].strip("/")
+            try:
+                payload = json.loads(body or b"{}")
+                mgr = _mission_manager()
+                if action == "create":
+                    result = mgr.create(str(payload.get("objective") or ""),
+                                        cwd=payload.get("cwd"),
+                                        acceptance_criteria=payload.get("acceptanceCriteria"),
+                                        options=payload.get("options"))
+                elif action in ("start", "pause", "resume", "cancel"):
+                    result = getattr(mgr, action)(str(payload.get("id") or ""))
+                else:
+                    self._error(404, "未知 mission 操作")
+                    return
+                self._json(result)
+            except MissionError as exc:
+                status = 404 if exc.code == "not-found" else (409 if exc.code in ("busy", "terminal") else 400)
+                self._error(status, str(exc))
+            except (json.JSONDecodeError, OSError, ValueError) as exc:
+                self._error(400, str(exc))
             return
         if path == "/api/providers" or path.startswith("/api/providers/"):
             self._providers_route(path, body)

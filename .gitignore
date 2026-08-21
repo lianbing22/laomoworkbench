@@ -28,3 +28,6 @@ coverage/
 __MACOSX/
 *.log
 docs/codex-schema-*/
+
+# Mission engine runtime state (run dirs + id->path index).
+.laomo/
