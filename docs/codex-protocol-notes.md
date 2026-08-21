@@ -73,3 +73,8 @@ codex app-server generate-json-schema --out docs/codex-schema-0.148.0-alpha.21
 4. app-server 进程被 `kill -9` 中断 thread 持久化初始化时，会在 rollout 留下 stale writer 标记，
    该 thread 后续 resume 永远 conflict（单线程损伤，规避方式：走网关的优雅退出）。
 5. 未知通知/字段必须防御性解析——alpha 版本通知集合会增减（已见 `hook/started`、`remoteControl/status/changed` 等）。
+6. 空线程（还没有首条用户消息）调 `thread/read includeTurns:true` 报 "not materialized yet"；
+   需降级为 `includeTurns:false`。
+7. 线程在首轮对话前不落盘，`thread/list` 看不到它——UI 侧用本地占位符 + `host/session-added` 帧补位。
+8. 沙箱策略变体是 camelCase：`readOnly` / `workspaceWrite` / `dangerFullAccess` / `externalSandbox`；
+   `turn/start` 的 `sandboxPolicy` + `approvalPolicy`（untrusted/on-request/never）按"本回合及后续"语义生效。

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -115,6 +116,11 @@ class EventTranslator:
     def session_subscribed(self, session_id: str) -> dict[str, Any]:
         return {"type": "server-request", "payload": {"type": "session/subscribed",
                                                       "sessionId": session_id, "lastSeq": self.last_seq(session_id)}}
+
+    def session_projection(self, session_id: str, key: str, value: Any) -> dict[str, Any]:
+        return {"type": "server-request", "payload": {
+            "type": "session/projection", "sessionId": session_id,
+            "key": key, "value": value, "seq": self.next_seq(session_id)}}
 
     def host_status(self, session_id: str, running: bool) -> dict[str, Any]:
         return {"type": "server-request", "payload": {"type": "host/session-status",
@@ -496,7 +502,7 @@ class SessionRegistry:
             s = self._sessions.get(thread_id)
             if s is None:
                 s = {"running": False, "turnId": "", "cwd": cwd, "title": title, "model": None, "effort": None,
-                     "updated": int(time.time() * 1000)}
+                     "permission": None, "updated": int(time.time() * 1000)}
                 self._sessions[thread_id] = s
             else:
                 if cwd:
@@ -514,6 +520,12 @@ class SessionRegistry:
         s = self.ensure(thread_id)
         with self._lock:
             s["running"] = running
+            s["updated"] = int(time.time() * 1000)
+
+    def set_permission(self, thread_id: str, permission: str) -> None:
+        s = self.ensure(thread_id)
+        with self._lock:
+            s["permission"] = permission
             s["updated"] = int(time.time() * 1000)
 
     def set_loaded(self, thread_id: str, loaded: bool) -> None:
@@ -1009,6 +1021,7 @@ class CodexRuntimeAdapter:
                 "workspaceId": "laomo-clean",
                 "updatedAt": t.get("updatedAt") or t.get("recencyAt") or 0,
                 "agentPreset": "standard",
+                "projection": {"permissions": self._permission_view(tid)},
             })
         return ok_value({"sessions": items, "items": items})
 
@@ -1051,6 +1064,7 @@ class CodexRuntimeAdapter:
             params["model"] = model
         if effort:
             params["effort"] = effort
+        params.update(self._sandbox_params(sid))
 
         def start_turn():
             try:
@@ -1094,7 +1108,13 @@ class CodexRuntimeAdapter:
     def _rpc_session_history(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
         proc = self._ensure_process()
         sid = str(body.get("sessionId", ""))
-        res = proc.rpc.request("thread/read", {"threadId": sid, "includeTurns": True}, timeout=60) or {}
+        try:
+            res = proc.rpc.request("thread/read", {"threadId": sid, "includeTurns": True}, timeout=60) or {}
+        except RuntimeError as exc:
+            if "not materialized" not in str(exc):
+                raise
+            # Blank thread (no first user message yet): read metadata only.
+            res = proc.rpc.request("thread/read", {"threadId": sid, "includeTurns": False}, timeout=60) or {}
         thread = res.get("thread") or res or {}
         events = self.folder.fold(thread)
         self.translator.set_seq_floor(sid, len(events))
@@ -1109,7 +1129,9 @@ class CodexRuntimeAdapter:
         if max_messages and len(events) > int(max_messages):
             events = events[-int(max_messages):]
             has_more = True
-        return ok_value({"events": events, "hasMore": has_more, "projections": {"asOfSeq": len(events), "values": {}}})
+        return ok_value({"events": events, "hasMore": has_more,
+                         "projections": {"asOfSeq": len(events),
+                                         "values": {"permissions": self._permission_view(sid)}}})
 
     # session.models -> model/list
     def _rpc_session_models(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
@@ -1184,6 +1206,42 @@ class CodexRuntimeAdapter:
         except (AdapterUnavailable, TimeoutError, RuntimeError) as exc:
             self._debug_log(f"archive failed (ignored): {exc}")
         return ok_value({"archived": True})
+
+    # commands/execute -> /permission <level> (the only line the UI sends)
+    _SANDBOX_MAP = {
+        "read-only": {"type": "readOnly"},
+        "workspace-write": {"type": "workspaceWrite"},
+        "danger-full-access": {"type": "dangerFullAccess"},
+    }
+
+    def _rpc_commands_execute(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
+        args = body.get("args") or {}
+        line = str(args.get("line") or body.get("line") or "")
+        m = re.fullmatch(r"\s*/permission\s+(read-only|workspace-write|danger-full-access)\s*", line)
+        sid = str(args.get("agentId") or body.get("agentId") or "")
+        if not m:
+            return ok_value({"ok": False, "output": f"codex runtime 不支持该命令: {line.strip()[:60]}"})
+        value = m.group(1)
+        if not sid:
+            return err_value("agentId required")
+        self.registry.set_permission(sid, value)
+        # Instant readback: the UI confirms by the permissions projection.
+        self._emit(self.translator.session_projection(sid, "permissions", {"currentValue": value}))
+        return ok_value({"ok": True, "output": f"permission -> {value}"})
+
+    def _permission_view(self, sid: str) -> dict[str, Any]:
+        reg = self.registry.get(sid) or {}
+        return {"currentValue": reg.get("permission") or "workspace-write"}
+
+    def _sandbox_params(self, sid: str) -> dict[str, Any]:
+        reg = self.registry.get(sid) or {}
+        perm = reg.get("permission")
+        if not perm or perm not in self._SANDBOX_MAP:
+            return {}
+        params: dict[str, Any] = {"sandboxPolicy": self._SANDBOX_MAP[perm]}
+        # Keep interactive approvals on unless the user asked for full access.
+        params["approvalPolicy"] = "never" if perm == "danger-full-access" else "on-request"
+        return params
 
     # respond -> answer pending codex server request
     def _rpc_respond(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
