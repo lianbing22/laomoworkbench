@@ -40,12 +40,14 @@
 
 | 能力 | 说明 |
 | --- | --- |
-| 本地 Agent 工作台 | 会话、运行信号、工具活动、审批交互，全部在本地界面完成。 |
+| 可插拔 Agent Runtime | 纯净模式默认 Codex（`codex app-server --stdio`），知识模式 DSH；`--clean-runtime` 一键切换，模式与引擎解耦。 |
+| 模型与推理强度 | 模型列表/五档推理等级（low~max）来自 Codex 真实目录，输入框旁即选即生效。 |
+| 沙箱权限 | 只读/工作区写入/完全访问三档，映射 Codex 沙箱策略，实时回读生效。 |
+| 目标与计划 | 设定目标自动驱动 Agent；计划步骤实时勾选；工具活动卡片实时展开。 |
 | Markdown 工作区 | 项目、知识、提示词与内容资料留在你拥有的文件夹，而不是云端数据库。 |
-| 长对话可用性 | 历史分页加载、流式投影与用户滚动分离，长任务生成时界面不抢滚动、不闪烁。 |
-| 任务与中断交互 | 需要确认、输入或批准的请求做队列化处理；过期响应自动收口，弹窗不卡死。 |
-| 本地优先 | 未配置访问码时只绑定本机回环地址；手机配对可启用受访问码保护的局域网访问；无遥测。 |
-| 双模式 | 知识模式连接个人 Vault；纯净模式只跑 Agent，不读取任何工作资料。 |
+| 长对话可用性 | 历史分页加载、流式投影与用户滚动分离，完成后自动切换富文本渲染。 |
+| 任务与中断交互 | 审批/提问队列化处理；运行中可引导（steer）或打断（interrupt）。 |
+| 本地优先 | 未配置访问码时只绑定本机回环地址；无遥测。 |
 | 跨平台 | macOS 13+ Apple Silicon 原生桌面宿主；Windows 10/11 x64 浏览器宿主（Beta）。 |
 
 ## 从源码启动（macOS）
@@ -85,7 +87,9 @@ python3 web/boujoy_server.py --port 8766 --vault vault --static web
 
 ## 路线图
 
-当前架构为「UI → 本地网关 → Agent Runtime」。正在进行的工作是把 Runtime 层抽象为可插拔 Adapter，第一位候选是 OpenAI Codex 的 `app-server`：
+**P0 已落地**：Runtime 层已完成解耦，纯净模式由 Codex app-server 驱动（12+2 项真实验收全过），知识模式保持 DSH，一条参数即可回退——详见 [CHANGELOG.md](CHANGELOG.md)。
+
+下一步（P1）：
 
 ~~~text
                 老墨工作台
@@ -100,7 +104,9 @@ python3 web/boujoy_server.py --port 8766 --vault vault --static web
 Codex  DeepSeek     Claude/GLM
 ~~~
 
-模式（知识/纯净）与 Runtime 将解耦配置：clean 默认接 Codex、knowledge 暂留 DeepSeek Harness，随时可切回。
+- Vault → Codex：把知识库/专家卡变成 Codex 可消费的上下文层，知识模式切换到 Codex。
+- 任务队列与子代理面板（由老墨控制层拥有，不绑死任何引擎）。
+- 更多 Runtime Provider（Claude/GLM）。
 
 ## 常见问题
 
