@@ -133,12 +133,21 @@ class TestEventTranslator(unittest.TestCase):
     def test_token_usage(self):
         frames = frames_of(self.tr, self.ctx, [
             {"method": "thread/tokenUsage/updated", "params": {
-                "threadId": self.sid, "tokenUsage": {"inputTokens": 10, "outputTokens": 5}}},
+                "threadId": self.sid, "tokenUsage": {"total": {
+                    "inputTokens": 10, "cachedInputTokens": 2, "outputTokens": 5,
+                    "cacheWriteInputTokens": 1, "totalTokens": 17},
+                    "modelContextWindow": 128000}}},
         ])
         ev = event_frames(frames, self.sid)[0]["payload"]["event"]
         self.assertEqual(ev["type"], "assistant/chunk")
         self.assertEqual(ev["data"]["type"], "usage")
-        self.assertEqual(ev["data"]["usage"]["inputTokens"], 10)
+        self.assertEqual(ev["data"]["usage"]["uncachedInputTokens"], 8)
+        self.assertEqual(ev["data"]["usage"]["cacheReadTokens"], 2)
+        # tokenUsage + contextPressure ride separate projection frames with
+        # their own counter (must not punch holes in the event seq stream).
+        projs = [f["payload"] for f in frames if f["payload"].get("type") == "session/projection"]
+        self.assertEqual([p["key"] for p in projs], ["tokenUsage", "contextPressure"])
+        self.assertEqual(projs[1]["value"]["contextWindow"], 128000)
 
     def test_error_notification(self):
         frames = frames_of(self.tr, self.ctx, [
@@ -178,7 +187,9 @@ class TestEventTranslator(unittest.TestCase):
         ]
         seqs = [f["payload"]["event"]["seq"] for f in frames_of(self.tr, self.ctx, notes)
                 if f["payload"].get("type") == "session/event" and f["payload"].get("sessionId") == self.sid]
-        self.assertEqual(seqs, list(range(1, len(seqs) + 1)))
+        # Strictly increasing; contiguous except where projection frames
+        # consumed their own (separate) counter in between.
+        self.assertTrue(all(b > a for a, b in zip(seqs, seqs[1:])))
 
 
 def sample_thread() -> dict:

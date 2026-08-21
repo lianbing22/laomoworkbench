@@ -68,6 +68,10 @@ class EventTranslator:
     def __init__(self) -> None:
         self._seq_lock = threading.Lock()
         self._seqs: dict[str, int] = {}
+        # Projections ride their own counter: the frontend gap-detects the
+        # session/event stream (seq must be contiguous); interleaving
+        # projection seqs there would trigger constant history repulls.
+        self._proj_seqs: dict[str, int] = {}
         self._stream_state: dict[str, dict[str, Any]] = {}
         self._finalized: dict[str, set[str]] = {}  # session -> emitted item ids
         self._current_turn: dict[str, str] = {}    # session -> turn id
@@ -118,9 +122,16 @@ class EventTranslator:
                                                       "sessionId": session_id, "lastSeq": self.last_seq(session_id)}}
 
     def session_projection(self, session_id: str, key: str, value: Any) -> dict[str, Any]:
+        with self._seq_lock:
+            seq = self._proj_seqs.get(session_id, 0) + 1
+            self._proj_seqs[session_id] = seq
         return {"type": "server-request", "payload": {
             "type": "session/projection", "sessionId": session_id,
-            "key": key, "value": value, "seq": self.next_seq(session_id)}}
+            "key": key, "value": value, "seq": seq}}
+
+    def set_proj_floor(self, session_id: str, floor: int) -> None:
+        with self._seq_lock:
+            self._proj_seqs[session_id] = max(self._proj_seqs.get(session_id, 0), floor)
 
     def host_status(self, session_id: str, running: bool) -> dict[str, Any]:
         return {"type": "server-request", "payload": {"type": "host/session-status",
@@ -202,7 +213,7 @@ class EventTranslator:
             elif method == "item/completed":
                 out.extend(self._item_completed(sid, params, ctx))
             elif method == "thread/tokenUsage/updated":
-                out.append(self._token_usage(sid, params))
+                out.extend(self._token_usage(sid, params, ctx))
             elif method == "error":
                 out.append(self.agent_error(str(params.get("message", "Codex runtime error"))))
             elif method == "warning":
@@ -351,14 +362,32 @@ class EventTranslator:
         }
         return self.session_event(sid, "assistant/message", data)
 
-    def _token_usage(self, sid: str, params: dict[str, Any]) -> dict[str, Any]:
-        info = params.get("tokenUsage", {}) or params.get("usage", {}) or {}
+    def _token_usage(self, sid: str, params: dict[str, Any], ctx: "CodexRuntimeAdapter") -> list[dict[str, Any]]:
+        # Schema: {tokenUsage: {last: breakdown, total: breakdown, modelContextWindow}}
+        info = params.get("tokenUsage", {}) or {}
+        total = info.get("total") or info.get("last") or info
+
+        def num(key: str) -> int:
+            try:
+                return int(total.get(key) or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        cached = num("cachedInputTokens")
         usage = {
-            "inputTokens": info.get("inputTokens") or info.get("lastTokenUsage", {}).get("inputTokens", 0),
-            "cachedInputTokens": info.get("cachedInputTokens", 0),
-            "outputTokens": info.get("outputTokens", 0),
+            "uncachedInputTokens": max(0, num("inputTokens") - cached),
+            "outputTokens": num("outputTokens"),
+            "cacheReadTokens": cached,
+            "cacheWriteTokens": num("cacheWriteInputTokens"),
         }
-        return self.session_event(sid, "assistant/chunk", {"type": "usage", "usage": usage, "index": 0})
+        pressure = {"projectedTokens": num("totalTokens"),
+                    "contextWindow": info.get("modelContextWindow") or 0}
+        ctx.registry.set_usage(sid, usage, pressure)
+        return [
+            self.session_event(sid, "assistant/chunk", {"type": "usage", "usage": usage, "index": 0}),
+            self.session_projection(sid, "tokenUsage", usage),
+            self.session_projection(sid, "contextPressure", pressure),
+        ]
 
     def _file_change_diffs(self, item: dict[str, Any]) -> list[dict[str, Any]]:
         diffs = []
@@ -521,6 +550,12 @@ class SessionRegistry:
         with self._lock:
             s["running"] = running
             s["updated"] = int(time.time() * 1000)
+
+    def set_usage(self, thread_id: str, usage: dict[str, Any], pressure: dict[str, Any]) -> None:
+        s = self.ensure(thread_id)
+        with self._lock:
+            s["usage"] = usage
+            s["pressure"] = pressure
 
     def set_permission(self, thread_id: str, permission: str) -> None:
         s = self.ensure(thread_id)
@@ -1097,6 +1132,10 @@ class CodexRuntimeAdapter:
         proc = self._ensure_process()
         sid = str(body.get("sessionId", ""))
         reg = self.registry.get(sid) or {}
+        # Idle session: nothing to interrupt; interrupting a completed turn id
+        # is rejected by codex and would surface a spurious error in the UI.
+        if not reg.get("running"):
+            return ok_value({"cancelled": True})
         turn_id = reg.get("turnId") or ""
         if not turn_id:
             return ok_value({"cancelled": True})
@@ -1118,6 +1157,7 @@ class CodexRuntimeAdapter:
         thread = res.get("thread") or res or {}
         events = self.folder.fold(thread)
         self.translator.set_seq_floor(sid, len(events))
+        self.translator.set_proj_floor(sid, len(events))
         self.registry.ensure(sid, cwd=thread.get("cwd"))
         # Pagination: beforeSeq returns events strictly below that seq
         # (scroll-up pages); maxMessages caps the page size tail.
@@ -1129,9 +1169,14 @@ class CodexRuntimeAdapter:
         if max_messages and len(events) > int(max_messages):
             events = events[-int(max_messages):]
             has_more = True
+        projections: dict[str, Any] = {"permissions": self._permission_view(sid)}
+        reg = self.registry.get(sid) or {}
+        if reg.get("usage"):
+            projections["tokenUsage"] = reg["usage"]
+        if reg.get("pressure"):
+            projections["contextPressure"] = reg["pressure"]
         return ok_value({"events": events, "hasMore": has_more,
-                         "projections": {"asOfSeq": len(events),
-                                         "values": {"permissions": self._permission_view(sid)}}})
+                         "projections": {"asOfSeq": len(events), "values": projections}})
 
     # session.models -> model/list
     def _rpc_session_models(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
@@ -1275,14 +1320,50 @@ class CodexRuntimeAdapter:
         return {"decision": "decline"}
 
     # --- stubs (P0: safely empty) ---
-    def _rpc_session_search(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
-        return ok_value({"items": []})
-
     def _rpc_session_rename(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
-        return err_value("rename is not supported on the codex runtime in P0", "unsupported")
+        sid = str(body.get("sessionId", ""))
+        title = str(body.get("title", "")).strip()
+        if not sid or not title:
+            return err_value("sessionId 和 title 必填")
+        try:
+            proc = self._ensure_process()
+            proc.rpc.request("thread/name/set", {"threadId": sid, "name": title}, timeout=15)
+        except (AdapterUnavailable, TimeoutError, RuntimeError) as exc:
+            return err_value(f"重命名失败: {exc}")
+        self.registry.set_title(sid, title)
+        return ok_value({"sessionId": sid, "title": title})
 
     def _rpc_session_fork(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
-        return err_value("fork is not supported on the codex runtime in P0", "unsupported")
+        sid = str(body.get("sessionId", ""))
+        if not sid:
+            return err_value("sessionId required")
+        try:
+            proc = self._ensure_process()
+            res = proc.rpc.request("thread/fork", {"threadId": sid}, timeout=30) or {}
+        except (AdapterUnavailable, TimeoutError, RuntimeError) as exc:
+            return err_value(f"分叉失败: {exc}")
+        new_id = res.get("threadId") or res.get("id") or (res.get("thread") or {}).get("id", "")
+        if not new_id:
+            return err_value("thread/fork 未返回新会话 ID")
+        self.registry.ensure(new_id)
+        self._emit(self.translator.session_added(new_id))
+        return ok_value({"sessionId": new_id, "id": new_id})
+
+    def _rpc_session_search(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
+        query = str(body.get("query", "")).strip().lower()
+        if not query:
+            return ok_value({"items": []})
+        try:
+            proc = self._ensure_process()
+            data = proc.rpc.request("thread/list", {"limit": 100}, timeout=30) or {}
+        except (AdapterUnavailable, TimeoutError, RuntimeError):
+            return ok_value({"items": []})
+        hits = []
+        for t in data.get("data", []) or []:
+            hay = f"{t.get('name') or ''} {t.get('preview') or ''}".lower()
+            if query in hay:
+                hits.append({"sessionId": t.get("id", ""), "title": t.get("name") or (t.get("preview") or "")[:60]})
+        return ok_value({"items": hits})
 
     def _rpc_session_updateQueue(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
         return err_value("queue is owned by the workbench, not codex (P0)", "unsupported")

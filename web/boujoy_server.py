@@ -1695,7 +1695,11 @@ class BoujoyHandler(BaseHTTPRequestHandler):
                 mode = str(payload.get("mode", "knowledge"))
                 if mode not in {"knowledge", "clean"}:
                     raise ValueError("无效运行模式")
-                moved = self._trash_session_logs(session_id, mode)
+                # Codex-backed modes have no DSH session-log layout to trash;
+                # the archive/delete already happened through the adapter.
+                moved = 0
+                if RUNTIMES.adapter_for(mode) is None:
+                    moved = self._trash_session_logs(session_id, mode)
                 self._json({"ok": True, "sessionId": session_id, "movedLogs": moved, "recoverable": True})
             except FileNotFoundError:
                 self._error(404, "Harness 会话目录不存在")
