@@ -1,79 +1,62 @@
 <div align="center">
 
-# Boujoy Harness
+# LaoMo Workbench
 
-## Pull the agent out of the chat box and into your local workspace.
+## 老墨工作台
 
-An unofficial product layer for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness): it keeps the upstream Agent runtime and protocol, then adds a local Markdown workspace, a desktop-shaped operating surface, and safeguards for long-running work.
+**Pull the agent out of the chat box and into your local workspace.**
 
-**Not another chat skin. A local workbench where an agent can act, recover, and work with context you own.**
+A local-first agent workbench: sessions, tasks, knowledge, and run signals — your files, your machine.
 
-[简体中文](README.md) · [Watch the full demo](https://github.com/asen-goat-mine/boujoy-harness/releases/download/demo-2026-08-19/Boujoy-Harness-Demo.mp4) · [Upstream DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
+[简体中文](README.md) · Derived from [Boujoy Harness](https://github.com/asen-goat-mine/boujoy-harness)
 
 </div>
 
 <p align="center">
-  <a href="https://github.com/asen-goat-mine/boujoy-harness/releases/download/demo-2026-08-19/Boujoy-Harness-Demo.mp4">
-    <img src="docs/assets/harness-demo.gif" alt="Animated Boujoy Harness UI demo. Click for the full video." width="900">
-  </a>
+  <img src="docs/assets/harness-demo.gif" alt="LaoMo Workbench UI demo" width="900">
 </p>
-
-<p align="center"><sub>The animation plays in this README. Click it to open the complete 49-second MP4.</sub></p>
 
 ## What it is
 
-DeepSeek Harness is the runtime. Boujoy Harness is the local product layer around it.
+LaoMo Workbench is an agent workbench that runs on your own machine. It hosts no models and stores no credentials in the cloud: the agent runtime (by default [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)) runs locally, and your working context stays in your own folders.
 
-It keeps the upstream WebSocket event and RPC semantics intact, then connects the runtime to a local Markdown vault, a task-oriented UI, and desktop-host reliability work:
+One-line division of labor:
 
-- Native WKWebView host and controlled restart path on macOS.
-- A local-only gateway between the UI and separately installed DeepSeek Harness instances.
-- A Markdown vault browser for projects, notes, prompts, and reusable context.
-- Paged history, streaming projection, scroll stability, and reconnect boundaries for long conversations.
-- Queue-safe interrupt dialogs so expired RPCs do not leave the UI trapped behind a modal.
-
-The source repository does **not** ship a model, provider account, DeepSeek Harness runtime, vault, session, or credentials. Whether a portable package includes a runtime depends on the publisher completing platform-specific packaging and validation.
-
-## Main capabilities
-
-| Capability | Why it matters |
-| --- | --- |
-| Upstream-compatible runtime bridge | DeepSeek Harness stays responsible for models, tools, event frames, and RPC. Boujoy does not invent an incompatible agent protocol. |
-| Local Markdown workspace | Keep projects, knowledge, prompts, and drafts as ordinary files that any editor can open. |
-| Long-task UI safeguards | History paging, streaming isolation, and user-scroll protection reduce jumpy views and missing old messages. |
-| Recoverable human-in-the-loop actions | Approval and input requests are queued; stale or cancelled requests close cleanly instead of permanently blocking the page. |
-| Local-first defaults | Without an access code the gateway is loopback-only; macOS phone pairing can enable access-code-protected LAN access; no analytics endpoint is configured. |
-| Startup resilience | Health checks, App Translocation handling, path selection, and optional-service degradation avoid turning a missing extra component into a dead app. |
-| Cross-platform direction | Native macOS 13+ Apple Silicon host today; Windows 10/11 x64 browser-host adapter is available as a Beta. |
-
-## Architecture
+- **Agent runtime** makes the agent act (model calls, tools, event streams).
+- **LaoMo Workbench** gives those actions a workspace, a visual surface, and a recoverable desktop experience.
+- **Markdown vault** keeps reusable context in files you own.
 
 ~~~text
-Your task
-    │
-    ▼
-Boujoy UI ── Local gateway ── DeepSeek Harness ── Your model provider / tools
-    │
-    └──────────────────────── Local Markdown Vault
-                                  projects · knowledge · prompts · content
+your one-line task
+        │
+        ▼
+LaoMo UI ── local gateway ── agent runtime ── your models / tools
+        │
+        └────────────── local Markdown vault
+                       projects · knowledge · prompts · content
 ~~~
 
-## Get started from source on macOS
+## Core capabilities
 
-### Requirements
+| Capability | Notes |
+| --- | --- |
+| Local agent workbench | Sessions, run signals, tool activity, and approval interactions, all in a local UI. |
+| Markdown workspace | Projects, knowledge, prompts, and content live in folders you own, not a cloud database. |
+| Long-conversation usability | Paged history, streaming projection separated from user scroll — no jumpiness during long generations. |
+| Task & interrupt handling | Queued confirmations/inputs/approvals; stale responses settle automatically, dialogs never stick. |
+| Local first | Loopback-only binding without an access code; optional PIN-protected LAN access for phone pairing; no telemetry. |
+| Two modes | Knowledge mode connects your personal vault; clean mode runs the agent without touching work data. |
+| Cross-platform | macOS 13+ Apple Silicon native host; Windows 10/11 x64 browser host (Beta). |
 
-- macOS 13+ on Apple Silicon (arm64)
-- A separately installed and built DeepSeek Harness checkout with node_modules/.bin/dsh
-- A local Markdown vault directory
-- A usable Python 3 executable
+## Building from source (macOS)
 
-### Build and install
+Prerequisites: macOS 13+ Apple Silicon, Python 3, a separately built DeepSeek Harness (an executable `node_modules/.bin/dsh`), and a local Markdown vault directory.
 
 ~~~bash
-git clone https://github.com/asen-goat-mine/boujoy-harness.git
-cd boujoy-harness
+git clone https://github.com/lianbing22/laomoworkbench.git
+cd laomoworkbench
 
-# Point these at your own local dependencies. Do not commit them.
+# Point at your own local dependencies; never commit these values.
 export BOUJOY_DSH_ROOT="$HOME/src/deepseek-harness"
 export BOUJOY_VAULT_DIR="$HOME/BoujoyVault"
 export BOUJOY_PYTHON_BIN="$(command -v python3)"
@@ -81,107 +64,91 @@ export BOUJOY_PYTHON_BIN="$(command -v python3)"
 ./macos/build-app.command --install
 ~~~
 
-The app is installed to Desktop as Boujoy Harness.app. Then:
+To skip the native shell and run the web edition directly (clean mode works out of the box):
 
-1. Select or create a workspace.
-2. Use Knowledge mode when the task should draw from your Markdown vault; use Clean mode for isolated work.
-3. Describe the task. Model, provider, and tool permissions still come from your DeepSeek Harness configuration.
-4. Handle confirmations or questions in the interrupt dialog. Expired requests are closed safely and the queue advances.
-
-## Knowledge mode and Clean mode
-
-| Mode | Use it for | It does not do |
-| --- | --- | --- |
-| Knowledge mode | Work that benefits from projects, notes, prompts, or prior decisions | It should not dump your entire vault into a prompt. Relevant context should be selected through indexes and cards. |
-| Clean mode | Experiments, one-off questions, or work that should not use local notes | It does not read your Markdown vault. |
-
-The public repository contains no personal vault. Start with an empty local directory or connect your own Markdown knowledge base.
-
-## Portable packages and App Translocation
-
-An unsigned macOS app opened directly from a downloaded ZIP can be placed in a temporary App Translocation directory. It then cannot reliably find sibling vault and runtime directories.
-
-For a portable package, preserve the full layout and start it through the package-root launcher rather than opening the App directly:
-
-~~~text
-portable-package/
-├── Boujoy Harness.app
-├── runtime/
-├── vault/
-└── 启动 Boujoy Harness.command
+~~~bash
+mkdir -p vault
+python3 web/boujoy_server.py --port 8766 --vault vault --static web
+# open http://127.0.0.1:8766/
 ~~~
 
-The launcher passes the package root explicitly. Direct launches are detected and should lead to a safe folder-selection flow rather than exposing temporary macOS paths. This is a compatibility fallback, not notarization; signed public macOS distribution still needs a Developer ID signature and Apple notarization.
+First run: pick or create a workspace on the left → connect your Markdown vault (skip in clean mode) → describe a task in the composer. Models, providers, and tool permissions are decided by the agent runtime you configure.
 
-## Windows adapter (Beta)
+## Knowledge mode vs. clean mode
 
-The Windows adapter keeps the same product UI but uses a local PowerShell host and opens Edge in app mode when possible.
+| Mode | Best for | What it never does |
+| --- | --- | --- |
+| Knowledge | Tasks that reuse project background, docs, prompts, or past decisions | Never dumps the whole vault into the model; context is served via indexing and relevant cards. |
+| Clean | Ad-hoc questions, experiments, anything unrelated to your work data | Never reads your Markdown vault. |
 
-It is a **Windows 10/11 x64 Beta**:
+No personal vault ships with the source; start from an empty directory.
 
-1. Prepare the platform-specific DeepSeek Harness runtime on a real Windows x64 machine with windows/Prepare-Windows-Runtime.ps1.
-2. Do not copy a macOS runtime folder to Windows; it contains platform-native dependencies.
-3. Start it with windows/Start-Boujoy.ps1; in-product restart is delegated to the host via a local restart signal.
-4. Read the [Windows guide](windows/README-Windows.zh-CN.md) and [release status](windows/WINDOWS-RELEASE-STATUS.md) before redistributing it.
+## Roadmap
 
-## Troubleshooting
+The current architecture is `UI → local gateway → agent runtime`. Ongoing work abstracts the runtime layer into pluggable adapters, with OpenAI Codex `app-server` as the first candidate:
 
-### Missing runtime component
+~~~text
+             LaoMo Workbench
+                    │
+        ┌───────────┴───────────┐
+  control plane             workbench UI
+        │
+  RuntimeAdapter
+        │
+  ┌─────┼─────────────┐
+  │     │             │
+Codex  DeepSeek     Claude/GLM
+~~~
 
-Verify that the DeepSeek Harness root, vault, and Python executable exist. For a downloaded portable package, use the package-root launcher instead of opening the App directly.
+Mode (knowledge/clean) and runtime become decoupled config: clean defaults to Codex, knowledge stays on DeepSeek Harness for now, with one flag to switch back.
 
-### The splash screen waits for a while
+## FAQ
 
-The gateway and Harness need time to start on a cold run. Boujoy waits for a health check instead of loading a page before it is ready. If it finally fails, inspect the local runtime, Python, and provider configuration rather than repeatedly reloading the page.
+**Why does it say runtime components are missing?** Verify the agent runtime, vault, and Python paths exist on this machine. For portable packages, launch via the launcher script, not by double-clicking the app.
 
-### The agent has no response
+**Why does startup hang for a while?** First runs wait on gateway/runtime health checks rather than blindly loading. On failure, check the local runtime, Python, and provider config.
 
-Boujoy does not operate model accounts or API balances. Check the configured DeepSeek Harness provider, balance, network, permissions, and runtime logs.
+**Why is the agent not replying?** This project hosts no model balance or API keys. Check the model provider, balance, network, and permissions from your agent runtime.
 
-### The knowledge preview is unavailable
+**Does a broken knowledge preview break chat?** No. The knowledge preview is optional; the main agent UI keeps working without it.
 
-The preview is optional. Its absence should not block the main Agent UI. Whether Knowledge mode can provide context depends on your own vault and Harness setup.
+**Is this an official DeepSeek or OpenAI product?** No. LaoMo Workbench is an independent, unofficial open-source layer.
 
-### Is this an official DeepSeek product?
+## Privacy & network boundary
 
-No. Boujoy Harness is an independent, unofficial open-source product layer and is not endorsed or supported by DeepSeek AI.
+- Vault contents, session state, and credentials stay on your machine; none of it is in this repository.
+- Without an access code the gateway binds 127.0.0.1 only; LAN access requires an explicitly configured PIN.
+- The AI news page fetches the public RSS feeds listed in `web/boujoy_server.py`; no analytics, no telemetry.
+- Never commit personal vaults, session logs, credentials, or platform runtimes.
 
-## Privacy and network boundary
+See [SECURITY.md](SECURITY.md) for details.
 
-- Vault content, session state, and credentials stay on your machine and are not included in this repository.
-- Without an access code, the local gateway binds only to 127.0.0.1. macOS phone pairing can enable access-code-protected LAN access.
-- Model requests can pass through the local gateway to the DeepSeek Harness or provider that you configure. Boujoy operates no remote proxy and does not persist API keys as a Boujoy service.
-- The AI news view requests public RSS feeds listed in web/boujoy_server.py; Boujoy configures no analytics or telemetry endpoint.
-- Never commit boujoy-config.json, a vault, sessions, credentials, generated dist Apps, or platform runtimes.
+## Verification & development
 
-See [SECURITY.md](SECURITY.md) for reporting guidance.
-
-## Verification
-
-Run the isolated smoke suite without a model account:
+A static smoke test runs without any model account:
 
 ~~~bash
 env PYTHONDONTWRITEBYTECODE=1 python3 tests/smoke_test.py --skip-live
 ~~~
 
-For a locally running instance:
+With a running local instance (including an agent runtime):
 
 ~~~bash
 python3 tests/smoke_test.py --live-origin http://127.0.0.1:8766
 ~~~
 
-The suite checks gateway contracts, path containment, access control, and portable-runtime normalization. It does not call a model provider or spend balance.
-
-## Repository map
+## Repository layout
 
 ~~~text
-macos/      Native macOS WKWebView host and build scripts
-web/        Local gateway, Boujoy UI, and first-party web assets
-windows/    Windows browser-host Beta scripts and documentation
-tests/      Model-free smoke tests
-assets/     Boujoy-owned visual assets and attribution material
+macos/      native WKWebView host and build scripts
+web/        local gateway, web UI, and assets
+windows/    Windows browser-host Beta scripts and docs
+tests/      model-free smoke tests
+assets/     icons, font attribution, and visual assets
 ~~~
 
-## License and notices
+## License & credits
 
-Boujoy-authored code and artwork are released under the [MIT License](LICENSE). DeepSeek Harness is a separate MIT-licensed dependency with its own license and notices. Font attribution and third-party information live in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+This repository derives from [Boujoy Harness](https://github.com/asen-goat-mine/boujoy-harness) (MIT License) and follows its license terms; the upstream itself builds on [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness). Font attribution and third-party notices: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+"LaoMo Workbench / 老墨工作台" is this project's own brand, unaffiliated with and not endorsed by DeepSeek AI or OpenAI.
