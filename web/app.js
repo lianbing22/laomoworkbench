@@ -11,7 +11,7 @@ const HISTORY_FETCH_LIMIT = 50;
 const state = {
   page: "agent",
   theme: localStorage.getItem("boujoy-theme") || "dark",
-  mode: "knowledge",
+  mode: localStorage.getItem("boujoy-mode") === "clean" ? "clean" : "knowledge",
   host: null,
   sessions: [],
   workspaces: [],
@@ -811,6 +811,7 @@ function showPage(page) {
 async function setMode(mode) {
   if (mode === state.mode) return;
   state.mode = mode;
+  localStorage.setItem("boujoy-mode", mode);
   closeEventSources();
   const clean = mode === "clean";
   $("#modeSwitch").setAttribute("aria-pressed", String(clean));
@@ -3277,6 +3278,10 @@ function bindEvents() {
 
 async function init() {
   setTheme(state.theme);
+  // Sync the mode toggle with the persisted mode before the first harness boot.
+  $("#modeSwitch").setAttribute("aria-pressed", String(state.mode === "clean"));
+  $("#modeName").textContent = state.mode === "clean" ? "纯净模式" : "知识模式";
+  $("#modeHint").textContent = state.mode === "clean" ? "NO VAULT / ISOLATED" : "VAULT 已连接";
   bindEvents();
   showPage("agent");
   try {
