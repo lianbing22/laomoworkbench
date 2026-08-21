@@ -45,6 +45,58 @@ HARNESS_ORIGINS = {
     "knowledge": "http://127.0.0.1:3080",
     "clean": "http://127.0.0.1:3081",
 }
+
+# --- Runtime layer (P0 Clean Runtime Migration) ------------------------------
+# Modes map to runtime adapters; knowledge stays on DSH. When clean-runtime is
+# codex, the clean mode routes through CodexRuntimeAdapter instead of the DSH
+# HTTP proxy. Mode and runtime stay decoupled: this table is configuration.
+
+
+class RuntimeManager:
+    """Resolve mode -> runtime adapter. Business handlers never branch on the
+    concrete runtime; they call adapter_rpc/adapter_events and this class picks
+    the DSH HTTP proxy or the Codex adapter."""
+
+    def __init__(self) -> None:
+        self.clean_runtime = "dsh"
+        self.codex_adapter = None  # lazily built
+
+    def configure(self, clean_runtime: str, codex_bin: str | None, codex_cwd: str | None) -> None:
+        self.clean_runtime = clean_runtime if clean_runtime in {"dsh", "codex"} else "dsh"
+        if self.clean_runtime == "codex":
+            from codex_adapter import CodexRuntimeAdapter
+            self.codex_adapter = CodexRuntimeAdapter(
+                bin_path=codex_bin,
+                default_cwd=codex_cwd,
+                debug_log=lambda m: print(m, file=sys.stderr, flush=True),
+            )
+
+    def runtime_for(self, mode: str) -> str:
+        return self.codex_adapter.NAME if (mode == "clean" and self.codex_adapter) else "dsh"
+
+    def adapter_for(self, mode: str):
+        """Return the Codex adapter when this mode routes to it, else None."""
+        if mode == "clean" and self.codex_adapter:
+            return self.codex_adapter
+        return None
+
+    def health(self) -> dict:
+        runtimes = {"knowledge": {"runtime": "dsh", "status": "ready"}}
+        if self.codex_adapter is not None:
+            runtimes["clean"] = self.codex_adapter.health()
+        else:
+            runtimes["clean"] = {"runtime": "dsh", "status": "ready"}
+        return runtimes
+
+    def shutdown(self) -> None:
+        if self.codex_adapter is not None:
+            try:
+                self.codex_adapter.shutdown()
+            except Exception:
+                pass
+
+
+RUNTIMES = RuntimeManager()
 # CORS allow-list: only loopback product surfaces may call this gateway's APIs.
 # Any other Origin (e.g. an arbitrary website open in the browser) must not be
 # able to read the vault or drive write endpoints. "null" covers file:// pages.
@@ -1160,7 +1212,9 @@ class BoujoyHandler(BaseHTTPRequestHandler):
             # This is intentionally the product gateway's readiness signal.
             # The optional standalone knowledge preview and lazy clean Harness
             # are not prerequisites for rendering the main product shell.
-            self._json({"ok": True, "ready": True, "pid": os.getpid(), "services": {"product": True, "gateway": True}})
+            self._json({"ok": True, "ready": True, "pid": os.getpid(),
+                        "services": {"product": True, "gateway": True},
+                        "runtimes": RUNTIMES.health()})
             return
         if path == "/api/config":
             self._json({"ok": True, "vaultName": self.config.vault.name})
@@ -1416,7 +1470,11 @@ class BoujoyHandler(BaseHTTPRequestHandler):
                 if not self._require_access(parsed):
                     self._deny_access()
                     return
-                self._ws_upgrade(mode, f"/api/{endpoint}")
+                adapter = RUNTIMES.adapter_for(mode)
+                if adapter is not None:
+                    self._ws_bridge_codex(adapter, endpoint)
+                else:
+                    self._ws_upgrade(mode, f"/api/{endpoint}")
                 return
             self._proxy(f"{HARNESS_ORIGINS[mode]}/api/{endpoint}", stream=True)
             return
@@ -1460,6 +1518,83 @@ class BoujoyHandler(BaseHTTPRequestHandler):
         # From here on the raw socket is the WebSocket; relay both directions.
         self.close_connection = True
         _ws_relay(self.connection, upstream)
+
+    def _ws_bridge_codex(self, adapter, endpoint: str) -> None:
+        """Bridge browser WS <-> codex adapter event bus. Downstream only:
+        runtime commands still ride HTTP POST RPC, so upstream frames (if any)
+        are drained and discarded. Frames are JSON text frames, unmasked."""
+        key = self.headers.get("Sec-WebSocket-Key", "")
+        accept = _ws_accept_key(key)
+        response = (
+            "HTTP/1.1 101 Switching Protocols\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Accept: {accept}\r\n"
+            "\r\n"
+        )
+        try:
+            self.connection.sendall(response.encode("ascii"))
+        except OSError:
+            return
+        self.close_connection = True
+        sock = self.connection
+        sock.settimeout(None)
+        stop = threading.Event()
+
+        def on_frame(frame: dict) -> None:
+            payload = json.dumps(frame, ensure_ascii=False).encode("utf-8")
+            header = bytearray([0x81])  # FIN + text frame
+            n = len(payload)
+            if n < 126:
+                header.append(n)
+            elif n < 65536:
+                header.append(126)
+                header += n.to_bytes(2, "big")
+            else:
+                header.append(127)
+                header += n.to_bytes(8, "big")
+            sock.sendall(bytes(header) + payload)
+
+        unsubscribe = adapter.subscribe(on_frame)
+        # Replay pending approvals so a reconnect never loses an interrupt.
+        try:
+            proc = adapter._ensure_process()
+            for descriptor in proc.rpc.pending_approvals():
+                payload = (descriptor.get("params") or {}).get("__payload__") or None
+                if payload:
+                    on_frame(payload)
+        except Exception:
+            pass
+
+        def drain_browser() -> None:
+            try:
+                while not stop.is_set():
+                    header = sock.recv(2)
+                    if len(header) < 2:
+                        break
+                    length = header[1] & 0x7F
+                    if length == 126:
+                        length = int.from_bytes(sock.recv(2), "big")
+                    elif length == 127:
+                        length = int.from_bytes(sock.recv(8), "big")
+                    if header[1] & 0x80 and length:  # masked client frame: skip mask+payload
+                        sock.recv(4 + length)
+                    elif length:
+                        sock.recv(length)
+            except OSError:
+                pass
+            finally:
+                stop.set()
+
+        threading.Thread(target=drain_browser, name="codex-ws-drain", daemon=True).start()
+        # Block this handler thread until the browser disconnects.
+        while not stop.is_set():
+            time.sleep(0.2)
+        unsubscribe()
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
 
     def do_POST(self) -> None:
         parsed = urllib.parse.urlsplit(self.path)
@@ -1522,6 +1657,26 @@ class BoujoyHandler(BaseHTTPRequestHandler):
         match = re.fullmatch(r"/api/harness/(knowledge|clean)/(.+)", path)
         if match:
             mode, endpoint = match.groups()
+            adapter = RUNTIMES.adapter_for(mode)
+            if adapter is not None:
+                try:
+                    envelope = json.loads(body or b"{}")
+                except json.JSONDecodeError:
+                    envelope = {}
+                if endpoint == "respond":
+                    # The frontend posts {type:client-response, rpcId, result}
+                    # with rpcId/result at the top level; test tooling may nest
+                    # them inside payload. Handle both, answer exactly once.
+                    payload = envelope.get("payload") or {}
+                    rpc_id = payload.get("rpcId") or envelope.get("rpcId", "")
+                    result = payload.get("result") or envelope.get("result") or {}
+                    response = adapter.rpc(mode, "respond", {"rpcId": rpc_id, "result": result})
+                else:
+                    response = adapter.rpc(mode, endpoint, envelope.get("payload") or {})
+                data = json.dumps(response, ensure_ascii=False).encode("utf-8")
+                self._headers(200, "application/json", len(data))
+                self.wfile.write(data)
+                return
             self._proxy(
                 f"{HARNESS_ORIGINS[mode]}/api/{endpoint}",
                 method="POST",
@@ -1653,6 +1808,10 @@ def main() -> int:
     parser.add_argument("--clean-home")
     parser.add_argument("--access-code", default="", help="PIN for phone/remote access; empty disables remote access")
     parser.add_argument("--restart-file", help="managed-host restart signal file (used by the Windows launcher)")
+    parser.add_argument("--clean-runtime", choices=("dsh", "codex"), default="dsh",
+                        help="runtime backing clean mode: dsh (default) or codex app-server")
+    parser.add_argument("--codex-bin", help="path to the codex binary (default: auto-detect)")
+    parser.add_argument("--codex-cwd", help="default cwd for codex threads (default: server cwd)")
     args = parser.parse_args()
     config = AppConfig(
         Path(args.vault),
@@ -1666,6 +1825,7 @@ def main() -> int:
     # A manually launched server without one must stay local: otherwise a
     # nearby LAN client could read the vault and drive the Harness unauthenticated.
     bind_host = "0.0.0.0" if config.access_code else LOOPBACK
+    RUNTIMES.configure(args.clean_runtime, args.codex_bin, args.codex_cwd)
     server = BoujoyServer((bind_host, args.port), config)
     native_parent_pid = os.getppid()
 
@@ -1685,6 +1845,7 @@ def main() -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        RUNTIMES.shutdown()
         server.server_close()
     return 0
 
