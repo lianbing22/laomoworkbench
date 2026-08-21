@@ -1115,19 +1115,42 @@ class CodexRuntimeAdapter:
     def _rpc_session_models(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
         proc = self._ensure_process()
         data = proc.rpc.request("model/list", {}, timeout=30) or {}
-        models = []
-        for m in data.get("data", []) or []:
-            mid = m.get("id") or m.get("slug") or m.get("model")
-            if mid:
-                models.append({"model": mid, "name": m.get("displayName") or m.get("label") or mid})
-        self._last_model_list = models
+        cfg = {}
+        try:
+            cfg = proc.rpc.request("config/read", {}, timeout=15).get("config", {}) or {}
+        except (TimeoutError, RuntimeError):
+            pass
+        models: list[dict[str, Any]] = []
+        current_efforts = ["low", "medium", "high"]
+        current_default: str | None = None
+        current_model = None
         sid = str(body.get("sessionId", ""))
         reg = self.registry.get(sid) or {}
-        current_model = reg.get("model") or self._default_model({})
+        for m in data.get("data", []) or []:
+            mid = m.get("id") or m.get("model")
+            if not mid:
+                continue
+            # Real per-model effort catalogue (schema: supportedReasoningEfforts
+            # [{reasoningEffort, description}] + defaultReasoningEffort).
+            sup = [e for e in m.get("supportedReasoningEfforts", []) or [] if isinstance(e, dict)]
+            efforts = [{"name": e.get("reasoningEffort", ""), "description": e.get("description", "")} for e in sup]
+            names = [e["name"] for e in efforts if e["name"]]
+            default_eff = m.get("defaultReasoningEffort") or (names[-1] if names else None)
+            models.append({"model": mid, "name": m.get("displayName") or mid,
+                           "reasoning": {"efforts": efforts, "defaultEffort": default_eff}})
+            if mid == cfg.get("model"):
+                current_model = mid
+                if names:
+                    current_efforts = names
+                current_default = default_eff
+        current_model = reg.get("model") or current_model or cfg.get("model") or "gpt-5.6-luna"
+        self._last_model_list = models
         return ok_value({
             "groups": [{"id": "codex", "name": "Codex", "models": models}],
             "current": {"model": current_model, "provider": "codex",
-                        "reasoning": {"efforts": self.DEFAULT_EFFORTS, "defaultEffort": self.DEFAULT_EFFORTS[-1]}},
+                        "reasoningEffort": reg.get("effort"),
+                        "reasoning": {"efforts": current_efforts,
+                                      "defaultEffort": current_default or current_efforts[-1]}},
         })
 
     # session.selectModel
