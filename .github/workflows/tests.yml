@@ -1,0 +1,30 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  pytest:
+    # The workbench runtime itself is stdlib-only; pytest is the sole dev
+    # dependency. Real-Codex gates (Gate 0/A-J, Usability) need a logged-in
+    # codex CLI and are NOT run here — they stay manual/local certification.
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install dev dependencies
+        run: python -m pip install pytest
+      - name: Run test suite
+        env:
+          # Keep gate/test state out of any real host-state; same isolation
+          # the local gate drivers use.
+          LAOMO_HOST_STATE_ROOT: ${{ runner.temp }}/host-state
+        run: python -m pytest tests/ -q
