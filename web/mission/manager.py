@@ -610,8 +610,20 @@ class MissionRunner(threading.Thread):
         wtree = WorktreeManager(str(mission.get("cwd") or os.getcwd()),
                                 self.store, self.mission_id)
         info = unit.get("worktree") or {}
-        if not info.get("path") or not wtree.available:
-            return "none"
+        if not wtree.available:
+            return "none"  # P1.1 non-git mode: integration is a no-op
+        if not info.get("path"):
+            # Gate A (real codex): a passed git unit without a worktree used
+            # to silently skip integration ("none") — its work then never
+            # reached the integration branch and only the machine gate
+            # caught it downstream. Fail closed at the source instead.
+            unit["integration"] = {"phase": "failed",
+                                   "reason": "git 使命缺少 worktree 记录"}
+            unit["state"] = unit["status"] = "failed"
+            self._save_unit(unit)
+            self.store.event("integration", {"unit": index, "phase": "failed",
+                                             "reason": "git 使命缺少 worktree 记录"})
+            return "failed"
         if unit.get("state") in ("integrated",):
             return "ok"  # crash between integrate-save and next-pending
         tx = dict(unit.get("integration") or {})

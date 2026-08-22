@@ -40,6 +40,7 @@ has in-flight commits).
 from __future__ import annotations
 
 import subprocess
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +57,13 @@ class WorktreeManager:
     """
 
     COMMIT_USER = ("-c", "user.name=laomo", "-c", "user.email=laomo@local")
+    # process-wide: unit threads share ONE git repo, and every unit worktree
+    # is cut from the shared integration worktree — creation must be
+    # serialized (Gate A caught two threads racing `git worktree add` on the
+    # same integration dir; the loser returned None and its unit silently
+    # fell back to the USER's workspace). RLock: ensure() re-enters via
+    # ensure_integration().
+    _create_lock = threading.RLock()
 
     def __init__(self, workspace: str | Path, store: MissionStore,
                  mission_id: str, timeout: int = 60) -> None:
@@ -218,10 +226,17 @@ class WorktreeManager:
         start = source_sha or self.rev(self._repo or self.workspace)
         if not start:
             return None
-        ok, _ = self._run("worktree", "add", "-B", self.integration_branch,
-                          str(path), start)
-        if not ok:
-            return None
+        with WorktreeManager._create_lock:
+            if path.is_dir() and self.rev(path):
+                # lost the race to a sibling unit thread — its worktree IS
+                # the mission's integration worktree; reuse it
+                head = self.rev(path)
+                return {"path": str(path), "branch": self.integration_branch,
+                        "baseSha": source_sha or head, "headSha": head}
+            ok, _ = self._run("worktree", "add", "-B", self.integration_branch,
+                              str(path), start)
+            if not ok:
+                return None
         return {"path": str(path), "branch": self.integration_branch,
                 "baseSha": start, "headSha": self.rev(path)}
 
@@ -251,10 +266,19 @@ class WorktreeManager:
         head = (integ or {}).get("headSha")
         if not head:
             return None
-        ok, _ = self._run("worktree", "add", "-B", self._branch(index),
-                          str(path), head)
-        if not ok:
-            return None
+        with WorktreeManager._create_lock:
+            if path.is_dir() and self.rev(path):
+                # lost the creation race to a sibling thread for THIS unit
+                # (dispatch retry): reuse, never reset
+                ok, branch = self._git(path, "rev-parse", "--abbrev-ref", "HEAD")
+                return {**base, "path": str(path),
+                        "branch": branch if ok else self._branch(index),
+                        "baseSha": (info or {}).get("baseSha") or self.rev(path),
+                        "headSha": self.rev(path)}
+            ok, _ = self._run("worktree", "add", "-B", self._branch(index),
+                              str(path), head)
+            if not ok:
+                return None
         return {**base,
                 "path": str(path), "branch": self._branch(index),
                 "baseSha": head, "headSha": self.rev(path)}

@@ -185,6 +185,13 @@ class UnitRunner:
         wtree = self._worktree()
         info = wtree.ensure(index, unit.get("title"), info=unit.get("worktree")) \
             if wtree.available else None
+        if wtree.available and info is None:
+            # Gate A (real codex) caught the silent fallback: when worktree
+            # creation lost a sibling race the builder turn ran directly in
+            # the USER's checked-out workspace. A git mission must NEVER
+            # fall back — crash the unit honestly instead.
+            raise RuntimeError(
+                f"unit {index} worktree 创建失败（git 使命禁止回退用户工作区）")
         if info:
             unit["worktree"] = info
         cwd = self._unit_cwd(info)
