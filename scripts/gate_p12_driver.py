@@ -36,8 +36,15 @@ import signal
 import subprocess
 import sys
 import threading
+import tempfile
 import time
 from pathlib import Path
+
+# Gates never touch the user real workbench host state (workspace registry,
+# settings, presets) — a polluted seed once shipped a temp dir into the live
+# workspace list. Force every adapter this driver builds into a scratch root.
+os.environ.setdefault("LAOMO_HOST_STATE_ROOT", tempfile.mkdtemp(prefix="laomo-gate-host-state-"))
+
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "web"))
 

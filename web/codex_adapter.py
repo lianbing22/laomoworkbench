@@ -544,6 +544,12 @@ class HistoryFolder:
 # --- Workbench host state (multi-project workspaces / settings / presets) ----
 
 def _host_state_root() -> str:
+    # LAOMO_HOST_STATE_ROOT isolates gate drivers and test harnesses from the
+    # user's real product state (a polluted seed once shipped a temp dir into
+    # the live workspace registry).
+    override = os.environ.get("LAOMO_HOST_STATE_ROOT")
+    if override:
+        return override
     if os.name == "nt":
         base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~/AppData/Local")
         return os.path.join(base, "Boujoy", "BoujoyHarness")

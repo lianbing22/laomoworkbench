@@ -345,7 +345,7 @@ class TestCodexProviderRegistration(ProviderTestCase):
 
     def test_write_provider_config_snake_case_params(self):
         self.save_mock()
-        adapter = CodexRuntimeAdapter(default_cwd=str(self.root), providers=self.mgr)
+        adapter = CodexRuntimeAdapter(default_cwd=str(self.root), providers=self.mgr, state_root=str(self.root / "host-state"))
         fake_proc = FakeProcess()
         adapter.process = fake_proc  # ready -> _ensure_process returns it
         profile = self.mgr.get("mock-provider")
@@ -403,7 +403,7 @@ class TestClassifyProviderError(unittest.TestCase):
 
 class TestSelectModelProviderGuard(unittest.TestCase):
     def _adapter(self):
-        return CodexRuntimeAdapter(default_cwd="/tmp")  # no process needed
+        return CodexRuntimeAdapter(default_cwd="/tmp", state_root=tempfile.mkdtemp(prefix="laomo-host-state-"))  # no process needed
 
     def test_cross_provider_change_rejected(self):
         adapter = self._adapter()
@@ -432,13 +432,13 @@ class TestSelectModelProviderGuard(unittest.TestCase):
 
 class TestProviderThreadParams(ProviderTestCase):
     def test_custom_provider_params(self):
-        adapter = CodexRuntimeAdapter(default_cwd=str(self.root), providers=self.mgr)
+        adapter = CodexRuntimeAdapter(default_cwd=str(self.root), providers=self.mgr, state_root=str(self.root / "host-state"))
         self.save_mock()
         self.assertEqual(adapter._provider_thread_params("mock-provider"),
                          {"modelProvider": "mock-provider", "model": "mock-1"})
 
     def test_chatgpt_and_unknown_providers_return_empty(self):
-        adapter = CodexRuntimeAdapter(default_cwd=str(self.root), providers=self.mgr)
+        adapter = CodexRuntimeAdapter(default_cwd=str(self.root), providers=self.mgr, state_root=str(self.root / "host-state"))
         self.assertEqual(adapter._provider_thread_params(BUILTIN_CHATGPT_ID), {})
         self.assertEqual(adapter._provider_thread_params("never-saved"), {})
         self.assertEqual(adapter._provider_thread_params(""), {})
