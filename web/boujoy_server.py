@@ -1661,6 +1661,8 @@ class BoujoyHandler(BaseHTTPRequestHandler):
                 return
             self._proxy(f"{HARNESS_ORIGINS[mode]}/api/{endpoint}", stream=True)
             return
+        if self._absolute_path_route(path):
+            return
         self._serve_static(path)
 
     def _providers_route(self, path: str, body: bytes) -> None:
@@ -1703,6 +1705,29 @@ class BoujoyHandler(BaseHTTPRequestHandler):
             self._error(400 if exc.code != "not-found" else 404, str(exc))
         except (OSError, ValueError) as exc:
             self._error(400, str(exc))
+            return
+
+    def _absolute_path_route(self, path: str) -> bool:
+        """Serve the 'paste an absolute path after the origin' habit.
+
+        127.0.0.1:8766/Users/.../file.html used to fall through to the SPA
+        fallback, which renders the app shell — the user reads that as
+        “生成的页面没有 CSS” every time. Detect absolute-path-shaped GETs
+        (first segment is a real filesystem root directory) and route them
+        through the preview logic: cwd-confined, sandbox CSP, real bytes."""
+        absolute = urllib.parse.unquote(path)
+        first = absolute.split("/", 2)[1] if absolute.count("/") >= 1 else ""
+        if not first or not Path("/" + first).is_dir():
+            return False
+        # Compare resolved forms: /var vs /private/var style symlinks (macOS)
+        # would break a plain string prefix check.
+        try:
+            Path(absolute).resolve().relative_to(Path.cwd().resolve())
+        except (ValueError, OSError):
+            self._error(403, "该路径不在工作台目录内；试试 /api/preview?path=<相对路径>")
+            return True
+        self._preview_file(absolute)
+        return True
 
     def _ws_upgrade(self, mode: str, path: str) -> None:
         """Answer the browser's WebSocket upgrade, then bridge to Harness."""

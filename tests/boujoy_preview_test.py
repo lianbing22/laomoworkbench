@@ -94,6 +94,20 @@ class PreviewRouteTest(unittest.TestCase):
         status, _, _ = self._get("/api/preview?path=nope.html")
         self.assertEqual(status, 404)
 
+    def test_absolute_path_paste_after_origin(self):
+        # Users paste /Users/.../file.html after the origin; that used to hit
+        # the SPA fallback and render the app shell ("页面没有 CSS").
+        pasted = f"{self.root}/page.html"
+        status, headers, body = self._get(pasted)
+        self.assertEqual(status, 200)
+        self.assertIn(b"<h1>", body)
+        self.assertIn("sandbox", headers.get("Content-Security-Policy", ""))
+
+    def test_absolute_path_outside_cwd_rejected(self):
+        outside = self._outside / "secret.txt"
+        status, _, _ = self._get(str(outside))
+        self.assertEqual(status, 403)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
