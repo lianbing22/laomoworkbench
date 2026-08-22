@@ -353,5 +353,191 @@ class WorktreeCrashResumeTest(WorktreeTest):
         self.assertEqual((self.repo / "feature-1.txt").read_text("utf-8"), "from unit worker 1\n")
 
 
+class IntegrationReconcileTest(WorktreeTest):
+    """P1.2/M5: integration is a write-ahead transaction; a crash between
+    `git merge` and the plan.json write is reconciled from git truth.
+
+    * git merge landed + crash -> plan says `integrating` -> restart adopts
+      the merge (no duplicate commits, no re-merge)
+    * crash before the merge -> replay the idempotent integrate
+    * crash mid-conflicted-merge (MERGE_HEAD left behind) -> abort first,
+      replay, land on `conflict` honestly
+    * stale git index.lock after a hard crash -> cleared, mission proceeds
+    """
+
+    def craft_crash(self, mid, unit0_state, tx, worktree_info):
+        """Hand-write the post-crash disk state: unit0 wedged mid-integration
+        (with its transaction record), unit1 still pending on `a`."""
+        store = self.mgr.store_for(mid)
+        plan = {
+            "version": 2, "replans": 0,
+            "units": [
+                {"id": "a", "index": 0, "title": "单元A", "description": "",
+                 "acceptance": ["x"], "dependencies": [],
+                 "state": unit0_state, "status": unit0_state,
+                 "attempt": 1, "repairCount": 0,
+                 "worktree": worktree_info, "jobId": None, "delta": None,
+                 "repairDirective": None, "lastVerdict": "PASS",
+                 "integration": tx,
+                 "worker": {"startedAt": 1, "finishedAt": 2}},
+                {"id": "b", "index": 1, "title": "单元B", "description": "",
+                 "acceptance": ["y"], "dependencies": ["a"],
+                 "state": "pending", "status": "pending",
+                 "attempt": 0, "repairCount": 0,
+                 "worktree": {"path": None, "branch": None,
+                              "baseSha": None, "headSha": None},
+                 "jobId": None, "delta": None, "repairDirective": None,
+                 "lastVerdict": None,
+                 "worker": {"startedAt": None, "finishedAt": None}},
+            ],
+        }
+        store.save_plan(plan)
+        store.save_state({"state": "running", "cycles": 2, "currentUnit": 1,
+                          "noProgress": 0, "progressSignature": "",
+                          "tokensUsed": 0, "wallElapsedMs": 0,
+                          "agentActiveMs": 0, "waitingMs": 0, "pausedMs": 0,
+                          "phaseStartedAt": 0})
+        self.adapter.script("worker", handoff_text(note="单元B 完成。"))
+        self.adapter.defaults["evaluator"] = verdict_block("PASS", ["条件满足"])
+
+    def integ_events(self, mid, unit):
+        return [e["detail"] for e in self.events(mid)
+                if e["type"] == "integration"
+                and isinstance(e.get("detail"), dict)
+                and e["detail"].get("unit") == unit]
+
+    def test_crash_after_merge_adopts_git_truth(self):
+        """M5 核心：git merge 已成功 → 进程崩溃 → plan.json 仍写 integrating。
+        重启后以 git 为真相直接采纳合并结果（不重放、不产生新提交）。"""
+        mid = self.create()
+        store = self.mgr.store_for(mid)
+        wm = WorktreeManager(str(self.repo), store, mid)
+        info = wm.ensure(0, "单元A")
+        wt = Path(info["path"])
+        (wt / "feature-1.txt").write_text("from unit worker 1\n", "utf-8")
+        git(wt, "add", "-A")
+        git(wt, "commit", "-q", "-m", "unit 0 work")
+        unit_head = wm.rev(wt)
+        # 崩溃的进程：已把 u0 分支合入 main（FF），但没来得及写回 plan.json
+        git(self.repo, "merge", "--no-edit", info["branch"])
+        self.assertEqual(git(self.repo, "rev-parse", "HEAD"), unit_head)
+        tx = {"phase": "prepared", "branch": info["branch"],
+              "unitHead": unit_head, "dirty": False, "startedAt": 1}
+        self.craft_crash(mid, "integrating", tx, {**info, "headSha": unit_head})
+
+        self.mgr.start(mid)
+        self.assertEqual(self.wait_terminal(mid), "done")
+
+        plan = self.plan(mid)
+        u0 = plan["units"][0]
+        self.assertEqual(u0["state"], "integrated")
+        self.assertEqual(u0["integration"].get("phase"), "cleaned")
+        self.assertTrue(u0["integration"].get("reconciled"))
+        adopted = [d for d in self.integ_events(mid, 0)
+                   if d.get("phase") == "integrated" and d.get("reconciled")]
+        self.assertEqual(len(adopted), 1, "应恰好一次 reconcile 采纳: %r" % self.integ_events(mid, 0))
+        self.assertEqual(adopted[0].get("alreadyMerged"), unit_head)
+        # 采纳而非重放：feature-1 在 main 历史中只有一个提交
+        self.assertEqual(
+            len(git(self.repo, "log", "--oneline", "--", "feature-1.txt").splitlines()), 1)
+        self.assertFalse(wt.is_dir(), "reconcile 后 u0 worktree 应清理")
+        self.assertEqual(plan["units"][1]["state"], "integrated")
+        self.assertEqual((self.repo / "feature-1.txt").read_text("utf-8"),
+                         "from unit worker 1\n")
+
+    def test_crash_before_merge_replays_idempotently(self):
+        """prepare 已落盘（dirty 工作树）、merge 从未执行 → 重放幂等集成。"""
+        mid = self.create()
+        store = self.mgr.store_for(mid)
+        wm = WorktreeManager(str(self.repo), store, mid)
+        info = wm.ensure(0, "单元A")
+        wt = Path(info["path"])
+        (wt / "feature-1.txt").write_text("from unit worker 1\n", "utf-8")  # 未提交
+        tx = {"phase": "prepared", "branch": info["branch"],
+              "unitHead": wm.rev(wt), "dirty": True, "startedAt": 1}
+        self.craft_crash(mid, "integrating", tx, info)
+
+        self.mgr.start(mid)
+        self.assertEqual(self.wait_terminal(mid), "done")
+
+        plan = self.plan(mid)
+        u0 = plan["units"][0]
+        self.assertEqual(u0["state"], "integrated")
+        self.assertEqual(u0["integration"].get("phase"), "cleaned")
+        self.assertIn(("replayed"), [d.get("phase") for d in self.integ_events(mid, 0)])
+        self.assertEqual((self.repo / "feature-1.txt").read_text("utf-8"),
+                         "from unit worker 1\n")
+        self.assertEqual(
+            len(git(self.repo, "log", "--oneline", "--", "feature-1.txt").splitlines()), 1,
+            "重放不得产生重复提交")
+        self.assertEqual(plan["units"][1]["state"], "integrated")
+
+    def test_crashed_conflicted_merge_aborted_then_blocks(self):
+        """崩溃发生在冲突 merge 中途（MERGE_HEAD 残留）：先 abort 保持 main
+        干净，再重放 → 冲突如实落 conflict，mission blocked。"""
+        mid = self.create()
+        store = self.mgr.store_for(mid)
+        wm = WorktreeManager(str(self.repo), store, mid)
+        info = wm.ensure(0, "单元A")
+        wt = Path(info["path"])
+        (wt / "shared.txt").write_text("from unit worker 1\n", "utf-8")
+        git(wt, "add", "-A")
+        git(wt, "commit", "-q", "-m", "unit 0 work")
+        unit_head = wm.rev(wt)
+        (self.repo / "shared.txt").write_text("external\n", "utf-8")
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-q", "-m", "external change")
+        proc = subprocess.run(["git", "-C", str(self.repo), "merge",
+                               "--no-edit", info["branch"]],
+                              capture_output=True, text=True)
+        self.assertNotEqual(proc.returncode, 0, "外部提交后合并应冲突")
+        self.assertTrue(git_ok(self.repo, "rev-parse", "-q", "--verify", "MERGE_HEAD"),
+                        "崩溃现场应残留 MERGE_HEAD")
+        tx = {"phase": "prepared", "branch": info["branch"],
+              "unitHead": unit_head, "dirty": False, "startedAt": 1}
+        self.craft_crash(mid, "integrating", tx, {**info, "headSha": unit_head})
+
+        self.mgr.start(mid)
+        self.assertEqual(self.wait_terminal(mid), "blocked")
+
+        u0 = self.plan(mid)["units"][0]
+        self.assertEqual(u0["state"], "conflict")
+        self.assertFalse(git_ok(self.repo, "rev-parse", "-q", "--verify", "MERGE_HEAD"),
+                         "reconcile 后不得残留 MERGE_HEAD")
+        self.assertEqual((self.repo / "shared.txt").read_text("utf-8"), "external\n")
+        phases = [d.get("phase") for d in self.integ_events(mid, 0)]
+        self.assertIn("aborted-stale-merge", phases)
+        self.assertIn("conflict", phases)
+        state = json.loads((self.mdir(mid) / "state.json").read_text("utf-8"))
+        self.assertIn("集成冲突", str(state.get("stopReason")))
+
+    def test_stale_index_lock_cleared_on_reconcile(self):
+        """硬崩溃残留 index.lock（worktree + 主仓库）→ reconcile 清锁后继续。"""
+        mid = self.create()
+        store = self.mgr.store_for(mid)
+        wm = WorktreeManager(str(self.repo), store, mid)
+        info = wm.ensure(0, "单元A")
+        wt = Path(info["path"])
+        (wt / "feature-1.txt").write_text("from unit worker 1\n", "utf-8")
+        wt_lock = Path(git(wt, "rev-parse", "--absolute-git-dir"), "index.lock")
+        wt_lock.write_text("", "utf-8")
+        Path(self.repo / ".git" / "index.lock").write_text("", "utf-8")
+        tx = {"phase": "prepared", "branch": info["branch"],
+              "unitHead": wm.rev(wt), "dirty": True, "startedAt": 1}
+        self.craft_crash(mid, "integrating", tx, info)
+
+        self.mgr.start(mid)
+        self.assertEqual(self.wait_terminal(mid), "done")
+
+        cleared = [d for d in self.integ_events(mid, 0)
+                   if d.get("phase") == "cleared-stale-locks"]
+        self.assertEqual(len(cleared), 1)
+        self.assertEqual(len(cleared[0].get("locks") or []), 2,
+                         "worktree 与主仓库的锁都应被清除")
+        self.assertEqual(self.plan(mid)["units"][0]["state"], "integrated")
+        self.assertEqual((self.repo / "feature-1.txt").read_text("utf-8"),
+                         "from unit worker 1\n")
+
+
 if __name__ == "__main__":
     unittest.main()

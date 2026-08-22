@@ -6,8 +6,10 @@ control plane integrates the unit branch (a plain git merge) back into the
 mission branch, so the next unit starts from an updated base. Non-git
 workspaces (or a workspace whose repo is unavailable) fall back to the P1.1
 behavior: the worker edits the workspace directory itself and integration is
-a no-op. Conflicts from integration are reported, not resolved — the
-ConflictResolver arrives in M5.
+a no-op. Conflicts from integration are reported, not resolved — the mission
+blocks on the unit's `conflict` state with the merge aborted (a resolver is
+deliberately out of scope; M5 instead made integration a crash-safe
+transaction: see WorktreeManager.is_merged / MissionRunner._reconcile).
 
 All operations are idempotent: a crashed run may leave a worktree behind and
 `ensure` reuses it (never resets a worktree that has in-flight commits).
@@ -68,6 +70,50 @@ class WorktreeManager:
         ok, sha = self._git(cwd, "rev-parse", ref)
         return sha if ok else None
 
+    # -- integration probes (M5 reconcile) -----------------------------------
+
+    def is_merged(self, sha: str) -> bool:
+        """True when `sha` is already reachable from the mission branch HEAD
+        (the merge landed). Used by crash reconcile to distinguish
+        crash-before-merge from crash-after-merge."""
+        if not sha:
+            return False
+        ok, _ = self._run("merge-base", "--is-ancestor", sha, "HEAD")
+        return ok
+
+    def merge_in_progress(self) -> bool:
+        ok, _ = self._run("rev-parse", "-q", "--verify", "MERGE_HEAD")
+        return ok
+
+    def abort_merge(self) -> None:
+        self._run("merge", "--abort")
+
+    def is_dirty(self, index: int) -> bool:
+        """True when the unit worktree has uncommitted changes at prepare
+        time. A dirty tree means the pre-merge unitHead alone cannot prove
+        the merge landed — reconcile must replay the idempotent integrate
+        instead of trusting the ancestry probe."""
+        ok, out = self._git(self._worktree_dir(index), "status", "--porcelain")
+        return bool(ok and out.strip())
+
+    def clear_stale_locks(self, paths: list[Path]) -> list[str]:
+        """Remove git index.lock files a hard crash left behind. Safe because
+        the control plane is the repo's only writer and reconcile runs on the
+        single scheduler thread with nothing in flight. Returns the locks."""
+        removed: list[str] = []
+        for path in paths:
+            ok, git_dir = self._git(path, "rev-parse", "--absolute-git-dir")
+            if not ok:
+                continue
+            lock = Path(git_dir) / "index.lock"
+            if lock.is_file():
+                try:
+                    lock.unlink()
+                    removed.append(str(lock))
+                except OSError:
+                    pass
+        return removed
+
     # -- per-unit worktree ------------------------------------------------------
 
     def ensure(self, index: int, title: str | None = None,
@@ -115,8 +161,10 @@ class WorktreeManager:
         """Commit any pending worktree changes and merge the unit branch into
         the mission branch (the mission branch is the repo's current branch).
         Returns {ok, headSha?, conflict?, reason?}. A content conflict aborts
-        the merge so the mission branch stays clean for the ConflictResolver
-        (M5); the report says conflict=True and the unit goes to `conflict`."""
+        the merge so the mission branch stays clean; the report says
+        conflict=True and the unit goes to `conflict`. Idempotent: replaying
+        after a crash re-commits nothing (clean tree) and re-merging an
+        already-merged branch is a no-op "Already up to date"."""
         path = self._worktree_dir(index)
         branch = branch or self._branch(index)
         if not path.is_dir() or not self.rev(path):

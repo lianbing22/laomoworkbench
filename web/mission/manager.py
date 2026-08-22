@@ -11,8 +11,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .dag import (UNIT_DEP_DONE, UNIT_EVALUATING, UNIT_INTEGRATED,
-                  UNIT_PASSED, UNIT_PENDING, UNIT_READY, UNIT_REPAIRING,
-                  UNIT_RUNNING, UNIT_WAITING, normalize_plan)
+                  UNIT_INTEGRATING, UNIT_PASSED, UNIT_PENDING, UNIT_READY,
+                  UNIT_REPAIRING, UNIT_RUNNING, UNIT_WAITING, normalize_plan)
 from .jobs import (JobWatcher, _process_identity, _terminate_job_process,
                    job_log_tail)
 from .models import (EVALUATOR_TURN_TIMEOUT, RUNS_DIRNAME, WORKER_TURN_TIMEOUT,
@@ -448,6 +448,23 @@ class MissionRunner(threading.Thread):
                         self.store.event("repair", {"unit": target, "scope": "machine-gate"})
                         continue
                 plan = self.store.load_plan()
+                # M5 reconcile: a crash mid-integration wedges a unit in
+                # `integrating` (owned by no thread, never dispatched again).
+                # Nothing is in flight here, so git truth can safely settle
+                # the transaction — without this the drain clause would end
+                # the mission as "DAG 依赖无法满足".
+                for unit in plan["units"]:
+                    if unit.get("state") != UNIT_INTEGRATING:
+                        continue
+                    res = self._reconcile_integration(state, unit["index"])
+                    if res == "conflict":
+                        self._transition(state, "blocked",
+                                         stopReason=f"单元 #{unit['index'] + 1} 集成冲突（崩溃恢复重放）")
+                        return False
+                    if res == "failed":
+                        self._transition(state, "failed",
+                                         stopReason=f"单元 #{unit['index'] + 1} 集成失败（崩溃恢复重放）")
+                        return False
                 for unit in plan["units"]:
                     if unit.get("state") == UNIT_PASSED:
                         self._integrate_harvested(state, unit["index"])
@@ -535,8 +552,12 @@ class MissionRunner(threading.Thread):
 
     def _integrate(self, state: dict[str, Any], index: int) -> str:
         """Integrate one passed unit: its worktree branch into the mission
-        branch. Returns "ok" | "conflict" | "failed" | "none" (never had a
-        worktree — P1.1 mode edits the workspace directly)."""
+        branch. Integration is a write-ahead transaction: the unit's
+        `integration` record (pre-merge unitHead + dirty flag) is persisted
+        ATOMICALLY with state=integrating BEFORE git runs, so a crash at any
+        point can be reconciled from git truth (see _reconcile_integration).
+        Returns "ok" | "conflict" | "failed" | "none" (never had a worktree —
+        P1.1 mode edits the workspace directly)."""
         unit = self._unit(index)
         if unit is None:
             return "failed"
@@ -548,15 +569,35 @@ class MissionRunner(threading.Thread):
             return "none"
         if unit.get("state") in ("integrated",):
             return "ok"  # crash between integrate-save and next-pending
-        if unit.get("state") != "integrating":
-            unit["state"] = unit["status"] = "integrating"
+        tx = dict(unit.get("integration") or {})
+        if unit.get("state") != UNIT_INTEGRATING:
+            unit["state"] = unit["status"] = UNIT_INTEGRATING
+            tx = {"phase": "prepared", "branch": info.get("branch"),
+                  "unitHead": wtree.rev(Path(str(info["path"]))),
+                  "dirty": wtree.is_dirty(index),
+                  "startedAt": _now_ms()}
+            # atomic with the integrating state: one plan.json write
+            unit["integration"] = tx
             self._save_unit(unit)
             self.store.event("integration", {"unit": index, "phase": "start",
                                              "branch": info.get("branch"),
-                                             "baseSha": info.get("baseSha")})
+                                             "baseSha": info.get("baseSha"),
+                                             "txUnitHead": tx.get("unitHead")})
+        elif not tx.get("unitHead"):
+            # pre-M5 crash record: backfill before touching git so reconcile
+            # data exists even for a wedge created by an older build
+            tx = {"phase": "prepared", "branch": info.get("branch"),
+                  "unitHead": wtree.rev(Path(str(info["path"]))),
+                  "dirty": wtree.is_dirty(index),
+                  "startedAt": _now_ms(), "backfilled": True}
+            unit["integration"] = tx
+            self._save_unit(unit)
         result = wtree.integrate(index, unit.get("title"), branch=info.get("branch"))
         if result.get("ok"):
             unit["worktree"] = wtree.refresh_head(unit.get("worktree") or info)
+            unit["integration"] = {**tx, "phase": "merged",
+                                   "headSha": result.get("headSha"),
+                                   "finishedAt": _now_ms()}
             unit["state"] = unit["status"] = "integrated"
             unit["delta"] = None
             self._save_unit(unit)
@@ -565,18 +606,87 @@ class MissionRunner(threading.Thread):
                                              "branch": info.get("branch"),
                                              "headSha": result.get("headSha")})
             wtree.cleanup(index, branch=info.get("branch"))
+            unit["integration"] = {**unit["integration"], "phase": "cleaned"}
+            self._save_unit(unit)
             return "ok"
         if result.get("conflict"):
+            unit["integration"] = {**tx, "phase": "conflict"}
             unit["state"] = unit["status"] = "conflict"
             self._save_unit(unit)
             self.store.event("integration", {"unit": index, "phase": "conflict",
                                              "reason": (result.get("reason") or "")[:200]})
             return "conflict"
+        unit["integration"] = {**tx, "phase": "failed"}
         unit["state"] = unit["status"] = "failed"
         self._save_unit(unit)
         self.store.event("integration", {"unit": index, "phase": "failed",
                                          "reason": (result.get("reason") or "")[:200]})
         return "failed"
+
+    def _reconcile_integration(self, state: dict[str, Any], index: int) -> str:
+        """M5 crash reconcile for a unit wedged in `integrating`. Git is the
+        truth for whether the merge landed; the persisted transaction record
+        says which probe is trustworthy:
+
+        * tx.unitHead recorded on a CLEAN tree and already an ancestor of the
+          mission HEAD => the merge landed and only plan.json lagged behind:
+          adopt it (no new commits, no re-merge), then clean up.
+        * a MERGE_HEAD is sitting in the repo => a conflicted merge crashed
+          mid-way: abort it (mission branch must stay clean), then replay.
+        * anything else (crash before the merge, dirty tree, legacy record)
+          => replay the idempotent integrate (commit-if-needed + merge;
+          re-merging an already-merged branch is "Already up to date").
+        """
+        unit = self._unit(index)
+        if unit is None:
+            return "failed"
+        mission = self.store.load_mission()
+        wtree = WorktreeManager(str(mission.get("cwd") or os.getcwd()),
+                                self.store, self.mission_id)
+        info = unit.get("worktree") or {}
+        tx = unit.get("integration") or {}
+        if not info.get("path") or not wtree.available:
+            unit["integration"] = {**tx, "phase": "failed",
+                                   "reason": "reconcile: worktree 不存在"}
+            unit["state"] = unit["status"] = "failed"
+            self._save_unit(unit)
+            self.store.event("integration", {"unit": index, "phase": "failed",
+                                             "reconciled": True,
+                                             "reason": "worktree 不存在"})
+            return "failed"
+        removed = wtree.clear_stale_locks(
+            [Path(str(info["path"])), wtree.workspace])
+        if removed:
+            self.store.event("integration", {"unit": index,
+                                             "phase": "cleared-stale-locks",
+                                             "locks": removed})
+        if tx.get("unitHead") and not tx.get("dirty") \
+                and wtree.is_merged(str(tx["unitHead"])):
+            head = wtree.rev(wtree.workspace)
+            unit["integration"] = {**tx, "phase": "merged", "headSha": head,
+                                   "finishedAt": _now_ms(), "reconciled": True}
+            unit["state"] = unit["status"] = "integrated"
+            unit["delta"] = None
+            self._save_unit(unit)
+            self.store.write_progress_md()
+            self.store.event("integration", {"unit": index, "phase": "integrated",
+                                             "reconciled": True,
+                                             "alreadyMerged": tx.get("unitHead"),
+                                             "headSha": head})
+            wtree.cleanup(index, branch=info.get("branch"))
+            unit["integration"] = {**unit["integration"], "phase": "cleaned"}
+            self._save_unit(unit)
+            return "ok"
+        if wtree.merge_in_progress():
+            wtree.abort_merge()
+            self.store.event("integration", {"unit": index,
+                                             "phase": "aborted-stale-merge",
+                                             "reconciled": True})
+        res = self._integrate(state, index)
+        if res == "ok":
+            self.store.event("integration", {"unit": index, "phase": "replayed",
+                                             "reconciled": True})
+        return res
 
     # -- phases --
     def _phase_planning(self, state: dict[str, Any]) -> bool:

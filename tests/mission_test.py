@@ -1483,6 +1483,58 @@ class TestParallelWorkUnits(MissionLoopTest):
         self.assertFalse(self.reason_has(self.mgr, mid, "no-progress", "stop"),
                          "兄弟 wake 不得被误判为 no-progress")
 
+    def test_36_parallel_pause_then_resume_completes(self):
+        """并行执行中 pause：mission 转 paused、不再派发新单元（在途轮次
+        允许收尾）；resume 后全部单元完成。"""
+        records = []
+        n = 3
+        self.adapter.script("planner", plan_block(sample_units(n)))
+        for _ in range(n * 2):  # resume 后允许重跑，脚本备足
+            self.adapter.script("worker", self._slow_worker(records, 0.4))
+        mid = self.create_mission(options={"maxParallelWorkers": 2})
+        self.mgr.start(mid)
+        self.assertTrue(self.wait_until(
+            lambda: len(self._dispatch_events(mid, 0)) >= 1, timeout=15,
+            desc="至少一个单元已派发"), "应立即派发首批单元")
+        self.mgr.pause(mid)
+        self.assertTrue(self.wait_state(self.mgr, mid, ["paused"], timeout=15),
+                        "pause 应在并行执行中生效")
+        # 在途 worker（0.4s）收尾后不得再有新的 worker 完成
+        time.sleep(1.2)
+        frozen = len(records)
+        time.sleep(1.0)
+        self.assertEqual(len(records), frozen,
+                         "paused 期间在途轮次收尾后不得继续执行 worker")
+        self.mgr.resume(mid)
+        self.assertTrue(self.wait_state(self.mgr, mid, ["done"], timeout=60),
+                        "resume 后全部单元应完成，实际: %s" % self.state_vals(self.mgr, mid))
+        plan = self.read_json(self.mdir(mid) / "plan.json")
+        self.assertEqual([u.get("state") for u in plan["units"]],
+                         ["passed"] * n, "resume 后 n 个单元全部 passed")
+        self.assertFalse(self.reason_has(self.mgr, mid, "no-progress", "stop"))
+
+    def test_37_parallel_cancel_stops_all_unit_threads(self):
+        """并行执行中 cancel：mission 及时转 cancelled，所有单元线程退出，
+        不留僵尸 worker。"""
+        records = []
+        self.adapter.script("planner", plan_block(sample_units(3)))
+        for _ in range(3):
+            self.adapter.script("worker", self._slow_worker(records, 5.0))
+        mid = self.create_mission(options={"maxParallelWorkers": 3})
+        self.mgr.start(mid)
+        self.assertTrue(self.wait_until(
+            lambda: len([e for e in self._events(mid) if e["type"] == "dispatch"]) >= 2,
+            timeout=15, desc="至少两个单元已派发"), "并行单元应已派发")
+        self.mgr.cancel(mid)
+        self.assertTrue(self.wait_state(self.mgr, mid, ["cancelled"], timeout=15),
+                        "cancel 应及时生效")
+        runner = self.mgr._runners.get(mid) if hasattr(self.mgr, "_runners") else None
+        if runner is not None:
+            self.assertFalse(runner.is_alive(), "runner 线程应已退出")
+        frozen = len(records)
+        time.sleep(1.5)
+        self.assertEqual(len(records), frozen, "cancel 后不得再有 worker 完成")
+
 
 if __name__ == "__main__":
     if MISSION_IMPORT_ERROR is not None:
