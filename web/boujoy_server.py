@@ -60,6 +60,29 @@ class RuntimeManager:
     def __init__(self) -> None:
         self.clean_runtime = "dsh"
         self.codex_adapter = None  # lazily built
+        self._dial_cache = {}  # (host, port) -> (monotonic_ts, reachable)
+
+    def _dsh_reachable(self, mode: str) -> bool:
+        """Cheap TCP dial to the DSH origin, cached briefly so /api/health
+        polling stays free. Reported honestly: a hardcoded "ready" let the
+        frontend boot into a dead runtime and 502-flood the console."""
+        origin = HARNESS_ORIGINS.get(mode)
+        if not origin:
+            return False
+        split = urllib.parse.urlsplit(origin)
+        host = split.hostname or LOOPBACK
+        port = split.port or (443 if split.scheme == "https" else 80)
+        now = time.monotonic()
+        hit = self._dial_cache.get((host, port))
+        if hit and now - hit[0] < 5.0:
+            return hit[1]
+        try:
+            with socket.create_connection((host, port), timeout=0.8):
+                reachable = True
+        except OSError:
+            reachable = False
+        self._dial_cache[(host, port)] = (now, reachable)
+        return reachable
 
     def configure(self, clean_runtime: str, codex_bin: str | None, codex_cwd: str | None) -> None:
         self.clean_runtime = clean_runtime if clean_runtime in {"dsh", "codex"} else "dsh"
@@ -86,14 +109,16 @@ class RuntimeManager:
         return None
 
     def health(self) -> dict:
-        runtimes = {"knowledge": {"runtime": "dsh", "status": "ready"}}
+        runtimes = {"knowledge": {"runtime": "dsh",
+                                  "status": "ready" if self._dsh_reachable("knowledge") else "down"}}
         if self.codex_adapter is not None:
             info = self.codex_adapter.health()
             with self.codex_adapter._sub_lock:
                 info["wsSubscribers"] = len(self.codex_adapter._subscribers)
             runtimes["clean"] = info
         else:
-            runtimes["clean"] = {"runtime": "dsh", "status": "ready"}
+            runtimes["clean"] = {"runtime": "dsh",
+                                 "status": "ready" if self._dsh_reachable("clean") else "down"}
         return runtimes
 
     def shutdown(self) -> None:
