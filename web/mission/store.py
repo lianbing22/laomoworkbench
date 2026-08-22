@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -9,14 +10,27 @@ from typing import Any
 from .models import _atomic_write, _load_json, _now_ms
 
 
+def _clone(data: Any) -> Any:
+    """Deep copy of JSON-safe data. Loads return fresh dicts: concurrent
+    threads must never mutate the same object, and each read-modify-write
+    starts from a private snapshot."""
+    return json.loads(json.dumps(data)) if data is not None else data
+
+
 # --- MissionStore ----------------------------------------------------------------
 
 
 class MissionStore:
-    """All durable state for one mission, under .laomo/runs/<id>/."""
+    """All durable state for one mission, under .laomo/runs/<id>/.
+
+    `lock` serializes state/plan/job read-modify-write across the scheduler
+    thread, per-unit worker threads and watcher threads. Callers doing a
+    multi-step RMW must hold it for the whole span; single calls are safe.
+    """
 
     def __init__(self, run_root: Path) -> None:
         self.root = run_root
+        self.lock = threading.RLock()
         self.mission_file = run_root / "mission.json"
         self.state_file = run_root / "state.json"
         self.plan_file = run_root / "plan.json"
@@ -37,25 +51,32 @@ class MissionStore:
 
     # -- mission (immutable) --
     def save_mission(self, data: dict[str, Any]) -> None:
-        _atomic_write(self.mission_file, json.dumps(data, ensure_ascii=False, indent=1))
+        with self.lock:
+            _atomic_write(self.mission_file, json.dumps(data, ensure_ascii=False, indent=1))
 
     def load_mission(self) -> dict[str, Any]:
-        return _load_json(self.mission_file, {}) or {}
+        with self.lock:
+            return _clone(_load_json(self.mission_file, {}) or {})
 
     # -- state --
     def load_state(self) -> dict[str, Any]:
-        return _load_json(self.state_file, {}) or {}
+        with self.lock:
+            return _clone(_load_json(self.state_file, {}) or {})
 
     def save_state(self, state: dict[str, Any]) -> None:
         state["updatedAt"] = _now_ms()
-        _atomic_write(self.state_file, json.dumps(state, ensure_ascii=False, indent=1))
+        with self.lock:
+            _atomic_write(self.state_file, json.dumps(state, ensure_ascii=False, indent=1))
 
     # -- plan --
     def load_plan(self) -> dict[str, Any]:
-        return _load_json(self.plan_file, {"units": [], "replans": 0}) or {"units": [], "replans": 0}
+        with self.lock:
+            return _clone(_load_json(self.plan_file, {"units": [], "replans": 0})
+                          or {"units": [], "replans": 0})
 
     def save_plan(self, plan: dict[str, Any]) -> None:
-        _atomic_write(self.plan_file, json.dumps(plan, ensure_ascii=False, indent=1))
+        with self.lock:
+            _atomic_write(self.plan_file, json.dumps(plan, ensure_ascii=False, indent=1))
 
     def write_progress_md(self) -> None:
         """Render progress.md from the current plan (unit statuses)."""
@@ -108,10 +129,13 @@ class MissionStore:
 
     # -- jobs --
     def save_job(self, job: dict[str, Any]) -> None:
-        _atomic_write(self.jobs_dir / f"{job['jobId']}.json", json.dumps(job, ensure_ascii=False, indent=1))
+        with self.lock:
+            _atomic_write(self.jobs_dir / f"{job['jobId']}.json",
+                          json.dumps(job, ensure_ascii=False, indent=1))
 
     def load_job(self, job_id: str) -> dict[str, Any]:
-        return _load_json(self.jobs_dir / f"{job_id}.json", {}) or {}
+        with self.lock:
+            return _clone(_load_json(self.jobs_dir / f"{job_id}.json", {}) or {})
 
     def job_log(self, job_id: str) -> Path:
         return self.jobs_dir / f"{job_id}.log"

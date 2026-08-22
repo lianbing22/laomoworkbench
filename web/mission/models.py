@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -21,7 +23,10 @@ DEFAULT_STOP_POLICY = {
     "maxNoProgressCycles": 2,
     "maxMissionCycles": 40,
     "maxWallTimeSec": 14400,
+    "maxParallelWorkers": 2,
 }
+
+MAX_PARALLEL_WORKERS = 4  # hard cap: a mission may never spawn more
 
 WORKER_TURN_TIMEOUT = 1800     # idle-tolerant: legit build turns run long
 EVALUATOR_TURN_TIMEOUT = 600   # 10 min
@@ -43,8 +48,12 @@ def _now_ms() -> int:
 
 
 def _atomic_write(path: Path, text: str) -> None:
+    # Unique per-call tmp name: parallel unit threads write artifacts
+    # (progress.md, handoff) concurrently; a fixed tmp path would race —
+    # one thread's tmp.replace() then crashes with FileNotFoundError.
+    # os.replace() is atomic, so the last writer wins without corruption.
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
     tmp.write_text(text, "utf-8")
     tmp.replace(path)
 
@@ -86,6 +95,8 @@ class StopPolicy:
         self.max_cycles = int(opts["maxMissionCycles"])
         self.max_wall_sec = float(opts["maxWallTimeSec"])
         self.token_budget = opts.get("tokenBudget")
+        self.max_parallel = max(1, min(int(opts.get("maxParallelWorkers") or 2),
+                                       MAX_PARALLEL_WORKERS))
 
     def check(self, state: dict[str, Any]) -> str | None:
         if state.get("cycles", 0) >= self.max_cycles:

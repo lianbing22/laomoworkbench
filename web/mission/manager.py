@@ -10,7 +10,9 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
-from .dag import normalize_plan
+from .dag import (UNIT_DEP_DONE, UNIT_EVALUATING, UNIT_INTEGRATED,
+                  UNIT_PASSED, UNIT_PENDING, UNIT_READY, UNIT_REPAIRING,
+                  UNIT_RUNNING, UNIT_WAITING, normalize_plan)
 from .jobs import (JobWatcher, _process_identity, _terminate_job_process,
                    job_log_tail)
 from .models import (EVALUATOR_TURN_TIMEOUT, RUNS_DIRNAME, WORKER_TURN_TIMEOUT,
@@ -39,8 +41,14 @@ class MissionRunner(threading.Thread):
         self.policy = manager.policy_for(mission_id)
         self.wake_event = threading.Event()
         self.wake_payload: dict[str, Any] | None = None
+        self._wake_lock = threading.Lock()
         self._control = threading.Event()  # set => stop loop (cancel/fail)
         self._last_progress_sig: str | None = None
+        # per-unit worker threads report back through this queue; the
+        # scheduler thread is the only consumer (serializes outcomes)
+        self._unit_outcomes: dict[int, tuple[str, dict[str, Any]]] = {}
+        self._unit_lock = threading.Lock()
+        self._sig_lock = threading.Lock()  # no-progress signature updates
         # no-progress compare must survive crashes: seed from persisted value
         disk = self.store.load_state()
         self._last_progress_sig = str(disk.get("progressSignature") or "") or None
@@ -51,8 +59,20 @@ class MissionRunner(threading.Thread):
         self.wake_event.set()
 
     def wake(self, payload: dict[str, Any]) -> None:
-        self.wake_payload = payload
+        with self._wake_lock:
+            self.wake_payload = payload
         self.wake_event.set()
+
+    def take_wake(self, job_id: str) -> dict[str, Any] | None:
+        """Pop the pending wake IF it belongs to the given job. Parallel
+        units each wait on their own job; a wake addressed to another unit
+        stays queued for its own thread."""
+        with self._wake_lock:
+            payload = self.wake_payload
+            if payload is None or payload.get("jobId") != job_id:
+                return None
+            self.wake_payload = None
+        return payload
 
     # -- state helpers --
     def _state(self) -> dict[str, Any]:
@@ -67,28 +87,29 @@ class MissionRunner(threading.Thread):
         # payload fields (repairDirective/delta/lastVerdict) that disk lacks,
         # so it is the base; disk wins on anything it also has (fresher
         # counters/phaseStartedAt from the just-run accrue).
-        disk = self.store.load_state()
-        _accrue_state(disk)
-        disk_state = disk.get("state")
-        merged = {**state, **disk}
-        merged["phaseStartedAt"] = disk.get("phaseStartedAt")
-        merged.update({k: v for k, v in fields.items() if k != "state"})
-        if disk_state == "paused" and new_state != "paused" and new_state not in TERMINAL_STATES:
-            defer = new_state
-            merged["state"] = "paused"
-            merged["stateBeforePause"] = defer
+        with self.store.lock:
+            disk = self.store.load_state()
+            _accrue_state(disk)
+            disk_state = disk.get("state")
+            merged = {**state, **disk}
+            merged["phaseStartedAt"] = disk.get("phaseStartedAt")
+            merged.update({k: v for k, v in fields.items() if k != "state"})
+            if disk_state == "paused" and new_state != "paused" and new_state not in TERMINAL_STATES:
+                defer = new_state
+                merged["state"] = "paused"
+                merged["stateBeforePause"] = defer
+                self.store.save_state(merged)
+                self.store.event("transition", {"state": "paused", "deferred": defer})
+                self.manager.broadcast(self.mission_id, merged)
+                return
+            if disk_state in TERMINAL_STATES:
+                self.store.event("transition-suppressed", {"wanted": new_state, "disk": disk_state})
+                return
+            merged["state"] = new_state
+            merged["wallElapsedMs"] = int(merged.get("agentActiveMs", 0)) + int(merged.get("waitingMs", 0))
+            merged["activeMs"] = merged["wallElapsedMs"]
             self.store.save_state(merged)
-            self.store.event("transition", {"state": "paused", "deferred": defer})
-            self.manager.broadcast(self.mission_id, merged)
-            return
-        if disk_state in TERMINAL_STATES:
-            self.store.event("transition-suppressed", {"wanted": new_state, "disk": disk_state})
-            return
-        merged["state"] = new_state
-        merged["wallElapsedMs"] = int(merged.get("agentActiveMs", 0)) + int(merged.get("waitingMs", 0))
-        merged["activeMs"] = merged["wallElapsedMs"]
-        self.store.save_state(merged)
-        self.store.event("transition", {"state": new_state, **{k: v for k, v in fields.items()}})
+            self.store.event("transition", {"state": new_state, **{k: v for k, v in fields.items()}})
         self.manager.broadcast(self.mission_id, merged)
         if new_state == "done":
             # evidence snapshot is baked at DONE and never overwritten later
@@ -185,15 +206,16 @@ class MissionRunner(threading.Thread):
         elapsed = _now_ms() - started
         usage = result.get("usage") or {}
         tokens = int(usage.get("uncachedInputTokens") or 0) + int(usage.get("outputTokens") or 0)
-        disk = self.store.load_state()
-        if disk.get("state") in TERMINAL_STATES:
-            # turn result is discarded: the mission is already over
-            self.store.event("turn", {"ok": result.get("ok"), "discarded": "terminal"})
-            return result
-        disk["cycles"] = int(disk.get("cycles", 0)) + 1
-        disk["activeMs"] = int(disk.get("activeMs", 0)) + elapsed
-        disk["tokensUsed"] = int(disk.get("tokensUsed", 0)) + tokens
-        self.store.save_state(disk)
+        with self.store.lock:
+            disk = self.store.load_state()
+            if disk.get("state") in TERMINAL_STATES:
+                # turn result is discarded: the mission is already over
+                self.store.event("turn", {"ok": result.get("ok"), "discarded": "terminal"})
+                return result
+            disk["cycles"] = int(disk.get("cycles", 0)) + 1
+            disk["activeMs"] = int(disk.get("activeMs", 0)) + elapsed
+            disk["tokensUsed"] = int(disk.get("tokensUsed", 0)) + tokens
+            self.store.save_state(disk)
         state.update({k: disk.get(k) for k in ("cycles", "activeMs", "tokensUsed")})
         self.store.event("turn", {"ok": result.get("ok"), "elapsedMs": elapsed,
                                   "tokens": tokens, "error": (result.get("error") or "")[:200]})
@@ -229,7 +251,7 @@ class MissionRunner(threading.Thread):
                 if not self._phase_planning(state):
                     return
             elif current in ("running", "repairing", "waiting", "evaluating"):
-                if not self._run_unit(state):
+                if not self._schedule(state):
                     return
             elif current == "replanning":
                 if not self._phase_replanning(state):
@@ -244,62 +266,273 @@ class MissionRunner(threading.Thread):
                 self._transition(state, "failed", stopReason=f"未知状态 {current}")
                 return
 
-    def _run_unit(self, state: dict[str, Any]) -> bool:
-        """Scheduler: hand the current unit to UnitRunner and act on its
-        outcome. At maxParallelWorkers=1 there is exactly one active unit;
-        M4 turns this into per-unit worker threads."""
-        index = int(state.get("currentUnit") or 0)
-        unit = self._unit(index)
-        # crash-resume fast path: a PASSed unit that crashed in the wedge
-        # between evaluator PASS and integration/next-pending must never
-        # re-run its worker turn — finish the integration instead. Only in
-        # the "running" mission state: after a machine-gate fail the mission
-        # deliberately re-opens the last unit as "repairing" even though it
-        # is "passed".
-        if (state.get("state") == "running" and unit is not None
-                and unit.get("state") in ("passed", "integrated", "integrating")):
-            return self._finish_unit_pass(state, index)
-        unit_run = UnitRunner(self, index)
-        outcome, state = unit_run.run(state)
-        if outcome in (UnitRunner.STOP, UnitRunner.IDLE):
-            return False
-        if outcome == UnitRunner.PASS:
-            return self._finish_unit_pass(state, index)
-        if outcome == UnitRunner.BLOCKED:
-            reasons = "; ".join((state.get("lastVerdict") or {}).get("reasons") or [])
-            self._transition(state, "blocked",
-                             stopReason=("evaluator 判定 BLOCKED：" + reasons[:200]))
-            return False
-        # NEEDS_WORK: repair loop lives inside UnitRunner as well — the
-        # mission only enforces the per-unit repair cap and re-enters.
-        unit = self._unit(index)
-        if unit is not None and int(unit.get("repairCount", 0)) >= self.policy.max_repair:
-            self._transition(state, "failed",
-                             stopReason=f"单元 #{index + 1} 修复次数超限（{self.policy.max_repair}）")
-            return False
-        self._transition(state, "repairing")
-        return True
+    # -- scheduler (P1.2/M4) ------------------------------------------------
 
-    def _finish_unit_pass(self, state: dict[str, Any], index: int) -> bool:
-        """UnitRunner says PASS: integrate the unit's worktree into the
-        mission branch (Control Plane duty), then advance to the next
-        runnable unit — or to harness verification when nothing is left."""
+    def _owned_units(self) -> set[int]:
+        """Units whose worker thread is currently alive (the real lease: an
+        alive thread holds the unit; a crashed scheduler loses its threads
+        and recovery re-dispatches by inspecting unit states)."""
+        with self.manager._lock:
+            pool = self.manager._unit_threads.get(self.mission_id) or {}
+            return {i for i, t in pool.items() if t.is_alive()}
+
+    def _dispatch(self, index: int) -> None:
+        """Start one worker thread for this unit. The unit's durable state is
+        the lease token holder; only the thread that owns the current token
+        may write its state transitions."""
+        unit = self._unit(index)
+        if unit is None:
+            return
+        with self.manager._lock:
+            pool = self.manager._unit_threads.setdefault(self.mission_id, {})
+            old = pool.get(index)
+            if old is not None and old.is_alive() and old is not threading.current_thread():
+                return  # already leased by a live thread
+            token = uuid.uuid4().hex[:8]
+            unit["lease"] = {"token": token, "acquiredAt": _now_ms(),
+                             "heartbeatAt": _now_ms()}
+            if unit.get("state") in (UNIT_PENDING, UNIT_READY):
+                unit["state"] = unit["status"] = UNIT_RUNNING
+            self._save_unit(unit)
+            thread = threading.Thread(target=self._unit_entry, args=(index, token),
+                                      name=f"unit-{self.mission_id[:8]}-{index}",
+                                      daemon=True)
+            pool[index] = thread
+        self.store.event("dispatch", {"unit": index, "lease": token})
+        thread.start()
+
+    def _unit_entry(self, index: int, token: str) -> None:
+        outcome = UnitRunner.CRASH
+        payload: dict[str, Any] = {}
+        try:
+            outcome, payload = UnitRunner(self, index).run_unit()
+        except Exception as exc:  # a unit must never take its mission down silently
+            self.store.event("unit", f"unit {index} crashed: {exc!r}")
+            payload["error"] = str(exc)[:300]
+        finally:
+            self._release_lease(index, token)
+            with self._unit_lock:
+                self._unit_outcomes[index] = (outcome, payload)
+
+    def _release_lease(self, index: int, token: str) -> None:
+        unit = self._unit(index)
+        if unit is not None and (unit.get("lease") or {}).get("token") == token:
+            unit["lease"] = None
+            self._save_unit(unit)
+        with self.manager._lock:
+            pool = self.manager._unit_threads.get(self.mission_id)
+            if pool and pool.get(index) is not None:
+                pool.pop(index, None)
+
+    def _mirror(self, phase: str, **fields: Any) -> None:
+        """Mirror a unit phase into the mission state so the pre-P1.2 UI
+        sequence stays identical at maxParallelWorkers=1. While several units
+        are active the mission stays "running" (parallel window)."""
+        with self.manager._lock:
+            pool = self.manager._unit_threads.get(self.mission_id) or {}
+            live = sum(1 for t in pool.values() if t.is_alive())
+        if live > 1:
+            return
+        state = self._state()
+        if state.get("state") in TERMINAL_STATES or state.get("state") == "paused":
+            return
+        self._transition(state, phase, **fields)
+
+    def _migrate_legacy_plan(self) -> None:
+        """Plans written before P1.2/M1 have no id/state/dependencies (v1).
+        One-shot upgrade so a resumed legacy mission keeps its statuses and
+        runs through the DAG scheduler like any v2 mission."""
+        plan = self.store.load_plan()
+        if int(plan.get("version") or 1) >= 2 and all("id" in u for u in plan["units"]):
+            return
+        with self.store.lock:
+            for u in plan["units"]:
+                if "id" in u and "state" in u:
+                    continue
+                st = str(u.get("state") or u.get("status") or "pending")
+                u.setdefault("id", f"unit-{int(u.get('index') or 0) + 1}")
+                u["state"] = u.get("state") or st
+                u["status"] = u.get("status") or st
+                u.setdefault("dependencies", [])
+                u.setdefault("worktree", {"path": None, "branch": None,
+                                          "baseSha": None, "headSha": None})
+                u.setdefault("jobId", None)
+                u.setdefault("delta", None)
+                u.setdefault("repairDirective", None)
+                u.setdefault("lastVerdict", None)
+                u.setdefault("attempt", 0)
+                u.setdefault("repairCount", 0)
+                u.setdefault("worker", {"startedAt": None, "finishedAt": None})
+            plan["version"] = 2
+            self.store.save_plan(plan)
+            self.store.event("plan-migration", {"units": len(plan["units"])})
+
+    def _schedule(self, state: dict[str, Any]) -> bool:
+        """Run the dispatch loop: harvest finished units, mark
+        dependency-ready units, dispatch into free worker slots, drain to
+        harness verification when nothing active remains. Returns False when
+        the mission loop should exit (terminal / paused / stop)."""
+        self._migrate_legacy_plan()
+        while not self._control.is_set():
+            state = self._state()
+            if state.get("state") in TERMINAL_STATES:
+                return False
+            if not self._wait_while_paused(state):
+                return False
+            with self.store.lock:
+                disk = self.store.load_state()
+                _accrue_state(disk)
+                if disk.get("state") in TERMINAL_STATES:
+                    return False
+                self.store.save_state(disk)
+            reason = self.policy.check(disk)
+            if reason:
+                self._transition(disk, "failed", stopReason=reason)
+                return False
+            if disk.get("state") not in ("running", "repairing", "waiting", "evaluating"):
+                return False
+            # 1. harvest unit outcomes (the scheduler thread is the only consumer)
+            with self._unit_lock:
+                finished = dict(self._unit_outcomes)
+                self._unit_outcomes.clear()
+            for index, (outcome, payload) in sorted(finished.items()):
+                if outcome in (UnitRunner.STOP, UnitRunner.IDLE):
+                    return False
+                if outcome == UnitRunner.PASS:
+                    res = self._integrate_harvested(state, index)
+                    if res == "conflict":
+                        self._transition(state, "blocked",
+                                         stopReason=f"单元 #{index + 1} 集成冲突，等待解决")
+                        return False
+                    if res == "failed":
+                        self._transition(state, "failed",
+                                         stopReason=f"单元 #{index + 1} 集成失败")
+                        return False
+                    continue
+                if outcome == UnitRunner.BLOCKED:
+                    reasons = "; ".join((payload.get("lastVerdict") or {}).get("reasons") or [])
+                    self._transition(state, "blocked",
+                                     stopReason=("evaluator 判定 BLOCKED：" + reasons[:200]),
+                                     **payload)
+                    return False
+                if outcome == UnitRunner.LIMIT:
+                    self._transition(state, "failed",
+                                     stopReason=f"单元 #{index + 1} 修复次数超限（{self.policy.max_repair}）",
+                                     **payload)
+                    return False
+                if outcome in (UnitRunner.CRASH, UnitRunner.FAILED):
+                    self._transition(state, "failed",
+                                     stopReason=f"单元 #{index + 1} 执行异常: "
+                                                f"{(payload.get('error') or '')[:120]}",
+                                     **payload)
+                    return False
+                if outcome == UnitRunner.CONFLICT:
+                    self._transition(state, "blocked",
+                                     stopReason=f"单元 #{index + 1} 集成冲突，等待解决")
+                    return False
+            # 2. recover/mark: machine-gate repair targets and crash-wedge
+            #    integration only run when nothing is in flight (no threads,
+            #    no un-harvested outcomes) and nothing was just harvested —
+            #    the harvest loop above already integrated those.
+            with self._unit_lock:
+                pending_outcomes = bool(self._unit_outcomes)
+            if not finished and not self._owned_units() and not pending_outcomes:
+                state = self._state()
+                if state.get("state") == "repairing":
+                    target = int(state.get("currentUnit") or 0)
+                    unit = self._unit(target)
+                    if unit is not None and unit.get("state") in (UNIT_PASSED, UNIT_INTEGRATED):
+                        unit["state"] = unit["status"] = UNIT_REPAIRING
+                        unit["repairDirective"] = str(
+                            state.get("repairDirective") or "修复验收未通过的问题")[:2000]
+                        self._save_unit(unit)
+                        self.store.event("repair", {"unit": target, "scope": "machine-gate"})
+                        continue
+                plan = self.store.load_plan()
+                for unit in plan["units"]:
+                    if unit.get("state") == UNIT_PASSED:
+                        self._integrate_harvested(state, unit["index"])
+            # 3. dispatch ready units into free slots
+            plan = self.store.load_plan()
+            owned = self._owned_units()
+            slots = self.policy.max_parallel - len(owned)
+            if slots > 0:
+                # atomic RMW: a unit thread may persist a verdict/lease on the
+                # same plan.json between load and save; a stale write-back here
+                # would revert it and make the scheduler re-dispatch forever.
+                with self.store.lock:
+                    plan = self.store.load_plan()
+                    by_id = {u["id"]: u for u in plan["units"]}
+                    done = {u["id"]: u["state"] in UNIT_DEP_DONE for u in plan["units"]}
+                    changed = False
+                    for u in plan["units"]:
+                        if u["state"] != UNIT_PENDING:
+                            continue
+                        deps = [d for d in (u.get("dependencies") or []) if d in by_id]
+                        if all(done.get(d, True) for d in deps):
+                            u["state"] = u["status"] = UNIT_READY
+                            changed = True
+                    if changed:
+                        self.store.save_plan(plan)
+            owned = self._owned_units()
+            plan = self.store.load_plan()
+            slots = self.policy.max_parallel - len(owned)
+            if slots > 0:
+                need = [u["index"] for u in plan["units"]
+                        if u["state"] in (UNIT_RUNNING, UNIT_EVALUATING,
+                                          UNIT_REPAIRING, UNIT_WAITING)
+                        and u["index"] not in owned]
+                ready = [u["index"] for u in plan["units"]
+                         if u["state"] == UNIT_READY and u["index"] not in owned]
+                for index in (need + ready)[:max(0, slots)]:
+                    self._dispatch(index)
+            # 4. drain: whenever no slot is occupied, decide the next phase
+            with self._unit_lock:
+                pending_outcomes = bool(self._unit_outcomes)
+            if self._owned_units() or pending_outcomes:
+                time.sleep(0.08)
+                continue
+            plan = self.store.load_plan()
+            units = plan["units"]
+            if all(u.get("state") in UNIT_DEP_DONE for u in units):
+                last = max((u["index"] for u in units), default=0)
+                self._transition(state, "verification", currentUnit=last)
+                return True
+            bad = [u for u in units if u.get("state") == "failed"]
+            if bad:
+                self._transition(state, "failed", stopReason=f"单元 #{bad[0]['index'] + 1} 失败")
+                return False
+            conf = [u for u in units if u.get("state") in ("conflict", "blocked")]
+            if conf:
+                self._transition(state, "blocked",
+                                 stopReason=f"单元 #{conf[0]['index'] + 1} 被阻塞")
+                return False
+            cancelled = [u for u in units if u.get("state") == "cancelled"]
+            if cancelled:
+                self._transition(state, "cancelled")
+                return False
+            self._transition(state, "blocked", stopReason="DAG 依赖无法满足（存在无法就绪的单元）")
+            return False
+        return False
+
+    def _integrate_harvested(self, state: dict[str, Any], index: int) -> str:
+        """A unit PASSed: integrate (Control Plane duty) then advance the
+        mission's currentUnit hint for the next runnable unit. Returns
+        "ok" | "conflict" | "failed" | "none"."""
         integ = self._integrate(state, index)
-        if integ == "conflict":
-            self._transition(state, "blocked",
-                             stopReason=f"单元 #{index + 1} 集成冲突，等待解决")
-            return False
-        if integ == "failed":
-            self._transition(state, "failed",
-                             stopReason=f"单元 #{index + 1} 集成失败")
-            return False
-        nxt = self._next_pending(self.store.load_plan(), current=index)
-        if nxt is None:
-            self._transition(state, "verification")
-        else:
-            state.pop("repairDirective", None)
-            self._transition(state, "running", currentUnit=nxt)
-        return True
+        if integ in ("conflict", "failed"):
+            return integ
+        nxt = self._next_ready(self.store.load_plan())
+        self._transition(state, "running",
+                         currentUnit=nxt if nxt is not None else index)
+        return integ
+
+    @staticmethod
+    def _next_ready(plan: dict[str, Any]) -> int | None:
+        for u in plan["units"]:
+            if u["state"] == UNIT_READY:
+                return u["index"]
+        return None
 
     def _integrate(self, state: dict[str, Any], index: int) -> str:
         """Integrate one passed unit: its worktree branch into the mission
@@ -391,11 +624,12 @@ class MissionRunner(threading.Thread):
         return None
 
     def _save_unit(self, unit: dict[str, Any]) -> None:
-        plan = self.store.load_plan()
-        for i, u in enumerate(plan["units"]):
-            if u["index"] == unit["index"]:
-                plan["units"][i] = unit
-        self.store.save_plan(plan)
+        with self.store.lock:
+            plan = self.store.load_plan()
+            for i, u in enumerate(plan["units"]):
+                if u["index"] == unit["index"]:
+                    plan["units"][i] = unit
+            self.store.save_plan(plan)
 
 
     @staticmethod
@@ -419,6 +653,7 @@ class MissionRunner(threading.Thread):
         return None
 
     def _phase_replanning(self, state: dict[str, Any]) -> bool:
+        self._migrate_legacy_plan()
         plan = self.store.load_plan()
         if int(plan.get("replans", 0)) >= self.policy.max_no_progress:
             self._transition(state, "failed", stopReason="replan 次数超限")
@@ -542,12 +777,16 @@ class MissionManager:
         self.broadcast_fn = broadcast_fn or (lambda mid, state: None)
         self._lock = threading.RLock()
         self._runners: dict[str, MissionRunner] = {}
-        self._watchers: dict[str, JobWatcher] = {}
+        # unit worker threads per mission, keyed by unit index. An alive
+        # thread is the unit's lease: crash recovery re-dispatches by
+        # inspecting unit states, not this table.
+        self._unit_threads: dict[str, dict[int, threading.Thread]] = {}
+        self._watchers: dict[str, list[JobWatcher]] = {}
         # Watchers stopped while their job is still running. They keep the
         # Popen handle referenced: a re-attached watcher reuses it so proc.poll()
         # reaps the real exit status (a dropped Popen would let Python's
         # subprocess._cleanup() reap the zombie before os.waitpid sees it).
-        self._stopped_watchers: dict[str, JobWatcher] = {}
+        self._stopped_watchers: dict[str, list[JobWatcher]] = {}
 
     # -- paths --
     def runs_root(self, cwd: Path | None) -> Path:
@@ -594,11 +833,13 @@ class MissionManager:
     def _all_run_roots(self) -> list[Path]:
         roots: list[Path] = []
         seen: set[Path] = set()
-        bases = [self.workspace_root, Path(os.getcwd())]
-        for base in bases:
-            root = base / RUNS_DIRNAME
-            if root.is_dir():
-                roots.extend(p for p in root.iterdir() if p.is_dir() and (p / "mission.json").is_file())
+        # Only the manager's own workspace root is scanned: every mission it
+        # created is registered in the index (and under workspace_root/.laomo/
+        # runs), so a manager for a different root must never harvest — or
+        # worse, resume — missions that belong to another workspace.
+        base = self.workspace_root / RUNS_DIRNAME
+        if base.is_dir():
+            roots.extend(p for p in base.iterdir() if p.is_dir() and (p / "mission.json").is_file())
         roots.extend(self._indexed_roots())
         unique: list[Path] = []
         for p in roots:
@@ -621,20 +862,16 @@ class MissionManager:
     def on_runner_exit(self, mission_id: str) -> None:
         with self._lock:
             self._runners.pop(mission_id, None)
-            watcher = self._watchers.pop(mission_id, None)
-            if watcher is not None:
-                self._stopped_watchers.setdefault(mission_id, watcher)
-        if watcher:
+            watchers = self._watchers.pop(mission_id, [])
+            if watchers:
+                self._stopped_watchers.setdefault(mission_id, []).extend(watchers)
+        for watcher in watchers:
             watcher.stop()
 
     def attach_watcher(self, mission_id: str, watcher: JobWatcher) -> None:
+        # one watcher per managed job: parallel units each hold their own
         with self._lock:
-            old = self._watchers.get(mission_id)
-            self._watchers[mission_id] = watcher
-            if old is not None:
-                self._stopped_watchers[mission_id] = old
-        if old is not None:
-            old.stop()
+            self._watchers.setdefault(mission_id, []).append(watcher)
 
     # -- summaries --
     def _summary(self, store: MissionStore) -> dict[str, Any]:
@@ -810,6 +1047,8 @@ class MissionManager:
         self._reap_runner(mission_id)
         self._ensure_not_active(exclude=mission_id)
         self._save_state_state(store, state, previous)
+        # parallel units may hold managed jobs; re-attach their watchers
+        self._reconcile_unit_waits(mission_id, store)
         runner = MissionRunner(self, mission_id)
         with self._lock:
             self._runners[mission_id] = runner
@@ -827,8 +1066,11 @@ class MissionManager:
         job = store.load_job(job_id) if job_id else {}
         ident = _process_identity(job) if job.get("pid") else {"alive": False, "reason": "no-pid"}
         if ident["alive"]:
-            old = self._stopped_watchers.pop(mission_id, None)
-            proc = old.proc if old is not None else None
+            proc = None
+            for w in self._stopped_watchers.pop(mission_id, []):
+                if (w.job or {}).get("jobId") == job_id:
+                    proc = w.proc
+                    break
             watcher = JobWatcher(job, store, lambda w, mid=mission_id: self._wake_resume(mid, w),
                                  proc=proc)
             self.attach_watcher(mission_id, watcher)
@@ -859,6 +1101,10 @@ class MissionManager:
         state.pop("waitingJobId", None)
         self._save_state_state(store, state, "cancelled")
         store.event("cancelled", None)
+        # cancel() 返回即须终止：等调度循环观察到 control 事件并退出，
+        # 否则 list().activeId 仍会报告一个即将退场的 runner。
+        if runner is not None and runner.is_alive():
+            runner.join(timeout=5.0)
         return {"ok": True, "mission": self._summary(store)}
 
     def terminate_mission_jobs(self, mission_id: str, store: MissionStore,
@@ -869,8 +1115,8 @@ class MissionManager:
         persist a different status (e.g. failed) after we persist the mark.
         Returns per-job outcomes; terminal jobs are left untouched."""
         with self._lock:
-            watcher = self._watchers.pop(mission_id, None)
-        if watcher:
+            watchers = self._watchers.pop(mission_id, [])
+        for watcher in watchers:
             watcher.stop()
             watcher.join(timeout=5.0)
         self._stopped_watchers.pop(mission_id, None)
@@ -935,6 +1181,10 @@ class MissionManager:
                     store.save_state(state)
                     store.event("recover", f"waiting: job gone ({ident.get('reason')}), waking")
             else:
+                # P1.2 parallel waits live on units (mission state stays
+                # "running"); re-attach their watchers / re-open their jobs
+                # before the runner comes back.
+                self._reconcile_unit_waits(mission_id, store)
                 store.event("recover", f"resuming from {name}")
             self._ensure_not_active_quiet(mission_id)
             runner = MissionRunner(self, mission_id)
@@ -943,6 +1193,49 @@ class MissionManager:
             runner.start()
             resumed.append(mission_id)
         return resumed
+
+    def _reconcile_unit_waits(self, mission_id: str, store: MissionStore) -> None:
+        """After a control-plane restart or a resume, P1.2 missions keep
+        their parallel wait state on the UNITS (mission state is "running").
+        Re-attach a watcher for every still-alive unit job; a job that died
+        while nobody watched is re-opened on its unit with a delta (honest
+        evidence, never a fake wake)."""
+        state = store.load_state()
+        if state.get("state") == "waiting":
+            return  # legacy serial wait lives on mission state; own path
+        plan = store.load_plan()
+        changed = False
+        for unit in plan["units"]:
+            if unit.get("state") != UNIT_WAITING or not unit.get("jobId"):
+                continue
+            job = store.load_job(str(unit["jobId"])) or {}
+            ident = _process_identity(job) if job.get("pid") else {"alive": False, "reason": "no-pid"}
+            if ident["alive"]:
+                proc = None
+                for w in self._stopped_watchers.pop(mission_id, []):
+                    if (w.job or {}).get("jobId") == unit.get("jobId"):
+                        proc = w.proc
+                        break
+                watcher = JobWatcher(job, store,
+                                     lambda w, mid=mission_id: self._wake_resume(mid, w),
+                                     proc=proc)
+                self.attach_watcher(mission_id, watcher)
+                watcher.start()
+                store.event("recover", f"unit {unit['index']} job alive, rewatching")
+            else:
+                tail = job_log_tail(Path(job.get("logPath") or ""))
+                unit["state"] = unit["status"] = UNIT_RUNNING
+                unit["delta"] = (f"网关重启期间后台作业已结束（{ident.get('reason')}）："
+                                 f"{job.get('command') or unit['jobId']}\n--- 日志尾部 ---\n{tail}")[:6000]
+                if job.get("pid"):
+                    job["status"] = "orphaned"
+                    job["orphanReason"] = ident.get("reason")
+                    job["finishedAt"] = _now_ms()
+                    store.save_job(job)
+                changed = True
+                store.event("recover", f"unit {unit['index']} job gone, delta set")
+        if changed:
+            store.save_plan(plan)
 
     def _wake_resume(self, mission_id: str, woken: dict[str, Any]) -> None:
         with self._lock:

@@ -1222,6 +1222,157 @@ class TestWatcherReattachReap(MissionLoopTest):
         self.assertEqual(j.get("exitKind"), "exited")
 
 
+class TestParallelWorkUnits(MissionLoopTest):
+    """P1.2/M4: MissionScheduler — 多工作单元并行 + 依赖就绪 + 并发上限。
+
+    * 无依赖单元必须真并发（worker 阶段重叠、先后 dispatch 同处一个窗口）
+    * 带依赖单元必须等前置 passed/integrated 后才被调度（不许抢跑）
+    * maxParallelWorkers=1 退化为与 P1.1 等价的串行执行
+    * 并发 worker 数永远不超过硬上限 MAX_PARALLEL_WORKERS(4)
+    * 每个单元持独立 lease 令牌；结束后 lease 必须释放
+    """
+
+    @staticmethod
+    def _slow_worker(records, delay=0.5, label=None):
+        """worker 轮次脚本：sleep 后记录 (start, end)，返回标准 handoff。"""
+        def slow(prompt):
+            start = time.monotonic()
+            time.sleep(delay)
+            records.append({"label": label, "start": start, "end": time.monotonic()})
+            return handoff_text()
+        return slow
+
+    def _events(self, mid):
+        return self.read_ndjson(self.mdir(mid) / "events.ndjson")
+
+    def _verdict_events(self, mid, unit):
+        return [e for e in self._events(mid)
+                if e["type"] == "verdict" and isinstance(e.get("detail"), dict)
+                and e["detail"].get("unit") == unit]
+
+    def _dispatch_events(self, mid, unit):
+        return [e for e in self._events(mid)
+                if e["type"] == "dispatch" and isinstance(e.get("detail"), dict)
+                and e["detail"].get("unit") == unit]
+
+    def test_30_independent_units_run_in_parallel(self):
+        records = []
+        self.adapter.script("worker", self._slow_worker(records, 0.5, "w0"))
+        self.adapter.script("worker", self._slow_worker(records, 0.5, "w1"))
+        self.adapter.script("planner", plan_block(sample_units(2)))
+        mid = self.create_mission()
+        self.mgr.start(mid)
+        self.assertTrue(self.wait_state(self.mgr, mid, ["done"], timeout=40),
+                        "独立单元并行执行后应 done，实际: %s" % self.state_vals(self.mgr, mid))
+        self.assertEqual(len(records), 2, "应恰好 2 次 worker 轮次")
+        a, b = sorted(records, key=lambda r: r["start"])
+        self.assertLess(b["start"], a["end"],
+                        "无依赖单元必须真并发（worker 轮次窗口应重叠）")
+        # 两个 dispatch 都发生在第一个 verdict 之前 => 并行窗口
+        self.assertEqual({e["detail"]["unit"] for e in self._events(mid)
+                          if e["type"] == "dispatch"}, {0, 1})
+        v0 = self._verdict_events(mid, 0)
+        self.assertTrue(v0, "单元 0 应有 PASS 判定")
+        self.assertLess(self._dispatch_events(mid, 1)[0]["ts"], v0[0]["ts"],
+                        "并行调度下单元 1 必须在单元 0 判定前就已派发")
+        # lease：每个单元独立令牌，结束后释放
+        tokens = [e["detail"]["lease"] for e in self._events(mid)
+                  if e["type"] == "dispatch"]
+        self.assertEqual(len(set(tokens)), 2, "每个单元必须持有独立 lease 令牌")
+        plan = self.read_json(self.mdir(mid) / "plan.json")
+        for u in plan["units"]:
+            self.assertEqual(u.get("state"), "passed")
+            self.assertIsNone(u.get("lease"), "完成后 lease 必须释放")
+
+    def test_31_dependent_unit_waits_for_dependency_passed(self):
+        records = []
+        self.adapter.script("worker", self._slow_worker(records, 0.5, "w0"))
+        self.adapter.script("worker", self._slow_worker(records, 0.5, "w1"))
+        units = sample_units(2)
+        units[0]["id"] = "a"
+        units[1]["id"] = "b"
+        units[1]["dependencies"] = ["a"]
+        self.adapter.script("planner", plan_block(units))
+        mid = self.create_mission()
+        self.mgr.start(mid)
+        # 轮询窗：只要 A 仍活跃，B 就必须停在 pending（依赖就绪判定）
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if self.state_vals(self.mgr, mid) & TERMINAL_STATES:
+                break
+            plan_path = self.mdir(mid) / "plan.json"
+            if not plan_path.is_file():  # planner 尚未产出
+                time.sleep(POLL_INTERVAL)
+                continue
+            plan = self.read_json(plan_path)
+            ua, ub = plan["units"][0], plan["units"][1]
+            if ua.get("state") in ("running", "evaluating", "waiting"):
+                self.assertEqual(ub.get("state"), "pending",
+                                 "前置单元未 passed/integrated 前，依赖单元不得离开 pending")
+            time.sleep(POLL_INTERVAL)
+        self.assertTrue(self.wait_state(self.mgr, mid, ["done"], timeout=40),
+                        "依赖链全过后应 done，实际: %s" % self.state_vals(self.mgr, mid))
+        self.assertEqual(len(records), 2)
+        a, b = sorted(records, key=lambda r: r["start"])
+        self.assertGreaterEqual(b["start"], a["end"],
+                                "依赖单元的 worker 必须晚于前置单元完成")
+        # 事件序：b 的 dispatch 严格晚于 a 的 PASS
+        va = self._verdict_events(mid, 0)
+        db = self._dispatch_events(mid, 1)
+        self.assertTrue(va and db, "应存在 a 的判定与 b 的派发")
+        self.assertGreater(db[0]["ts"], va[0]["ts"],
+                           "b 只能在 a 判定 PASS 之后被调度")
+
+    def test_32_max_parallel_1_serial_equivalence(self):
+        records = []
+        self.adapter.script("worker", self._slow_worker(records, 0.5, "w0"))
+        self.adapter.script("worker", self._slow_worker(records, 0.5, "w1"))
+        self.adapter.script("planner", plan_block(sample_units(2)))
+        mid = self.create_mission(options={"maxParallelWorkers": 1})
+        self.mgr.start(mid)
+        self.assertTrue(self.wait_state(self.mgr, mid, ["done"], timeout=40),
+                        "串行策略同样必须 done，实际: %s" % self.state_vals(self.mgr, mid))
+        self.assertEqual(len(records), 2)
+        a, b = sorted(records, key=lambda r: r["start"])
+        self.assertGreaterEqual(b["start"], a["end"],
+                                "maxParallelWorkers=1 时两个单元不得并发")
+        # 事件序：b 的 dispatch 严格晚于 a 的 PASS（P1.1 式的顺序执行）
+        va = self._verdict_events(mid, 0)
+        db = self._dispatch_events(mid, 1)
+        self.assertTrue(va and db)
+        self.assertGreater(db[0]["ts"], va[0]["ts"],
+                           "串行模式 b 必须等 a 的 PASS 之后才派发")
+        plan = self.read_json(self.mdir(mid) / "plan.json")
+        for u in plan["units"]:
+            self.assertEqual(u.get("state"), "passed")
+
+    def test_33_parallel_workers_capped_at_hard_limit(self):
+        records = []
+        n = 5
+        self.adapter.script("planner", plan_block(sample_units(n)))
+        for _ in range(n):
+            self.adapter.script("worker", self._slow_worker(records, 0.5))
+        mid = self.create_mission(options={"maxParallelWorkers": 99})
+        self.mgr.start(mid)
+        self.assertTrue(self.wait_state(self.mgr, mid, ["done"], timeout=60),
+                        "5 个独立单元应全部完成，实际: %s" % self.state_vals(self.mgr, mid))
+        self.assertEqual(len(records), n, "每个单元恰好一次 worker 轮次")
+        # 最大并发 = 任意时刻重叠的 worker 数；99 被钳制到硬上限 4
+        intervals = sorted(records, key=lambda r: r["start"])
+        peak, ends = 0, []
+        for it in intervals:
+            ends = [e for e in ends if e > it["start"]]
+            peak = max(peak, len(ends) + 1)
+            ends.append(it["end"])
+        self.assertLessEqual(peak, 4,
+                             "并发 worker 数不得超过硬上限 4（99 被钳制）")
+        self.assertGreaterEqual(peak, 4,
+                                "前 4 个单元应在同一调度窗口内并发")
+        plan = self.read_json(self.mdir(mid) / "plan.json")
+        self.assertEqual(len([u for u in plan["units"] if u.get("state") == "passed"]),
+                         n, "全部单元应通过")
+
+
 if __name__ == "__main__":
     if MISSION_IMPORT_ERROR is not None:
         print("NOTE: web/mission.py 无法导入（%r）— 全部用例跳过，待主线合入后验证"
