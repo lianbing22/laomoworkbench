@@ -1094,6 +1094,31 @@ class CodexRuntimeAdapter:
             self._debug_log(f"rpc {endpoint} failed: {exc!r}")
             return err_value(f"codex adapter error: {exc}", "adapter-error")
 
+    # host.pickDirectory -> native macOS folder picker (choose folder).
+    # The DSH native host had this capability; the codex runtime lost it and
+    # the 选择新项目 button went dead. The gateway runs on the same machine
+    # in the user's GUI session, so the real system dialog is available.
+    # User cancel is the normal "closed the picker" path — the frontend
+    # treats a cancelled error as silent.
+    def _rpc_host_pickDirectory(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
+        if sys.platform != "darwin":
+            return err_value("host.pickDirectory 仅支持 macOS")
+        try:
+            proc = subprocess.run(
+                ["osascript", "-e",
+                 'POSIX path of (choose folder with prompt "选择新项目文件夹")'],
+                capture_output=True, text=True, timeout=600)
+        except FileNotFoundError:
+            return err_value("osascript 不可用")
+        except subprocess.TimeoutExpired:
+            return err_value("选择超时，请重试")
+        if proc.returncode != 0:
+            return err_value("cancelled")
+        path = proc.stdout.strip().rstrip("/")
+        if not path.startswith("/"):
+            return err_value("未选择有效目录")
+        return ok_value({"path": path})
+
     # host.describe
     def _rpc_host_describe(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
         proc = self._ensure_process()

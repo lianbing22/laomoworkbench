@@ -14,11 +14,13 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "web"))
 
+import codex_adapter  # noqa: E402
 from codex_adapter import (  # noqa: E402
     CodexRuntimeAdapter,
     EventTranslator,
@@ -348,6 +350,24 @@ class TestAdapterStatics(unittest.TestCase):
         self.assertEqual(params["approvalPolicy"], "never")
         # the readback projection and list view must carry the level through
         self.assertEqual(adapter._permission_view("s1")["currentValue"], "full-auto")
+
+    def test_pick_directory_native_dialog(self):
+        # 选择新项目 went dead on the codex runtime: host.pickDirectory had
+        # no handler. Dispatch must reach the native-picker handler; user
+        # cancel is the silent path, a picked path feeds workspace.create.
+        from unittest import mock
+        adapter = CodexRuntimeAdapter(default_cwd="/tmp")
+        completed = subprocess.CompletedProcess(args=[], returncode=0,
+                                                 stdout="/Users/lianb/Downloads/bh/\n")
+        with mock.patch.object(codex_adapter.subprocess, "run", return_value=completed):
+            r = adapter.rpc("clean", "host.pickDirectory", {})
+        self.assertTrue(r["result"]["ok"])
+        self.assertEqual(r["result"]["value"]["path"], "/Users/lianb/Downloads/bh")
+        cancelled = subprocess.CompletedProcess(args=[], returncode=1, stdout="")
+        with mock.patch.object(codex_adapter.subprocess, "run", return_value=cancelled):
+            r = adapter.rpc("clean", "host.pickDirectory", {})
+        self.assertFalse(r["result"]["ok"])
+        self.assertIn("cancel", str(r["result"]["error"]))
 
     def test_permission_levels_approval_matrix(self):
         adapter = CodexRuntimeAdapter(default_cwd="/tmp")
