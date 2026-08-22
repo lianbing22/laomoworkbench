@@ -215,7 +215,15 @@ class UnitRunner:
             + (f"工作目录（本单元独立 git 工作树，改动请提交在该分支上）：{cwd}\n" if cwd else "")
             + f"当前单元 #{index + 1}：{unit['title']}\n{unit['description']}\n"
             "验收标准：\n- " + "\n- ".join(unit.get("acceptance") or ["实现并自测通过"]) + "\n"
-            + (f"\n上次验收反馈（必须修复）：{unit.get('repairDirective')}\n" if repair else "")
+            + ("\n【机器验收修复轮】本轮目标不是重做本单元，而是让下方"
+               "『机器验收反馈』列出的全部机器检查通过：这些检查要求的文件"
+               "允许且必须创建/修改——原描述中的范围限制（例如『除此以外"
+               "不要创建或修改任何文件』）本轮不适用；但不得破坏已集成的"
+               "其它成果，仍然禁止执行 git 命令。\n"
+               f"\n机器验收反馈（必须全部通过）：{unit.get('repairDirective')}\n"
+               if repair and "机器验收未通过" in str(unit.get("repairDirective") or "")
+               else (f"\n上次验收反馈（必须修复）：{unit.get('repairDirective')}\n"
+                     if repair else ""))
             + (f"\n交接摘要（此前进展）：\n{self.store.load_handoff() or '（无）'}\n"
                if self.store.load_handoff() else "")
             + (f"\n自上次唤醒的增量：\n{unit.get('delta')}\n" if unit.get("delta") else "")

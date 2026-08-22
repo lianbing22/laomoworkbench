@@ -1648,6 +1648,37 @@ class TestCancelInterruptPropagation(MissionLoopTest):
                          "cancel 后不得再发生任何模型 turn")
 
 
+class TestMachineGateRepairScope(MissionLoopTest):
+    """Gate I finding: the machine-gate repair directive asks for files the
+    unit's original description forbids touching ("除此以外不要创建或修改
+    任何文件") — real codex obeys the description and the repair no-ops.
+    The repair prompt must explicitly override the unit's original scope for
+    machine-gate repairs."""
+
+    def test_41_machine_gate_repair_prompt_overrides_unit_scope(self):
+        prompts = []
+
+        def fix(prompt):
+            prompts.append(prompt)
+            marker = self.root / "summary.txt"
+            if "机器验收未通过" in prompt and "修复轮" in prompt:
+                marker.write_text("REPAIR\n", encoding="utf-8")
+            return handoff_text()
+
+        self.adapter.script("worker", handoff_text(), fix)
+        self.adapter.set_default("evaluator", verdict_block("PASS", ["ok"]))
+        mid = self.create_mission(cwd=str(self.root), verification={
+            "requiredFiles": ["summary.txt"]})
+        self.mgr.start(mid)
+        self.assertTrue(self.wait_state(self.mgr, mid, ["done"], timeout=40),
+                        "机器门禁修复轮应能产出单元范围外的必需文件，实际: %s"
+                        % self.state_vals(self.mgr, mid))
+        repair_prompts = [p for p in prompts if "机器验收未通过" in p]
+        self.assertTrue(repair_prompts, "应存在机器门禁修复轮")
+        self.assertIn("修复轮", repair_prompts[0],
+                      "修复 prompt 必须声明本轮 scope 覆盖原单元范围限制")
+
+
 if __name__ == "__main__":
     if MISSION_IMPORT_ERROR is not None:
         print("NOTE: web/mission.py 无法导入（%r）— 全部用例跳过，待主线合入后验证"

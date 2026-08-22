@@ -2245,6 +2245,222 @@ def gate_h(ev: Evidence, scratch: Path) -> dict:
     return result
 
 
+I_UNIT_A = ("创建 a.txt，内容恰好为一行：REAL-I-A。"
+            "除此以外不要创建或修改任何文件，不要执行 git 命令。")
+I_UNIT_B = ("创建 b.txt，内容恰好为一行：REAL-I-B。"
+            "除此以外不要创建或修改任何文件，不要执行 git 命令。")
+
+
+def gate_i(ev: Evidence, scratch: Path) -> dict:
+    ev.log("Gate I — Machine Verification Repair (real FAIL -> real codex "
+           "repair -> real PASS)")
+    repo = scratch / "fixture-i" / "repo"
+    base_sha = init_fixture(repo)
+    before = porcelain(repo)
+
+    adapter = CodexRuntimeAdapter(bin_path=GATE_BIN, default_cwd=str(repo),
+                                  debug_log=ev.log)
+    tap = TurnTap(ev, adapter)
+    ptap = PromptTap(ev, adapter)
+    mgr = MissionManager(adapter, repo)
+    checks: dict[str, bool] = {}
+    detail: dict = {}
+    try:
+        created = mgr.create(
+            "两个并行单元各产出一个文件",
+            cwd=str(repo),
+            acceptance_criteria=["a.txt 与 b.txt 产出正确"],
+            options={"maxParallelWorkers": 2},
+            verification={
+                "requiredFiles": ["a.txt", "b.txt", "summary.txt"],
+                "commands": ["grep -q REAL-I-A a.txt",
+                             "grep -q REAL-I-B b.txt",
+                             "grep -q REPAIR-I summary.txt"]})
+        mid = created["mission"]["id"]
+        runs = repo / ".laomo" / "runs" / mid
+
+        def unit(uid, index, title, desc):
+            return {"id": uid, "index": index, "title": title,
+                    "description": desc,
+                    "acceptance": [f"{title} 文件存在且内容正确"],
+                    "dependencies": [], "state": "pending", "status": "pending",
+                    "attempt": 0, "repairCount": 0, "conflictCount": 0,
+                    "conflict": None,
+                    "worktree": {"path": None, "branch": None,
+                                 "baseSha": None, "headSha": None},
+                    "jobId": None, "delta": None, "repairDirective": None,
+                    "lastVerdict": None,
+                    "worker": {"startedAt": None, "finishedAt": None},
+                    "integration": None}
+        store = mgr.store_for(mid)
+        store.save_plan({"version": 2, "replans": 0, "gitIntegration": True,
+                         "units": [unit("a", 0, "单元A", I_UNIT_A),
+                                   unit("b", 1, "单元B", I_UNIT_B)]})
+        store.save_state({"state": "running", "cycles": 0, "currentUnit": 0,
+                          "noProgress": 0, "progressSignature": "",
+                          "tokensUsed": 0, "wallElapsedMs": 0,
+                          "agentActiveMs": 0, "waitingMs": 0, "pausedMs": 0,
+                          "phaseStartedAt": 0})
+        mgr.start(mid)
+
+        deadline = time.monotonic() + MISSION_TIMEOUT
+        state = {}
+        while time.monotonic() < deadline:
+            state = mgr.status(mid)["mission"]
+            if state.get("state") in ("done", "failed", "blocked", "cancelled"):
+                break
+            time.sleep(POLL)
+        ev.log(f"mission terminal: {state.get('state')} "
+               f"(stopReason={state.get('stopReason')})")
+
+        events = [json.loads(l) for l in
+                  (runs / "events.ndjson").read_text("utf-8").splitlines()
+                  if l.strip()]
+        plan = json.loads((runs / "plan.json").read_text("utf-8"))
+
+        def evts(etype, **kw):
+            out = []
+            for e in events:
+                if e["type"] != etype:
+                    continue
+                d = e.get("detail")
+                if not isinstance(d, dict):
+                    d = {}
+                if all(d.get(k) == v for k, v in kw.items()):
+                    out.append(e)
+            return out
+
+        # 1. real unit evaluator PASS for both units BEFORE the first gate
+        first_gate = evts("verification")[0] if evts("verification") else None
+        verdicts_pass = [e for e in evts("verdict")
+                         if e["detail"].get("verdict") == "PASS"]
+        checks["unit-evaluator-pass-real"] = bool(
+            first_gate and len({e["detail"].get("unit") for e in verdicts_pass
+                                if e["ts"] < first_gate["ts"]}) >= 2)
+
+        # 2. both integrated BEFORE the first machine gate
+        integ_done = [e for e in evts("integration", phase="integrated")
+                      if first_gate and e["ts"] < first_gate["ts"]]
+        checks["units-integrated-before-gate"] = (
+            {e["detail"].get("unit") for e in integ_done} == {0, 1})
+
+        # 3. first machine verification genuinely FAILed, evidence persisted
+        first_fail = bool(first_gate and first_gate["detail"].get("passed") is False)
+        results_files = sorted((runs / "verification").glob("results-*.json"))
+        first_results = json.loads(results_files[0].read_text("utf-8")) \
+            if results_files else {}
+        failed_checks = [c for c in first_results.get("checks", [])
+                         if not c.get("passed")]
+        checks["first-machine-verification-fail"] = bool(
+            first_fail and first_results.get("passed") is False
+            and any("summary.txt" in str(c.get("name", ""))
+                    for c in failed_checks))
+        (ev.root / "first-verification-failure.json").write_text(
+            json.dumps(first_results, ensure_ascii=False, indent=1), "utf-8")
+
+        # 4. no DONE / no final evaluator before machine PASS
+        machine_pass = [e for e in evts("verification")
+                        if e["detail"].get("passed") is True]
+        first_pass_ts = machine_pass[0]["ts"] if machine_pass else None
+        early_final = [e for e in evts("final-verdict")
+                       if first_pass_ts and e["ts"] < first_pass_ts]
+        early_done = [e for e in evts("transition")
+                      if e["detail"].get("state") == "done"
+                      and first_pass_ts and e["ts"] < first_pass_ts]
+        checks["no-done-after-fail"] = not early_final and not early_done
+
+        # 5. harness formed a repair directive naming the machine failure
+        repairing_ev = [e for e in evts("transition")
+                        if e["detail"].get("state") == "repairing"]
+        directive_ok = False
+        for e in repairing_ev:
+            st = json.loads((runs / "state.json").read_text("utf-8"))
+            directive_ok = directive_ok or "机器验收未通过" in str(
+                st.get("repairDirective"))
+        repair_events = evts("repair")
+        checks["repair-directive-formed"] = bool(repair_events and directive_ok)
+
+        # 6/7/8. the repair was executed by REAL codex in the right workspace
+        fail_ts = first_gate["ts"] if first_gate else 0
+        repair_turns = [c for c in ptap.calls
+                        if not c["read_only"] and c["ts"] * 1000 > fail_ts
+                        and "机器验收未通过" in c["prompt"]]
+        checks["repair-by-real-codex"] = bool(repair_turns)
+        checks["repair-cwd-correct"] = bool(
+            repair_turns and str(repair_turns[0]["cwd"]).endswith("/u1"))
+        detail["repairTurn"] = {
+            "cwd": repair_turns[0]["cwd"] if repair_turns else None,
+            "promptHead": (repair_turns[0]["prompt"][:160]
+                           if repair_turns else None)}
+        integ_branch = f"laomo/{mid}/integration"
+
+        def show(path):
+            try:
+                return git(repo, "show", f"{integ_branch}:{path}")
+            except AssertionError:
+                return ""
+        checks["repair-targets-machine-failure"] = (
+            "REPAIR-I" in show("summary.txt"))
+        # repair did NOT redo the mission: A builder stayed at 1 turn,
+        # the repair diff only adds summary.txt
+        builders_a = [c for c in ptap.in_cwd("/u0") if not c["read_only"]]
+        builders_b = [c for c in ptap.in_cwd("/u1") if not c["read_only"]]
+        repair_commit_files = set()
+        log = git(repo, "log", "--name-only", "--pretty=format:@@%s",
+                  integ_branch)
+        cur = None
+        for line in log.splitlines():
+            if line.startswith("@@"):
+                cur = line
+            elif line.strip() and cur and "unit #2" in cur:
+                repair_commit_files.add(line.strip())
+        checks["repair-targeted-not-redo"] = (
+            len(builders_a) == 1 and len(builders_b) == 2
+            and "summary.txt" in repair_commit_files
+            and "a.txt" not in repair_commit_files)
+        detail["builders"] = {"A": len(builders_a), "B": len(builders_b)}
+
+        # 9/10. machine verification re-ran: real FAIL -> PASS
+        verif_events = evts("verification")
+        checks["machine-verification-re-runs"] = len(verif_events) >= 2
+        last_results = json.loads(
+            (runs / "verification" / "results.json").read_text("utf-8"))
+        checks["real-fail-to-pass"] = bool(
+            last_results.get("passed") and first_results.get("passed") is False)
+
+        # 11. DONE strictly after machine PASS
+        done_ts = next((e["ts"] for e in evts("transition")
+                        if e["detail"].get("state") == "done"), None)
+        checks["no-done-before-machine-pass"] = bool(
+            done_ts and first_pass_ts and done_ts > first_pass_ts)
+
+        # 12. the repair did not break the other integrated unit
+        checks["other-units-preserved"] = (
+            "REAL-I-A" in show("a.txt") and "REAL-I-B" in show("b.txt"))
+
+        # 13/14. source isolation + mission done
+        checks["source-isolation"] = (
+            git(repo, "rev-parse", "HEAD") == base_sha
+            and porcelain(repo) == before)
+        checks["mission-done"] = state.get("state") == "done"
+        checks["units-final-integrated"] = (
+            [u["state"] for u in plan["units"]] == ["integrated"] * 2)
+        detail["verifyEvents"] = len(verif_events)
+        detail["mission"] = {"id": mid, "state": state.get("state"),
+                             "stopReason": state.get("stopReason")}
+    finally:
+        adapter.shutdown()
+
+    verdict = all(checks.values())
+    result = {"gate": "I", "checks": checks, "detail": detail,
+              "verdict": "PASS" if verdict else "FAIL"}
+    ev.write("summary.json", result)
+    ev.log(f"Gate I verdict: {result['verdict']} checks={checks}")
+    return result
+
+
+# ---------------------------------------------------------------- registry
+
 # ---------------------------------------------------------------- registry
 
 # ---------------------------------------------------------------- registry
@@ -2273,6 +2489,7 @@ GATES = {
     "F": lambda ev, scratch: gate_f(ev, scratch),
     "G": lambda ev, scratch: gate_g(ev, scratch),
     "H": lambda ev, scratch: gate_h(ev, scratch),
+    "I": lambda ev, scratch: gate_i(ev, scratch),
 }
 
 
