@@ -1057,6 +1057,238 @@ def gate_d(ev: Evidence, scratch: Path) -> dict:
     return result
 
 
+PAUSE_UNIT_A = (
+    "本轮内直接执行 shell 命令 sleep 15 并等待它完成（不要输出任何任务标记块），"
+    "然后创建 a.txt，内容恰好为一行：REAL-CODEX-E-A。"
+    "除此以外不要创建或修改任何文件，不要执行 git 命令。")
+PAUSE_UNIT_B = (
+    "本轮内直接执行 shell 命令 sleep 15 并等待它完成（不要输出任何任务标记块），"
+    "然后创建 b.txt，内容恰好为一行：REAL-CODEX-E-B。"
+    "除此以外不要创建或修改任何文件，不要执行 git 命令。")
+PAUSE_UNIT_C = ("创建 c.txt，内容恰好为一行：REAL-CODEX-E-C。"
+                "除此以外不要创建或修改任何文件，不要执行 git 命令。")
+
+
+def gate_e(ev: Evidence, scratch: Path) -> dict:
+    ev.log("Gate E — Pause / Resume (quiesce at safe point, no replay)")
+    repo = scratch / "fixture-e" / "repo"
+    base_sha = init_fixture(repo)
+    before = porcelain(repo)
+
+    adapter = CodexRuntimeAdapter(bin_path=GATE_BIN, default_cwd=str(repo),
+                                  debug_log=ev.log)
+    tap = TurnTap(ev, adapter)
+    ptap = PromptTap(ev, adapter)
+    mgr = MissionManager(adapter, repo)
+    checks: dict[str, bool] = {}
+    detail: dict = {}
+    try:
+        created = mgr.create(
+            "三个独立单元：A/B 先行（长命令在轮内等待），C 等待空闲槽位",
+            cwd=str(repo),
+            acceptance_criteria=["integration 分支包含 a.txt/b.txt/c.txt"],
+            options={"maxParallelWorkers": 2},
+            verification={"requiredFiles": ["a.txt", "b.txt", "c.txt"],
+                          "commands": ["grep -q REAL-CODEX-E-A a.txt",
+                                       "grep -q REAL-CODEX-E-B b.txt",
+                                       "grep -q REAL-CODEX-E-C c.txt"]})
+        mid = created["mission"]["id"]
+        runs = repo / ".laomo" / "runs" / mid
+
+        def unit(uid, index, title, desc, marker):
+            return {"id": uid, "index": index, "title": title,
+                    "description": desc,
+                    "acceptance": [f"{marker} 所在文件存在且内容正确"],
+                    "dependencies": [], "state": "pending", "status": "pending",
+                    "attempt": 0, "repairCount": 0, "conflictCount": 0,
+                    "conflict": None,
+                    "worktree": {"path": None, "branch": None,
+                                 "baseSha": None, "headSha": None},
+                    "jobId": None, "delta": None, "repairDirective": None,
+                    "lastVerdict": None,
+                    "worker": {"startedAt": None, "finishedAt": None},
+                    "integration": None}
+        store = mgr.store_for(mid)
+        store.save_plan({"version": 2, "replans": 0, "gitIntegration": True,
+                         "units": [unit("a", 0, "单元A", PAUSE_UNIT_A, "a.txt"),
+                                   unit("b", 1, "单元B", PAUSE_UNIT_B, "b.txt"),
+                                   unit("c", 2, "单元C", PAUSE_UNIT_C, "c.txt")]})
+        store.save_state({"state": "running", "cycles": 0, "currentUnit": 0,
+                          "noProgress": 0, "progressSignature": "",
+                          "tokensUsed": 0, "wallElapsedMs": 0,
+                          "agentActiveMs": 0, "waitingMs": 0, "pausedMs": 0,
+                          "phaseStartedAt": 0})
+        mgr.start(mid)
+
+        def events_now():
+            if not (runs / "events.ndjson").is_file():
+                return []
+            return [json.loads(l) for l in
+                    (runs / "events.ndjson").read_text("utf-8").splitlines()
+                    if l.strip()]
+
+        # -- window 1: both A/B turns ACTIVE, C never dispatched -> pause
+        deadline = time.monotonic() + 120
+        paused_at = None
+        while time.monotonic() < deadline:
+            t0 = tap.unit_turns("/u0")
+            t1 = tap.unit_turns("/u1")
+            a_active = any(t.get("endedAt") is None for t in t0)
+            b_active = any(t.get("endedAt") is None for t in t1)
+            c_disp = any(e["type"] == "dispatch"
+                         and isinstance(e.get("detail"), dict)
+                         and e["detail"].get("unit") == 2 for e in events_now())
+            if a_active and b_active and not c_disp:
+                mgr.pause(mid)
+                paused_at = time.time()
+                ev.log("pause requested while A and B turns both active")
+                break
+            time.sleep(0.2)
+        checks["two-workers-active-before-pause"] = paused_at is not None
+        detail["pauseRequestedAt"] = paused_at
+
+        # -- window 2: safe point — paused persisted, threads drained
+        deadline = time.monotonic() + 180
+        quiesced = None
+        while time.monotonic() < deadline:
+            st = (mgr.status(mid).get("mission") or {})
+            with mgr._lock:
+                pool = mgr._unit_threads.get(mid) or {}
+                live_units = sum(1 for t in pool.values() if t.is_alive())
+                runner = mgr._runners.get(mid)
+                runner_alive = bool(runner and runner.is_alive())
+            if (st.get("state") == "paused" and live_units == 0
+                    and not runner_alive):
+                quiesced = time.time()
+                break
+            time.sleep(0.2)
+        checks["pause-state-persisted"] = quiesced is not None
+        checks["safe-point-reached"] = quiesced is not None
+        plan_q = json.loads((runs / "plan.json").read_text("utf-8")) \
+            if quiesced else {}
+        detail["safePoint"] = {
+            "quiescedAt": quiesced,
+            "unitStates": [u["state"] for u in plan_q.get("units", [])],
+        }
+        st_q = json.loads((runs / "state.json").read_text("utf-8")) \
+            if quiesced else {}
+        detail["timing"] = {"pausedMsAtQuiesce": st_q.get("pausedMs"),
+                            "wallMsAtQuiesce": st_q.get("wallElapsedMs")}
+
+        # in-flight turns ended NATURALLY (not interrupted)
+        t0 = tap.unit_turns("/u0")
+        t1 = tap.unit_turns("/u1")
+        initial0 = t0[0] if t0 else {}
+        initial1 = t1[0] if t1 else {}
+        checks["inflight-turns-not-interrupted"] = (
+            initial0.get("status") == "completed"
+            and initial1.get("status") == "completed")
+        detail["initialTurns"] = {"A": initial0, "B": initial1}
+
+        # -- window 3: hold 10s, absolutely nothing may move
+        if quiesced is not None:
+            ev_snap = events_now()
+            disp_before = sum(1 for e in ev_snap if e["type"] == "dispatch")
+            integ_before = sum(1 for e in ev_snap if e["type"] == "integration")
+            turns_before = len(tap.unit_turns("/u0")) + len(tap.unit_turns("/u1")) \
+                + len(tap.unit_turns("/u2"))
+            evals_before = len(ptap.calls)
+            time.sleep(10.0)
+            ev_after = events_now()
+            disp_after = sum(1 for e in ev_after if e["type"] == "dispatch")
+            integ_after = sum(1 for e in ev_after if e["type"] == "integration")
+            turns_after = len(tap.unit_turns("/u0")) + len(tap.unit_turns("/u1")) \
+                + len(tap.unit_turns("/u2"))
+            evals_after = len(ptap.calls)
+            c_starts = sum(1 for e in ev_after
+                           if e["type"] == "dispatch"
+                           and isinstance(e.get("detail"), dict)
+                           and e["detail"].get("unit") == 2) \
+                - sum(1 for e in ev_snap
+                      if e["type"] == "dispatch"
+                      and isinstance(e.get("detail"), dict)
+                      and e["detail"].get("unit") == 2)
+            checks["paused-window-no-dispatch"] = disp_after == disp_before
+            checks["paused-window-no-turns"] = turns_after == turns_before
+            checks["paused-window-no-evaluator"] = evals_after == evals_before
+            checks["paused-window-no-integration"] = integ_after == integ_before
+            checks["C-not-started-while-paused"] = c_starts == 0
+            detail["hold"] = {"dispatchDelta": disp_after - disp_before,
+                              "turnDelta": turns_after - turns_before,
+                              "evaluatorDelta": evals_after - evals_before,
+                              "integrationDelta": integ_after - integ_before,
+                              "cStarts": c_starts}
+
+        # -- resume: builder never replays; C starts now
+        mgr.resume(mid)
+        st_r = json.loads((runs / "state.json").read_text("utf-8"))
+        detail["timing"]["pausedMsAtResume"] = st_r.get("pausedMs")
+        detail["timing"]["wallMsAtResume"] = st_r.get("wallElapsedMs")
+        resume_at = time.time()
+        deadline = time.monotonic() + MISSION_TIMEOUT
+        state = {}
+        while time.monotonic() < deadline:
+            state = mgr.status(mid)["mission"]
+            if state.get("state") in ("done", "failed", "blocked", "cancelled"):
+                break
+            time.sleep(POLL)
+        ev.log(f"mission terminal: {state.get('state')} "
+               f"(stopReason={state.get('stopReason')})")
+        checks["mission-done"] = state.get("state") == "done"
+
+        # builders: exactly ONE worker turn per unit A/B across the whole run
+        builders_a = [c for c in ptap.in_cwd("/u0") if not c["read_only"]]
+        builders_b = [c for c in ptap.in_cwd("/u1") if not c["read_only"]]
+        checks["resume-no-worker-replay"] = (len(builders_a) == 1
+                                             and len(builders_b) == 1)
+        evals_a = [c for c in ptap.in_cwd("/u0") if c["read_only"]]
+        evals_b = [c for c in ptap.in_cwd("/u1") if c["read_only"]]
+        checks["resume-continues-at-evaluator"] = (len(evals_a) >= 1
+                                                   and len(evals_b) >= 1)
+        # C's real worker turn starts only after resume
+        c_builders = [c for c in ptap.in_cwd("/u2") if not c["read_only"]]
+        checks["C-started-after-resume"] = bool(
+            c_builders and c_builders[0]["ts"] >= resume_at)
+        detail["builders"] = {"A": len(builders_a), "B": len(builders_b),
+                              "C": len(c_builders)}
+        detail["evaluators"] = {"A": len(evals_a), "B": len(evals_b)}
+
+        plan = json.loads((runs / "plan.json").read_text("utf-8"))
+        checks["resume-completes-all"] = (
+            [u["state"] for u in plan["units"]] == ["integrated"] * 3)
+
+        # timing contract: pause holds the wall budget
+        tmg = detail["timing"]
+        paused_delta = (tmg.get("pausedMsAtResume") or 0) \
+            - (tmg.get("pausedMsAtQuiesce") or 0)
+        wall_delta = (tmg.get("wallMsAtResume") or 0) \
+            - (tmg.get("wallMsAtQuiesce") or 0)
+        checks["pause-budget-contract"] = (paused_delta >= 8000
+                                           and wall_delta <= 1500)
+        detail["timing"]["pausedDeltaMs"] = paused_delta
+        detail["timing"]["wallDeltaMs"] = wall_delta
+
+        integ_branch = f"laomo/{mid}/integration"
+        checks["source-isolation"] = (
+            git(repo, "rev-parse", "HEAD") == base_sha
+            and porcelain(repo) == before
+            and all(marker in git(repo, "show", f"{integ_branch}:{f}")
+                    for f, marker in (("a.txt", "REAL-CODEX-E-A"),
+                                      ("b.txt", "REAL-CODEX-E-B"),
+                                      ("c.txt", "REAL-CODEX-E-C"))))
+    finally:
+        adapter.shutdown()
+
+    verdict = all(checks.values())
+    result = {"gate": "E", "checks": checks, "detail": detail,
+              "verdict": "PASS" if verdict else "FAIL"}
+    ev.write("summary.json", result)
+    ev.log(f"Gate E verdict: {result['verdict']} checks={checks}")
+    return result
+
+
+# ---------------------------------------------------------------- registry
+
 # ---------------------------------------------------------------- registry
 
 # ---------------------------------------------------------------- registry
@@ -1073,6 +1305,7 @@ GATES = {
     "B": lambda ev, scratch: gate_b(ev, scratch),
     "C": lambda ev, scratch: gate_c(ev, scratch),
     "D": lambda ev, scratch: gate_d(ev, scratch),
+    "E": lambda ev, scratch: gate_e(ev, scratch),
 }
 
 
