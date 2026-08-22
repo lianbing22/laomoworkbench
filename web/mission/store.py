@@ -57,6 +57,14 @@ class MissionStore:
     def save_plan(self, plan: dict[str, Any]) -> None:
         _atomic_write(self.plan_file, json.dumps(plan, ensure_ascii=False, indent=1))
 
+    def write_progress_md(self) -> None:
+        """Render progress.md from the current plan (unit statuses)."""
+        plan = self.load_plan()
+        rows = [f"- [{u['status']}] #{u['index'] + 1} {u['title']}（repair×{u.get('repairCount', 0)}，"
+                f"最后判定 {u.get('lastVerdict') or '—'}）" for u in plan["units"]]
+        self.write_progress(
+            f"# Mission 进度\n\n更新：{time.strftime('%Y-%m-%d %H:%M:%S')}\n\n" + "\n".join(rows))
+
     # -- events --
     def event(self, kind: str, detail: Any = None) -> None:
         entry = {"ts": _now_ms(), "type": kind, "detail": detail}

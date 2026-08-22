@@ -28,6 +28,7 @@ from .models import (EVALUATOR_TURN_TIMEOUT, WORKER_TURN_TIMEOUT,
                      TERMINAL_STATES, _HANDOFF_RE, _JOB_RE, _VERDICT_RE,
                      _now_ms, parse_json_marker)
 from .store import MissionStore
+from .worktree import WorktreeManager
 
 
 class UnitRunner:
@@ -52,6 +53,21 @@ class UnitRunner:
         self.mission_id = runner.mission_id
         self.store: MissionStore = runner.store
         self.policy = runner.policy
+        self._wtree: WorktreeManager | None = None
+
+    def _worktree(self) -> WorktreeManager:
+        if self._wtree is None:
+            mission = self.store.load_mission()
+            self._wtree = WorktreeManager(
+                str(mission.get("cwd") or os.getcwd()), self.store, self.mission_id)
+        return self._wtree
+
+    def _unit_cwd(self, info: dict[str, Any] | None) -> str | None:
+        """The unit's git worktree path when one exists, else None
+        (MissionRunner falls back to the mission workspace — P1.1 mode)."""
+        if info and info.get("path"):
+            return str(info["path"])
+        return None
 
     # -- scheduler-facing entry point --
     def run(self, state: dict[str, Any] | None = None) -> tuple[str, dict[str, Any]]:
@@ -109,6 +125,12 @@ class UnitRunner:
             self.runner._transition(state, "failed", stopReason=f"工作单元 {index} 不存在")
             return False
         mission = self.store.load_mission()
+        wtree = self._worktree()
+        info = wtree.ensure(index, unit.get("title"), info=unit.get("worktree")) \
+            if wtree.available else None
+        if info:
+            unit["worktree"] = info
+        cwd = self._unit_cwd(info)
         unit["state"] = unit["status"] = "running"
         unit["attempt"] = int(unit.get("attempt", 0)) + 1
         unit["worker"]["startedAt"] = _now_ms()
@@ -124,7 +146,8 @@ class UnitRunner:
         prompt = (
             "你是 Mission Worker（构建者）。只做当前这一个工作单元，不要做别的。\n"
             f"总目标：{mission.get('objective')}\n"
-            f"当前单元 #{index + 1}：{unit['title']}\n{unit['description']}\n"
+            + (f"工作目录（本单元独立 git 工作树，改动请提交在该分支上）：{cwd}\n" if cwd else "")
+            + f"当前单元 #{index + 1}：{unit['title']}\n{unit['description']}\n"
             "验收标准：\n- " + "\n- ".join(unit.get("acceptance") or ["实现并自测通过"]) + "\n"
             + (f"\n上次验收反馈（必须修复）：{state.get('repairDirective')}\n" if repair else "")
             + (f"\n交接摘要（此前进展）：\n{self.store.load_handoff() or '（无）'}\n"
@@ -139,7 +162,7 @@ class UnitRunner:
               "2) 完工时输出一段以 HANDOFF: 开头的交接摘要（≤300 字：做了什么/改了哪些文件/下一步建议）。\n"
               "3) 你不能宣布整个 Mission 完成；只交付当前单元。"
         )
-        result = self.runner._turn(state, prompt)
+        result = self.runner._turn(state, prompt, cwd=cwd)
         if not result.get("ok"):
             self.store.event("worker", f"turn failed: {(result.get('error') or '')[:160]}")
         text = result.get("text") or ""
@@ -154,6 +177,8 @@ class UnitRunner:
         if unit is not None:
             unit["worker"]["finishedAt"] = _now_ms()
             unit["delta"] = None
+            if info:
+                unit["worktree"] = wtree.refresh_head(unit.get("worktree") or info)
             self._save_unit(unit)
         state.pop("delta", None)
         self.runner._transition(state, "evaluating")
@@ -161,8 +186,10 @@ class UnitRunner:
 
     def _register_job(self, state: dict[str, Any], unit_index: int, job_spec: dict[str, Any]) -> None:
         mission = self.store.load_mission()
+        u = self._unit(unit_index)
+        wtree_path = (u.get("worktree") or {}).get("path") if u else None
         job_id = uuid.uuid4().hex[:12]
-        cwd = str(job_spec.get("cwd") or mission.get("cwd") or os.getcwd())
+        cwd = str(job_spec.get("cwd") or wtree_path or mission.get("cwd") or os.getcwd())
         command = str(job_spec.get("command"))
         log_path = self.store.job_log(job_id)
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -234,6 +261,8 @@ class UnitRunner:
             if u is not None:
                 u["state"] = u["status"] = "running"
                 u["delta"] = delta[:6000]
+                if (u.get("worktree") or {}).get("path"):
+                    u["worktree"] = self._worktree().refresh_head(u["worktree"])
                 self._save_unit(u)
         self.store.event("wake", {"jobId": job_id, "exitKind": exit_kind})
         self.runner._transition(state, "running")
@@ -248,13 +277,15 @@ class UnitRunner:
         mission = self.store.load_mission()
         unit["state"] = unit["status"] = "evaluating"
         self._save_unit(unit)
+        eval_cwd = self._unit_cwd(unit.get("worktree") or {})
+        work_area = eval_cwd or mission.get("cwd")
         prompt = (
             "你是独立验收员（Evaluator）。你与构建者无关，只依据事实验收。\n"
             "你处于只读沙箱：不得创建/修改/删除任何文件，只能读取与运行只读检查。\n"
             f"总目标：{mission.get('objective')}\n"
             f"待验收单元 #{index + 1}：{unit['title']}\n{unit['description']}\n"
             "验收标准：\n- " + "\n- ".join(unit.get("acceptance") or []) + "\n"
-            f"工作区：{mission.get('cwd')}\n"
+            f"工作区：{work_area}\n"
             f"证据目录：{self.store.evidence_dir}\n"
             "可自行运行只读命令（查看文件、跑测试可以；测试若有写行为导致失败就按 NEEDS_WORK 记录）。\n"
             "在回复末尾必须输出（三选一，NEEDS_WORK 时 repair 必填）：\n"
@@ -262,7 +293,8 @@ class UnitRunner:
             '{"verdict":"PASS|NEEDS_WORK|BLOCKED","reasons":["..."],"repair":"..."}'
             "\nLAOMO_VERDICT>>>"
         )
-        result = self.runner._turn(state, prompt, read_only=True, timeout=EVALUATOR_TURN_TIMEOUT)
+        result = self.runner._turn(state, prompt, read_only=True, timeout=EVALUATOR_TURN_TIMEOUT,
+                                   cwd=eval_cwd)
         verdict = parse_json_marker(result.get("text") or "", _VERDICT_RE)
         if not isinstance(verdict, dict) or verdict.get("verdict") not in ("PASS", "NEEDS_WORK", "BLOCKED"):
             # default-fail contract: unparseable verdict is NEVER a pass
@@ -301,14 +333,14 @@ class UnitRunner:
             unit["lastVerdict"] = "PASS"
             self._save_unit(unit)
             self._checkpoint(state, index, unit, verdict)
-            self._update_progress_md()
+            self.store.write_progress_md()
             return (self.PASS, state)
         if v == "BLOCKED":
             unit["state"] = unit["status"] = "blocked"
             unit["lastVerdict"] = "BLOCKED"
             self._save_unit(unit)
             self._checkpoint(state, index, unit, verdict)
-            self._update_progress_md()
+            self.store.write_progress_md()
             return (self.BLOCKED, state)
         # NEEDS_WORK
         unit["state"] = unit["status"] = "repairing"
@@ -326,9 +358,3 @@ class UnitRunner:
             f"reasons：{json.dumps(verdict.get('reasons'), ensure_ascii=False)}\n\n"
             f"## handoff\n{self.store.load_handoff()[:1500]}\n"))
 
-    def _update_progress_md(self) -> None:
-        plan = self.store.load_plan()
-        rows = [f"- [{u['status']}] #{u['index'] + 1} {u['title']}（repair×{u.get('repairCount', 0)}，"
-                f"最后判定 {u.get('lastVerdict') or '—'}）" for u in plan["units"]]
-        self.store.write_progress(
-            f"# Mission 进度\n\n更新：{time.strftime('%Y-%m-%d %H:%M:%S')}\n\n" + "\n".join(rows))

@@ -20,6 +20,7 @@ from .models import (EVALUATOR_TURN_TIMEOUT, RUNS_DIRNAME, WORKER_TURN_TIMEOUT,
 from .store import MissionStore
 from .unit_runner import UnitRunner
 from .verification import VerificationRunner, _git_diff_summary
+from .worktree import WorktreeManager
 
 
 # --- MissionRunner -------------------------------------------------------------------
@@ -168,15 +169,18 @@ class MissionRunner(threading.Thread):
         return True
 
     def _turn(self, state: dict[str, Any], prompt: str, *,
-              read_only: bool = False, timeout: int = WORKER_TURN_TIMEOUT) -> dict[str, Any]:
+              read_only: bool = False, timeout: int = WORKER_TURN_TIMEOUT,
+              cwd: str | None = None) -> dict[str, Any]:
         """Run one codex turn on a fresh thread. Counters always accumulate on
         a fresh disk copy: a pause/cancel landing mid-turn must never be
         clobbered by a stale in-memory dict. Mutates the caller's state dict
-        in place afterwards so its counters stay in sync."""
+        in place afterwards so its counters stay in sync. `cwd` overrides the
+        mission workspace (per-unit worktrees)."""
         mission = self.store.load_mission()
         started = _now_ms()
         result = self.manager.adapter.run_turn(
-            prompt=prompt, cwd=mission.get("cwd"), read_only=read_only,
+            prompt=prompt, cwd=cwd if cwd is not None else mission.get("cwd"),
+            read_only=read_only,
             model=mission.get("model"), effort=mission.get("effort"), timeout=timeout)
         elapsed = _now_ms() - started
         usage = result.get("usage") or {}
@@ -245,18 +249,22 @@ class MissionRunner(threading.Thread):
         outcome. At maxParallelWorkers=1 there is exactly one active unit;
         M4 turns this into per-unit worker threads."""
         index = int(state.get("currentUnit") or 0)
+        unit = self._unit(index)
+        # crash-resume fast path: a PASSed unit that crashed in the wedge
+        # between evaluator PASS and integration/next-pending must never
+        # re-run its worker turn — finish the integration instead. Only in
+        # the "running" mission state: after a machine-gate fail the mission
+        # deliberately re-opens the last unit as "repairing" even though it
+        # is "passed".
+        if (state.get("state") == "running" and unit is not None
+                and unit.get("state") in ("passed", "integrated", "integrating")):
+            return self._finish_unit_pass(state, index)
         unit_run = UnitRunner(self, index)
         outcome, state = unit_run.run(state)
         if outcome in (UnitRunner.STOP, UnitRunner.IDLE):
             return False
         if outcome == UnitRunner.PASS:
-            nxt = self._next_pending(self.store.load_plan(), current=index)
-            if nxt is None:
-                self._transition(state, "verification")
-            else:
-                state.pop("repairDirective", None)
-                self._transition(state, "running", currentUnit=nxt)
-            return True
+            return self._finish_unit_pass(state, index)
         if outcome == UnitRunner.BLOCKED:
             reasons = "; ".join((state.get("lastVerdict") or {}).get("reasons") or [])
             self._transition(state, "blocked",
@@ -271,6 +279,72 @@ class MissionRunner(threading.Thread):
             return False
         self._transition(state, "repairing")
         return True
+
+    def _finish_unit_pass(self, state: dict[str, Any], index: int) -> bool:
+        """UnitRunner says PASS: integrate the unit's worktree into the
+        mission branch (Control Plane duty), then advance to the next
+        runnable unit — or to harness verification when nothing is left."""
+        integ = self._integrate(state, index)
+        if integ == "conflict":
+            self._transition(state, "blocked",
+                             stopReason=f"单元 #{index + 1} 集成冲突，等待解决")
+            return False
+        if integ == "failed":
+            self._transition(state, "failed",
+                             stopReason=f"单元 #{index + 1} 集成失败")
+            return False
+        nxt = self._next_pending(self.store.load_plan(), current=index)
+        if nxt is None:
+            self._transition(state, "verification")
+        else:
+            state.pop("repairDirective", None)
+            self._transition(state, "running", currentUnit=nxt)
+        return True
+
+    def _integrate(self, state: dict[str, Any], index: int) -> str:
+        """Integrate one passed unit: its worktree branch into the mission
+        branch. Returns "ok" | "conflict" | "failed" | "none" (never had a
+        worktree — P1.1 mode edits the workspace directly)."""
+        unit = self._unit(index)
+        if unit is None:
+            return "failed"
+        mission = self.store.load_mission()
+        wtree = WorktreeManager(str(mission.get("cwd") or os.getcwd()),
+                                self.store, self.mission_id)
+        info = unit.get("worktree") or {}
+        if not info.get("path") or not wtree.available:
+            return "none"
+        if unit.get("state") in ("integrated",):
+            return "ok"  # crash between integrate-save and next-pending
+        if unit.get("state") != "integrating":
+            unit["state"] = unit["status"] = "integrating"
+            self._save_unit(unit)
+            self.store.event("integration", {"unit": index, "phase": "start",
+                                             "branch": info.get("branch"),
+                                             "baseSha": info.get("baseSha")})
+        result = wtree.integrate(index, unit.get("title"), branch=info.get("branch"))
+        if result.get("ok"):
+            unit["worktree"] = wtree.refresh_head(unit.get("worktree") or info)
+            unit["state"] = unit["status"] = "integrated"
+            unit["delta"] = None
+            self._save_unit(unit)
+            self.store.write_progress_md()
+            self.store.event("integration", {"unit": index, "phase": "integrated",
+                                             "branch": info.get("branch"),
+                                             "headSha": result.get("headSha")})
+            wtree.cleanup(index, branch=info.get("branch"))
+            return "ok"
+        if result.get("conflict"):
+            unit["state"] = unit["status"] = "conflict"
+            self._save_unit(unit)
+            self.store.event("integration", {"unit": index, "phase": "conflict",
+                                             "reason": (result.get("reason") or "")[:200]})
+            return "conflict"
+        unit["state"] = unit["status"] = "failed"
+        self._save_unit(unit)
+        self.store.event("integration", {"unit": index, "phase": "failed",
+                                         "reason": (result.get("reason") or "")[:200]})
+        return "failed"
 
     # -- phases --
     def _phase_planning(self, state: dict[str, Any]) -> bool:
@@ -316,6 +390,13 @@ class MissionRunner(threading.Thread):
                 return u
         return None
 
+    def _save_unit(self, unit: dict[str, Any]) -> None:
+        plan = self.store.load_plan()
+        for i, u in enumerate(plan["units"]):
+            if u["index"] == unit["index"]:
+                plan["units"][i] = unit
+        self.store.save_plan(plan)
+
 
     @staticmethod
     def _next_pending(plan_index: dict[str, Any], current: int) -> int | None:
@@ -343,7 +424,7 @@ class MissionRunner(threading.Thread):
             self._transition(state, "failed", stopReason="replan 次数超限")
             return False
         mission = self.store.load_mission()
-        gaps = [u for u in plan["units"] if u.get("status") != "passed"]
+        gaps = [u for u in plan["units"] if u.get("status") not in ("passed", "integrated")]
         prompt = (
             "你是 Mission Planner（补缺口轮）。以下单元尚未通过验收，给出修正后的后续单元计划。\n"
             f"目标：{mission.get('objective')}\n"
@@ -431,9 +512,10 @@ class MissionRunner(threading.Thread):
         state["lastVerdict"] = {"unit": "final", **{k: verdict.get(k) for k in ("verdict", "reasons")}}
         self.store.event("final-verdict", state["lastVerdict"])
         if verdict.get("verdict") == "PASS":
-            # triple gate: all units passed + final regression (the evaluator ran
-            # the checks above) + final evaluator PASS
-            all_passed = all(u.get("status") == "passed" for u in plan["units"])
+            # triple gate: all units passed/integrated + final regression
+            # (the evaluator ran the checks above) + final evaluator PASS
+            all_passed = all(u.get("status") in ("passed", "integrated")
+                             for u in plan["units"])
             if all_passed:
                 self._transition(state, "done")
                 return False
