@@ -431,6 +431,19 @@ class WorktreeConflictTest(WorktreeTest):
                     if str(c.get("cwd") or "").endswith("/u1")]
         self.assertEqual(len(u1_evals), 2,
                          "冲突解决后必须重新验收：实际 %d 次" % len(u1_evals))
+        # M5-C.1：冲突解决不消耗 evaluator 修复预算
+        self.assertEqual(int(u1.get("repairCount") or 0), 0,
+                         "conflictCount 与 repairCount 必须真正独立")
+        # M5-C.1：resolver 轮使用专用 prompt（git 禁令，无普通 worker 的
+        # “改动请提交在该分支上”矛盾指令）
+        u1_workers = [c for c in self.adapter.calls_for("worker")
+                      if str(c.get("cwd") or "").endswith("/u1")]
+        resolver_prompts = [c for c in u1_workers
+                            if "集成冲突" in (c.get("prompt") or "")]
+        self.assertTrue(resolver_prompts, "resolver 轮应存在")
+        self.assertIn("Conflict Resolver", resolver_prompts[0]["prompt"])
+        self.assertIn("禁止执行", resolver_prompts[0]["prompt"])
+        self.assertNotIn("改动请提交在该分支上", resolver_prompts[0]["prompt"])
         # 用户主仓库全程未被触碰
         self.assertEqual(git(self.repo, "rev-parse", "HEAD"), self.initial_sha)
         self.assertFalse((self.repo / "shared.txt").exists())
@@ -812,6 +825,8 @@ class ConflictResolverGatesTest(WorktreeTest):
         self.assertEqual(u1["state"], "integrated")
         self.assertEqual(int(u1.get("conflictCount") or 0), 2,
                          "二次竞争必须进入第二轮解决: %r" % u1.get("conflict"))
+        self.assertEqual(int(u1.get("repairCount") or 0), 0,
+                         "两轮冲突解决都不得消耗 repairCount")
         phases = [d.get("phase") for d in self.integ_events(mid, 1)]
         self.assertEqual(phases.count("conflict-resolve"), 2)
         merged = self.show(mid, "shared.txt")
@@ -862,6 +877,100 @@ class ConflictResolverGatesTest(WorktreeTest):
         self.assertEqual(git(self.repo, "rev-parse", "HEAD"), self.initial_sha)
         state = json.loads((self.mdir(mid) / "state.json").read_text("utf-8"))
         self.assertIn("集成冲突", str(state.get("stopReason")))
+
+    def test_binary_conflict_fails_closed_for_human(self):
+        """M5-C.1 P0：二进制冲突没有文本标记，绝不能被解释成“已解决”而
+        自动 commit——不支持的冲突类型 fail closed：还原单元现场、保留证
+        据、诚实 blocked 等人接管。"""
+        mid = self.create()
+        integ = self.intdir(mid)
+
+        def on_worker(prompt, cwd, n):
+            if "单元 #2" not in (prompt or ""):
+                return
+            if "集成冲突" in (prompt or ""):
+                # resolver 轮：二进制冲突无从下手（真实 worker 也会卡住）
+                return
+            # 单元B 写二进制文件；外部同时在集成分支写不同二进制
+            (Path(cwd) / "logo.png").write_bytes(b"\x89PNG\r\n\x1a\nunit-side")
+            with open(integ / "logo.png", "wb") as fh:
+                fh.write(b"\x89PNG\r\n\x1a\nexternal-side")
+
+            def g(*a):
+                pass
+            git(integ, "add", "-A")
+            git(integ, "commit", "-q", "-m", "external binary")
+
+        self.adapter.on_worker = on_worker
+        self.adapter.script("planner", plan_block(UNIT_PLAN_2))
+        self.adapter.defaults["worker"] = handoff_text(note="完成。")
+        self.adapter.defaults["evaluator"] = verdict_block("PASS", ["条件满足"])
+        self.mgr.start(mid)
+        self.assertEqual(self.wait_terminal(mid, timeout=40), "blocked")
+
+        u1 = self.plan(mid)["units"][1]
+        self.assertEqual(u1["state"], "conflict")
+        self.assertEqual((u1.get("integration") or {}).get("phase"),
+                         "conflict-unsupported")
+        phases = [d.get("phase") for d in self.integ_events(mid, 1)]
+        self.assertIn("conflict-unsupported", phases)
+        # fail closed：单元现场还原（无 MERGE_HEAD、二进制仍是单元版本）
+        wt = Path(u1["worktree"]["path"])
+        self.assertTrue(wt.is_dir())
+        self.assertFalse(git_ok(wt, "rev-parse", "-q", "--verify", "MERGE_HEAD"))
+        self.assertEqual((wt / "logo.png").read_bytes(),
+                         b"\x89PNG\r\n\x1a\nunit-side")
+        # 集成分支绝未被自动接受单元侧二进制（读集成工作树字节对比）
+        self.assertEqual((integ / "logo.png").read_bytes(),
+                         b"\x89PNG\r\n\x1a\nexternal-side")
+        state = json.loads((self.mdir(mid) / "state.json").read_text("utf-8"))
+        self.assertIn("集成冲突", str(state.get("stopReason")))
+        self.assertEqual(git(self.repo, "rev-parse", "HEAD"), self.initial_sha)
+
+    def test_conclude_failure_keeps_resolving_then_completes(self):
+        """M5-C.1 P1：conclude_unit_merge 失败不得被下一层 git 操作兜底——
+        停留 resolving（同一尝试），恢复后照常完成。"""
+        mid = self.create()
+        integ = self.intdir(mid)
+        calls = {"n": 0}
+        orig = WorktreeManager.conclude_unit_merge
+
+        def flaky(self, index):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {"ok": False, "headSha": None, "reason": "模拟 git 锁"}
+            return orig(self, index)
+
+        def on_worker(prompt, cwd, n):
+            p2 = "单元 #2" in (prompt or "")
+            if p2 and "集成冲突" not in (prompt or ""):
+                (integ / "shared.txt").write_text("external\n", "utf-8")
+                git(integ, "add", "-A")
+                git(integ, "commit", "-q", "-m", "external")
+            if p2 and "集成冲突" in (prompt or ""):
+                base = (integ / "shared.txt").read_text("utf-8")
+                (Path(cwd) / "shared.txt").write_text(
+                    base + "from unit worker 2\n", "utf-8")
+
+        self.adapter.shared = True
+        self.adapter.on_worker = on_worker
+        self.adapter.script("planner", plan_block(UNIT_PLAN_2))
+        self.adapter.defaults["worker"] = handoff_text(note="完成。")
+        self.adapter.defaults["evaluator"] = verdict_block("PASS", ["条件满足"])
+        WorktreeManager.conclude_unit_merge = flaky
+        try:
+            self.mgr.start(mid)
+            self.assertEqual(self.wait_terminal(mid, timeout=40), "done",
+                             "conclude 一次失败后应继续解决并完成: %r"
+                             % self.mgr.status(mid))
+        finally:
+            WorktreeManager.conclude_unit_merge = orig
+        self.assertGreaterEqual(calls["n"], 2, "失败后必须重试 conclude")
+        u1 = self.plan(mid)["units"][1]
+        self.assertEqual(u1["state"], "integrated")
+        merged = self.show(mid, "shared.txt")
+        self.assertIn("external", merged)
+        self.assertIn("from unit worker 2", merged)
 
     def test_crash_during_resolver_resumes_and_completes(self):
         """Gate 8：网关死在 resolver 中途（单元 resolving、工作树停在冲突

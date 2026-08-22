@@ -637,19 +637,36 @@ class MissionRunner(threading.Thread):
                   "startedAt": _now_ms(), "backfilled": True}
             unit["integration"] = tx
             self._save_unit(unit)
-        if wtree.unit_merge_state(index) == "conflicted":
-            # The resolver worker edits files but never runs git, so the
-            # control plane settles the merge itself. Markers still in the
-            # files => the resolution is genuinely incomplete: resume the
-            # SAME conflict attempt (no extra budget; the no-progress fuse
-            # bounds the loop). No markers => the worker finished: stage +
-            # commit the resolution (the merge commit) and fall through —
-            # the integration merge below then fast-forwards.
-            if wtree.has_unresolved_markers(index):
+        # The resolver edits files but never runs git, so the control plane
+        # settles the merge itself — strictly fail-closed (M5-C.1): only a
+        # clean two-sided TEXT resolution may be auto-concluded; markers
+        # mean the resolution is incomplete (resume the SAME attempt, the
+        # no-progress fuse bounds the loop); unsupported kinds (binary,
+        # delete/modify, renames) NEVER get an automatic decision — the
+        # unit stops for a human with its worktree restored pristine.
+        rstate = wtree.resolution_state(index)
+        if rstate == "markers":
+            self._stage_conflict_resolution(wtree, unit, index, info, tx,
+                                            resume=True)
+            return "repair"
+        if rstate == "unsupported":
+            wtree.abort_unit_merge(index)
+            unit["integration"] = {**tx, "phase": "conflict-unsupported"}
+            unit["state"] = unit["status"] = "conflict"
+            self._save_unit(unit)
+            self.store.event("integration", {"unit": index,
+                                             "phase": "conflict-unsupported",
+                                             "reason": "非文本冲突不自动决策"})
+            return "conflict"
+        if rstate == "resolved":
+            cres = wtree.conclude_unit_merge(index)
+            if not cres.get("ok"):
+                # a git error while concluding: stay resolving on the SAME
+                # attempt; a persistent failure is bounded by the no-progress
+                # fuse — never let the next git layer paper over this one
                 self._stage_conflict_resolution(wtree, unit, index, info, tx,
                                                 resume=True)
                 return "repair"
-            wtree.conclude_unit_merge(index)
         result = wtree.integrate(index, unit.get("title"), branch=info.get("branch"))
         if result.get("ok"):
             unit["worktree"] = wtree.refresh_head(unit.get("worktree") or info)
@@ -670,11 +687,14 @@ class MissionRunner(threading.Thread):
         if result.get("conflict"):
             if self._stage_conflict_resolution(wtree, unit, index, info, tx):
                 return "repair"
-            unit["integration"] = {**tx, "phase": "conflict"}
-            unit["state"] = unit["status"] = "conflict"
-            self._save_unit(unit)
-            self.store.event("integration", {"unit": index, "phase": "conflict",
-                                             "reason": (result.get("reason") or "")[:200]})
+            if unit.get("state") != "conflict":
+                # (a conflict already staged as conflict-unsupported keeps
+                # its more specific record)
+                unit["integration"] = {**tx, "phase": "conflict"}
+                unit["state"] = unit["status"] = "conflict"
+                self._save_unit(unit)
+                self.store.event("integration", {"unit": index, "phase": "conflict",
+                                                 "reason": (result.get("reason") or "")[:200]})
             return "conflict"
         unit["integration"] = {**tx, "phase": "failed"}
         unit["state"] = unit["status"] = "failed"
@@ -710,6 +730,20 @@ class MissionRunner(threading.Thread):
         mres = wtree.merge_integration_into_unit(index)
         if not mres.get("ok") and not mres.get("conflict"):
             wtree.abort_unit_merge(index)
+            return False
+        if mres.get("conflict") \
+                and wtree.resolution_state(index) == "unsupported":
+            # binary / delete-modify / rename conflicts are not something a
+            # text resolver may decide: restore the unit pristine and stop
+            # for a human (evidence + commits kept)
+            wtree.abort_unit_merge(index)
+            unit["integration"] = {**tx, "phase": "conflict-unsupported"}
+            unit["state"] = unit["status"] = "conflict"
+            self._save_unit(unit)
+            self.store.event("integration", {"unit": index,
+                                             "phase": "conflict-unsupported",
+                                             "attempt": conflicts,
+                                             "reason": "非文本冲突不自动决策"})
             return False
         files = [f.get("path") for f in (mres.get("files") or [])
                  if f.get("path")][:10]

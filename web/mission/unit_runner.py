@@ -141,13 +141,13 @@ class UnitRunner:
                 continue
             if st == UNIT_RESOLVING:
                 # M5-C: the integration conflict is materialized in this
-                # unit's worktree (merge left in progress); the worker
-                # resolves the markers, then the unit evaluator must PASS
-                # again before integration re-runs
+                # unit's worktree (merge left in progress); the resolver
+                # edits the real conflicted files, then the unit evaluator
+                # must PASS again before integration re-runs
                 if int(unit.get("conflictCount", 0)) > self.runner.CONFLICT_REPAIRS:
                     return (self.CONFLICT, payload)
                 self.runner._mirror("repairing", **payload)
-                if not self._phase_worker(unit, repair=True, payload=payload):
+                if not self._phase_resolver(unit, payload):
                     return (self.STOP, payload)
                 continue
             if st == UNIT_EVALUATING:
@@ -239,6 +239,53 @@ class UnitRunner:
             unit["delta"] = None
             if info:
                 unit["worktree"] = wtree.refresh_head(unit.get("worktree") or info)
+            self._save_unit(unit)
+        self.runner._mirror("evaluating", **payload)
+        return True
+
+    def _phase_resolver(self, unit: dict[str, Any],
+                        payload: dict[str, Any]) -> bool:
+        """M5-C conflict-resolution turn. Deliberately separate from
+        _phase_worker for two contract reasons (M5-C.1):
+
+        * it must NOT consume the evaluator-repair budget — git conflicts
+          are budgeted by conflictCount/CONFLICT_REPAIRS; repairCount counts
+          only evaluator NEEDS_WORK repairs;
+        * the normal worker prompt tells the builder to commit on its
+          branch — here that instruction would be a contradiction: the
+          worktree sits MID-MERGE and every git mutation belongs to the
+          control plane. The resolver only edits file content.
+        """
+        index = int(unit["index"])
+        mission = self.store.load_mission()
+        cwd = self._unit_cwd(unit.get("worktree"))
+        unit["state"] = unit["status"] = UNIT_RUNNING
+        unit["attempt"] = int(unit.get("attempt", 0)) + 1
+        unit["worker"]["startedAt"] = _now_ms()
+        self._save_unit(unit)
+        prompt = (
+            "你是 Conflict Resolver（冲突解决员）。\n"
+            f"总目标：{mission.get('objective')}\n"
+            + (f"工作目录（本单元独立 git 工作树）：{cwd}\n" if cwd else "")
+            + f"当前单元 #{index + 1}：{unit['title']}\n\n"
+            f"# ConflictDirective\n\n{unit.get('repairDirective') or '解决工作树中的合并冲突'}\n\n"
+            "允许：读取文件、编辑冲突文件、运行测试与只读检查（diff/status/log 可看）。\n"
+            "禁止执行任何改变 git 状态的命令（git add/commit/merge/rebase/reset/checkout/"
+            "cherry-pick/stash 等）——你的工作树正停在合并冲突状态，git 收口由控制平面完成，"
+            "你只负责把冲突文件的内容改成正确的合并结果（保留双方意图）。\n"
+            "完成后输出一段以 HANDOFF: 开头的摘要（解决了哪些冲突、如何取舍）。"
+        )
+        result = self.runner._turn(self.runner._state(), prompt, cwd=cwd)
+        if not result.get("ok"):
+            self.store.event("resolver", f"turn failed: {(result.get('error') or '')[:160]}")
+        handoff = _HANDOFF_RE.search(result.get("text") or "")
+        if handoff:
+            self.store.save_handoff(handoff.group(1).strip()[:2000])
+        unit = self._unit(index)
+        if unit is not None:
+            unit["state"] = unit["status"] = UNIT_EVALUATING
+            unit["worker"]["finishedAt"] = _now_ms()
+            unit["delta"] = None
             self._save_unit(unit)
         self.runner._mirror("evaluating", **payload)
         return True

@@ -447,6 +447,49 @@ class WorktreeManager:
                     return True
         return False
 
+    def resolution_state(self, index: int) -> str:
+        """M5-C.1 fail-closed classification of an in-progress unit merge:
+        "none" (no merge in progress), "markers" (regular two-sided text
+        conflict whose working files still carry conflict markers — resume
+        the resolver), "resolved" (every unmerged path is a plain two-sided
+        TEXT conflict, readable and marker-free — safe for the control
+        plane to conclude), "unsupported" (anything else: binary content,
+        one-sided stages like delete/modify, renames, unreadable files).
+        The whole point: "不知道是否已解决" must never be read as "已经解
+        决" — unsupported kinds never get an automatic decision."""
+        path = self._worktree_dir(index)
+        ok, _ = self._git(path, "rev-parse", "-q", "--verify", "MERGE_HEAD")
+        if not ok:
+            return "none"
+        ok, out = self._git(path, "ls-files", "-u")
+        if not ok:
+            return "unsupported"
+        stages: dict[str, dict[int, str]] = {}
+        for line in out.splitlines():
+            parts = line.split("\t", 1)
+            if len(parts) != 2:
+                continue
+            bits = parts[0].split()
+            if len(bits) < 3 or not bits[2].isdigit():
+                continue
+            stages.setdefault(parts[1].strip(), {})[int(bits[2])] = bits[1]
+        if not stages:
+            return "none"  # the merge concluded between the two probes
+        has_markers = False
+        for rel, by_stage in stages.items():
+            if 2 not in by_stage or 3 not in by_stage:
+                return "unsupported"  # delete/modify, rename, one-sided add
+            try:
+                text = (path / rel).read_text("utf-8")
+            except (OSError, UnicodeDecodeError):
+                return "unsupported"  # binary or unreadable
+            if "\x00" in text:
+                return "unsupported"  # binary
+            for line in text.splitlines():
+                if line.startswith(("<<<<<<<", ">>>>>>>")):
+                    has_markers = True
+        return "markers" if has_markers else "resolved"
+
     def conclude_unit_merge(self, index: int) -> dict[str, Any]:
         """Control-plane conclusion of a RESOLVED merge: the resolver worker
         is forbidden from git, so the control plane stages the edited files
