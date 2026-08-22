@@ -19,6 +19,7 @@ Each gate creates a mission via HTTP and asserts the P1.1 contract:
 """
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -28,8 +29,10 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-REPO = Path("/Users/lianb/Downloads/bh")
-CODEX_BIN = os.environ.get("GATE_CODEX_BIN", "/Users/lianb/.local/bin/codex")
+# repo root resolved from this script (scripts/..)
+REPO = Path(__file__).resolve().parent.parent
+CODEX_BIN = (os.environ.get("GATE_CODEX_BIN") or shutil.which("codex") or
+             "/Users/lianb/.local/bin/codex")
 PORT = int(os.environ.get("GATE_PORT", "8777"))
 BASE = f"http://127.0.0.1:{PORT}/"
 

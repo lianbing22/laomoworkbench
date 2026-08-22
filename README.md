@@ -18,7 +18,7 @@
 
 ## 它是什么
 
-老墨工作台是一个跑在你本机的 Agent 工作台。它不托管模型、不保存你的凭据到云端：Agent Runtime（默认 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)）跑在你自己的机器上，工作上下文留在你自己的文件夹里。
+老墨工作台是一个跑在你本机的 Agent 工作台。它不托管模型、不保存你的凭据到云端：Agent Runtime（默认 Codex `app-server`，模型服务由 Provider Profiles 配置）跑在你自己的机器上，工作上下文留在你自己的文件夹里。
 
 一句话分工：
 
@@ -44,6 +44,9 @@
 | 模型与推理强度 | 模型列表/五档推理等级（low~max）来自 Codex 真实目录，输入框旁即选即生效。 |
 | 沙箱权限 | 只读/工作区写入/完全访问三档，映射 Codex 沙箱策略，实时回读生效。 |
 | 目标与计划 | 设定目标自动驱动 Agent；计划步骤实时勾选；工具活动卡片实时展开。 |
+| Durable Mission（P1） | 目标 → 多单元计划 → 后台作业执行（Control Plane 全权持有 pid/进程组/身份）→ 验收/修复闭环；可暂停/resume/取消/崩溃恢复（PID 复用检测）。 |
+| Hard Verification（P1.1） | `blocked` 真终态、waiting pause/resume 语义、四桶时间账、机器验收门禁（command/requiredFiles/httpChecks 逐项存证）、DONE = 单元全 PASS + 机器 PASS + fresh Final Evaluator PASS、Evidence Manifest（path/sha256 不可变）。 |
+| Provider Profiles（P0.5） | 模型服务配置中心：baseUrl/APIKey/模型目录/推理等级，独立于 Runtime 切换。 |
 | Markdown 工作区 | 项目、知识、提示词与内容资料留在你拥有的文件夹，而不是云端数据库。 |
 | 长对话可用性 | 历史分页加载、流式投影与用户滚动分离，完成后自动切换富文本渲染。 |
 | 任务与中断交互 | 审批/提问队列化处理；运行中可引导（steer）或打断（interrupt）。 |
@@ -87,15 +90,18 @@ python3 web/boujoy_server.py --port 8766 --vault vault --static web
 
 ## 路线图
 
-**P0 已落地**：Runtime 层已完成解耦，纯净模式由 Codex app-server 驱动（12+2 项真实验收全过），知识模式保持 DSH，一条参数即可回退——详见 [CHANGELOG.md](CHANGELOG.md)。
-
-下一步（P1）：
+- **P0 已落地**：Runtime 层解耦，纯净模式由 Codex app-server 驱动（12+2 项真实验收全过），知识模式保持 DSH。
+- **P0.5 已落地**：Provider Profiles——模型服务配置中心（模型目录/推理等级/profile）。
+- **P1 已落地**：Durable Mission——目标自动规划多单元、后台作业生命周期、验收/修复闭环（真跑 8 个 Gate）。
+- **P1.1 已落地**：Reliability & Hard Verification——`blocked` 终态、waiting pause/resume、崩溃恢复（进程身份+PID 复用）、四桶时间账、机器验收门禁、DONE 三重条件、Evidence Manifest；真跑 Gate A–E 全 PASS（`scripts/gate_p11_driver.py`）。
+- **P1.2 进行中**：Parallel Mission Execution——DAG 依赖调度 + Git Worktree 隔离 + Integration 合并/冲突路径（MissionScheduler / WorktreeManager / IntegrationManager / ConflictResolver）。
+- **随后**：P1.3 Multi-Mission Scheduler → P1.4 Provider Role Routing（Planner/Worker/Evaluator 不同模型）→ P1.5 Vault/Knowledge Context Layer。
 
 ~~~text
                 老墨工作台
                     │
         ┌───────────┴───────────┐
-   产品控制层                工作台 UI
+   产品控制层（Mission）      工作台 UI
         │
   RuntimeAdapter
         │
@@ -103,10 +109,6 @@ python3 web/boujoy_server.py --port 8766 --vault vault --static web
   │     │             │
 Codex  DeepSeek     Claude/GLM
 ~~~
-
-- Vault → Codex：把知识库/专家卡变成 Codex 可消费的上下文层，知识模式切换到 Codex。
-- 任务队列与子代理面板（由老墨控制层拥有，不绑死任何引擎）。
-- 更多 Runtime Provider（Claude/GLM）。
 
 ## 常见问题
 
@@ -149,7 +151,9 @@ python3 tests/smoke_test.py --live-origin http://127.0.0.1:8766
 macos/      macOS 原生 WKWebView 宿主与构建脚本
 web/        本地网关、Web UI 与资源
 windows/    Windows 浏览器宿主 Beta 脚本与说明
-tests/      不依赖模型的 smoke test
+tests/      不依赖模型的 smoke test 与 P0/P1.1 全量回归 + DAG 单测
+scripts/    真跑门禁驱动（P1.1 Gate A–E；P1.2 Gate A–K）
+docs/       契约与协议说明（mission-contract.md 为 Mission 引擎三方契约）
 assets/     图标、字体归属与视觉资源
 ~~~
 

@@ -1,29 +1,36 @@
-# P1 Notes — P0 期间识别、明确延后的能力
+# 进展 Notes — 能力识别与延后决策
 
-P0（Clean Runtime Migration）范围外的事项记录于此，避免顺手实现导致范围膨胀。
+本文记录各阶段识别出的能力与决策状态。已完成项会标出落地位置，避免重做。
 
-## Codex Runtime 侧
+## 已完成
 
-- **rename**：`thread/name/set` 已存在，P0 前端调用返回 unsupported。接入工作量小。
-- **fork**：`thread/fork` 已存在，同上延后。
-- **queue**：DSH 的 steering queue 语义（session.updateQueue/session/queue 帧）不应硬映射到 Codex turn；
-  应由老墨自己的 Control Plane 拥有队列，再投影为 Codex turn/steer。
-- **完整 Workspace Manager**：workspace CRUD/排序/迁移/最近列表。P0 只有 cwd 映射（workspace.create 改 cwd）。
-- **session.search / subagent.* / goal.* / settings.* / credentials.* / skill.list / agentPreset.***：
-  前端会调用，P0 一律安全 stub（空集合/ok:false）。Codex 侧其实有 skills/list、thread/goal/set 可接。
-- **图片输入**：`_content_to_input` 已把 image 块转 data URL 传给 turn/start（协议支持），但未做端到端实测；
-  历史 attachment 读取（session.attachment）P0 未接。
-- **Codex remote daemon / WebSocket transport**：官方标注 experimental/unsupported，不进 P0。
-- **多 Runtime 选择器 UI**：Mode 与 Runtime 已解耦（RuntimeManager 配置），UI 暴露留给 P1。
+- **rename**：`thread/rename` 已接入（codex_adapter），前端可调用。
+- **fork**：`thread/fork` 已接入（codex_adapter，1700 行附近）。
+- **goal / 目标与计划**：Durable Mission 引擎（P1）：目标 → 多单元计划 → 后台作业
+  执行 → 验收/修复闭环 → 机器验收 + fresh Final Evaluator + Evidence Manifest，
+  见 `web/mission.py` 与 `docs/mission-contract.md`（P1.1 Hard Verification 已收口：
+  五真跑 Gate A–E 全 PASS，门禁脚本 `scripts/gate_p11_driver.py`）。
+- **queue / steering**：由 Mission 引擎的 pause/resume/cancel 与 waiting 作业状态
+  拥有（Control Plane 侧），不再投影为 DSH 语义。
+- **多 Runtime 选择器**：RuntimeManager + Provider Profiles（P0.5）已解耦
+  model provider（baseUrl/apiKey/模型目录），见 `web/provider_profiles.py`。
 
-## 架构侧
+## 识别待做（P1.2+ 排期）
 
-- **knowledge → Codex**：Vault/Expert/Style 上下文转 Codex 可消费的 Context Layer（thread/inject_items 或
-  baseInstructions），是 P1 的主战役。
-- **Tauri/Rust 原生后端 + codex-app-server-client crate**：消除进程边界的长期路线，P0 用 stdio 足够。
-- **capabilities 驱动 UI**：host.describe 已返回 capabilities{modelSelection,reasoningEffort,steer,interrupt,
-  fork,queue}，前端尚未消费；P1 可按能力渲染（如 Codex 下隐藏队列按钮）。
-- **turn/completed 折叠与 live 事件去重**：当前 turn/completed 会重放 items 兜底定稿，若 live 已发过
-  item/completed 会产生内容重复（前端以 assistant/message 定稿覆盖渲染，实际无碍）；P1 可按 item id 去重。
-- **stale writer 自愈**：app-server 异常退出留下的 rollout 锁（见 docs/codex-protocol-notes.md 坑 4），
-  P1 可加检测+提示或自动隔离该 thread。
+- **P1.2 Parallel Mission Execution**：DAG 依赖调度 + Git Worktree 隔离 +
+  Integration 合并/冲突路径（当前主线进行中：`MissionScheduler` / `WorktreeManager`
+  / `IntegrationManager` / `ConflictResolver`）。
+- **P1.3 Multi-Mission Scheduler**：多 Mission 同时运行（当前单 Mission 串/并行）。
+- **P1.4 Provider Role Routing**：Planner / Worker / Evaluator 使用不同模型。
+- **P1.5 Vault / Knowledge Context Layer**：Vault/Expert/Style 上下文转 Codex 可消费的
+  Context Layer（thread/inject_items 或 baseInstructions）。
+- **session.search / subagent.\* / settings.\* / credentials.\* / skill.list /
+  agentPreset.\***：前端会调用，仍为安全 stub（Codex 侧 skills/list、agentPreset
+  已存在，P1.4+ 视角色路由需要接入）。
+- **图片输入端到端实测**：`_content_to_input` 已把 image 块转 data URL（协议支持），
+  但未做端到端实测；历史 attachment 读取（session.attachment）未接。
+- **Codex remote daemon / WebSocket transport**：官方标注 experimental，不进排期。
+- **Tauri/Rust 原生后端 + codex-app-server-client crate**：消除进程边界的长期路线，
+  当前 stdio 足够。
+- **stale writer 自愈**：app-server 异常退出留下的 rollout 锁（docs/codex-protocol-notes.md
+  坑 4），P1 可加检测+提示或自动隔离该 thread。
