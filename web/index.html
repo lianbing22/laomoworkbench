@@ -142,17 +142,22 @@
                 <div class="composer-left">
                   <button id="attachButton" class="composer-tool attach-tool" title="添加图片" aria-label="添加图片"><span>＋</span><small>图片</small></button>
                   <input id="imageInput" class="hidden" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple>
-                  <select id="permissionSelect" class="inline-select" aria-label="权限模式">
-                    <option value="workspace-write">工作区写入</option>
-                    <option value="read-only">只读</option>
-                    <option value="danger-full-access">完全访问</option>
-                  </select>
-                  <select id="presetSelect" class="inline-select" aria-label="Agent 预设"><option value="">标准模式</option></select>
+                  <!-- Advanced runtime panel: provider / model / effort / permission / preset.
+                       Collapsed by default; one tap on the model summary reopens it. -->
+                  <div id="composerAdvanced" class="composer-advanced" aria-label="高级运行时设置">
+                    <button id="providerButton" class="composer-tool attach-tool provider-tool" type="button" title="模型服务" aria-label="模型服务"><span>⚙</span><small>服务</small></button>
+                    <select id="modelSelect" class="inline-select model-select" aria-label="模型"><option>读取模型…</option></select>
+                    <select id="effortSelect" class="inline-select effort-select" aria-label="推理强度" title="推理强度"><option value="">强度…</option></select>
+                    <select id="permissionSelect" class="inline-select" aria-label="权限模式">
+                      <option value="workspace-write">工作区写入</option>
+                      <option value="read-only">只读</option>
+                      <option value="danger-full-access">完全访问</option>
+                    </select>
+                    <select id="presetSelect" class="inline-select" aria-label="Agent 预设"><option value="">标准模式</option></select>
+                  </div>
                 </div>
                 <div class="composer-right">
-                  <button id="providerButton" class="composer-tool attach-tool provider-tool" type="button" title="模型服务" aria-label="模型服务"><span>⚙</span><small>服务</small></button>
-                  <select id="modelSelect" class="inline-select model-select" aria-label="模型"><option>读取模型…</option></select>
-                  <select id="effortSelect" class="inline-select effort-select" aria-label="推理强度" title="推理强度"><option value="">强度…</option></select>
+                  <button id="modelSummaryButton" class="model-summary" type="button" aria-expanded="false" aria-controls="composerAdvanced" title="高级运行时设置"><span id="modelSummaryLabel" class="model-summary-label">模型读取中…</span><i class="model-summary-caret" aria-hidden="true">▸</i></button>
                   <button id="cancelButton" class="stop-button hidden" type="button">■ 停止</button>
                   <button id="sendButton" class="send-button" type="button" aria-label="发送或停止">↑</button>
                 </div>
@@ -163,11 +168,14 @@
 
         <aside id="activityPanel" class="activity-panel">
           <div class="panel-label"><span>LIVE SIGNAL</span><button id="toggleActivity" title="收起">×</button></div>
+          <!-- Compact agent strip: parallel workers/evaluator reserved for P1.2.
+               Rendered as chips ([W1 RUN] [W2 WAIT] [E1 CHECK]) — never full cards. -->
+          <div id="agentStrip" class="agent-strip" role="list" aria-label="Agent 并行状态"></div>
           <div id="signalCard" class="signal-card"><small id="signalKicker">当前目标</small><strong id="currentGoal">尚未设定</strong><div id="goalActions"><button id="goalButton">设定目标</button></div><div id="missionView" class="mission-view"><div class="mission-meta"><span id="missionPhase" class="mission-phase tone-muted">—</span><span id="missionCycles" class="mission-chip">循环 0</span></div><strong id="missionObjective">…</strong><div class="mission-rows"><div class="mission-row" id="missionTaskRow"><span>当前任务</span><b id="missionTask">—</b></div><div class="mission-row hidden" id="missionWaitingRow"><span>后台作业</span><b id="missionWaiting">—</b></div><div class="mission-row hidden" id="missionVerdictRow"><span>最近判定</span><b id="missionVerdict" class="mission-verdict">—</b></div><div class="mission-row hidden" id="missionCheckpointRow"><span>检查点</span><b id="missionCheckpoint">—</b></div><div class="mission-row"><span>运行时长</span><b id="missionElapsed">—</b></div></div><div id="missionActions" class="mission-actions"></div></div><div id="contextMeter" class="context-meter hidden"></div><button id="pendingInterruptBar" class="interrupt-bar hidden" type="button">⚠ Agent 正在等待你的审批/回答，点击处理</button><div class="capture-row"><button id="captureButton" type="button" title="让模型判断本次对话是否有长期价值，并按规则沉淀">⇣ 沉淀本次对话</button><span id="captureStatus" class="capture-status"></span></div></div>
-          <div class="activity-section"><h3>计划</h3><div id="planList" class="plan-list"><p class="muted">Agent 创建计划后会显示在这里。</p></div></div>
-          <div class="activity-section"><h3>任务队列</h3><div id="queueList" class="queue-list"><p class="muted">没有排队任务。</p></div></div>
-          <div class="activity-section"><h3>子代理</h3><div id="subagentList" class="subagent-list"><p class="muted">没有子代理。</p></div></div>
-          <div class="activity-section"><h3>运行记录</h3><div id="toolActivity" class="tool-activity"><p class="muted">工具调用将在这里实时展开。</p></div></div>
+          <details class="activity-section" id="planSection" open><summary>计划<small>PROGRESS</small></summary><div id="planList" class="plan-list"><p class="muted">Agent 创建计划后会显示在这里。</p></div></details>
+          <details class="activity-section" id="queueSection"><summary>任务队列<small>QUEUE</small></summary><div id="queueList" class="queue-list"><p class="muted">没有排队任务。</p></div></details>
+          <details class="activity-section" id="subagentSection"><summary>子代理<small>AGENTS</small></summary><div id="subagentList" class="subagent-list"><p class="muted">没有子代理。</p></div></details>
+          <details class="activity-section" id="toolSection"><summary>运行记录<small>ACTIVITY</small></summary><div id="toolActivity" class="tool-activity"><p class="muted">工具调用将在这里实时展开。</p></div></details>
         </aside>
       </section>
 
@@ -221,6 +229,7 @@
           <div><p class="section-kicker">USAGE / TRAJECTORY / EFFORT</p><h2>看得见每一次<br><span>思考的成本。</span></h2><p>Token 用量、缓存命中、运行轨迹与推理强度，全部来自真实运行数据。</p></div>
           <button id="monitorRefresh" class="mini-cut">↻ 刷新</button>
         </div>
+        <div id="monitorEmptyHint" class="monitor-empty-hint">选择一个运行中的会话查看 Token / Context / Tool Trace</div>
         <div class="monitor-grid">
           <article class="monitor-card token-card">
             <div class="monitor-card-head"><h3>TOKEN 用量</h3><span id="tokenSessionLabel">当前会话</span></div>

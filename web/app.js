@@ -1095,6 +1095,7 @@ async function loadModels() {
     return `<option value="${escapeHtml(JSON.stringify({ model, provider, reasoningEffort: effort }))}" ${model === current ? "selected" : ""}>${escapeHtml(item.name || item.label || item.displayName || model || "模型")}</option>`;
   }).join("") || `<option>${escapeHtml(current || "默认模型")}</option>`;
   renderEffortOptions(current);
+  updateModelSummary();
 }
 
 // Reasoning-effort dropdown beside the model selector. Options come from the
@@ -1122,6 +1123,7 @@ async function applyEffort() {
     const current = state.modelDirectory?.current || {};
     await rpc("session.selectModel", { sessionId: state.sessionId, model: model || current.model, provider: provider || current.provider, reasoningEffort: effort });
     if (state.modelDirectory?.current) state.modelDirectory.current.reasoningEffort = effort;
+    updateModelSummary();
     toast(`推理强度已设为 ${effort}`);
   } catch (error) { toast(error.message, true); }
 }
@@ -2204,6 +2206,7 @@ async function selectModel() {
     await rpc("session.selectModel", { sessionId: state.sessionId, model: selected.model, provider: selected.provider, reasoningEffort: selected.reasoningEffort || undefined });
     if (state.modelDirectory?.current) state.modelDirectory.current.model = selected.model;
     renderEffortOptions(selected.model);
+    updateModelSummary();
     toast(`已切换到 ${selected.model}`);
   } catch (error) { toast(error.message, true); }
 }
@@ -2223,6 +2226,7 @@ async function applyPermission(value) {
     if (actual !== value) throw new Error(`Harness 回读权限为 ${actual || "未知"}，切换未生效`);
     select.value = actual;
     select.dataset.current = actual;
+    updateModelSummary();
     toast(`权限已切换并回读：${actual === "read-only" ? "只读" : actual === "danger-full-access" ? "完全访问" : "工作区写入"}`);
   } catch (error) {
     select.value = state.projection?.permissions?.currentValue || select.dataset.current || "workspace-write";
@@ -2702,6 +2706,7 @@ function renderMission() {
     ? { sec: Number(mission.elapsedSec) || 0, at: Date.now() }
     : null;
   $("#missionActions").innerHTML = missionActionsHtml(mission);
+  renderAgentStrip();
 }
 
 function tickMissionElapsed() {
@@ -3981,6 +3986,8 @@ function monitorSessionLabel() {
 }
 
 function renderMonitor() {
+  const emptyHint = $("#monitorEmptyHint");
+  if (emptyHint) emptyHint.classList.toggle("hidden", Boolean(state.sessionId));
   const projection = state.projection || {};
   const usage = projection.tokenUsage || {};
   const input = usage.uncachedInputTokens ?? 0;
@@ -4172,5 +4179,60 @@ window.Boujoy = {
   nativeModeReady(clean) { if (Boolean(clean) === (state.mode === "clean")) waitForHarness(); },
   receivePrompt(text, send = false) { showPage("agent"); $("#promptInput").value = text; autoResizePrompt(); if (send) sendPrompt(text); },
 };
+
+/* ============================================================
+   UI Refinement 1.0 — minimal, additive wiring:
+   model-summary chip, advanced runtime toggle, agent strip.
+   ============================================================ */
+
+function updateModelSummary() {
+  const label = $("#modelSummaryLabel");
+  if (!label) return;
+  const current = state.modelDirectory?.current || {};
+  let provider = current.providerName || current.provider || "";
+  let model = current.model || "";
+  const selected = state.models.find(item => (item.model || item.id) === model);
+  if (!provider && selected) provider = selected.providerName || selected.provider || "";
+  if (!model && selected) model = selected.model || "";
+  if (!provider && state.host) provider = state.host.provider || "";
+  if (!model && state.host) model = state.host.model || "";
+  let effort = current.reasoningEffort || selected?.reasoning?.defaultEffort || current.reasoning?.defaultEffort || "";
+  const parts = [];
+  if (provider) parts.push(String(provider));
+  if (model) parts.push(String(model));
+  if (effort) parts.push(String(effort)[0].toUpperCase() + String(effort).slice(1));
+  label.textContent = parts.length ? parts.join(" · ") : "模型读取中…";
+  label.title = label.textContent;
+}
+
+function renderAgentStrip() {
+  const strip = $("#agentStrip");
+  if (!strip) return;
+  const units = state.missionDetail?.plan?.units || state.mission?.units || [];
+  if (!Array.isArray(units) || units.length < 2) { strip.innerHTML = ""; return; }
+  const statusMap = {
+    running: "RUN", in_progress: "RUN", active: "RUN",
+    waiting: "WAIT", queued: "WAIT", pending: "WAIT",
+    evaluating: "CHECK", vetting: "CHECK", verifying: "CHECK",
+    completed: "DONE", complete: "DONE", passed: "DONE", done: "DONE",
+    failed: "FAIL", needs_fix: "FIX", idled: "IDLE",
+  };
+  strip.innerHTML = units.map((unit, index) => {
+    const raw = String(unit.state || unit.status || unit.stateLabel || "idle").toLowerCase();
+    const tag = statusMap[raw] || (raw === "idle" ? "IDLE" : String(raw).slice(0, 4).toUpperCase());
+    const name = unit.shortName || unit.title || unit.index || unit.id || `U${index + 1}`;
+    return `<span class="agent-strip-chip chip-${tag.toLowerCase()}" role="listitem"><i></i><b>${escapeHtml(String(name).slice(0, 6))}</b><span>${tag}</span></span>`;
+  }).join("");
+}
+
+(function wireModelSummary() {
+  const toggle = $("#modelSummaryButton");
+  const panel = $("#composerAdvanced");
+  if (!toggle || !panel) return;
+  toggle.addEventListener("click", () => {
+    const open = panel.classList.toggle("open");
+    toggle.setAttribute("aria-expanded", open ? "true" : "false");
+  });
+})();
 
 init();
