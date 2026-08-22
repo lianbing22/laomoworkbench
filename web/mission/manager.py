@@ -858,8 +858,26 @@ class MissionRunner(threading.Thread):
                                              "reconciled": True,
                                              "locks": report["external"]})
             return "external-lock"
+        # adoption: which sha proves the merge landed?
+        #  * clean prepare: the recorded tx.unitHead itself
+        #  * dirty prepare (the NORMAL real-worker case: uncommitted work at
+        #    prepare; integrate() committed it and merged): the recorded
+        #    unitHead is the pre-commit base and can never prove anything —
+        #    re-derive from the CURRENT unit branch head, valid because
+        #    reconcile runs with nothing in flight and the control plane is
+        #    the repo's only writer (clean tree + reachable head = landed)
+        adopted = None
         if tx.get("unitHead") and not tx.get("dirty") \
                 and wtree.is_merged(str(tx["unitHead"])):
+            adopted = str(tx["unitHead"])
+        else:
+            current = wtree.rev(Path(str(info["path"]))) \
+                if info.get("path") else None
+            if current and not wtree.is_dirty(index) \
+                    and wtree.unit_merge_state(index) != "conflicted" \
+                    and wtree.is_merged(current):
+                adopted = current
+        if adopted:
             head = wtree.rev(wtree.integration_dir()) \
                 or wtree.rev(wtree.workspace)
             unit["integration"] = {**tx, "phase": "merged", "headSha": head,
@@ -870,7 +888,7 @@ class MissionRunner(threading.Thread):
             self.store.write_progress_md()
             self.store.event("integration", {"unit": index, "phase": "integrated",
                                              "reconciled": True,
-                                             "alreadyMerged": tx.get("unitHead"),
+                                             "alreadyMerged": adopted,
                                              "headSha": head})
             wtree.cleanup(index, branch=info.get("branch"))
             unit["integration"] = {**unit["integration"], "phase": "cleaned"}

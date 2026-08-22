@@ -684,6 +684,45 @@ class IntegrationReconcileTest(WorktreeTest):
         self.assertEqual(git(self.repo, "rev-parse", "HEAD"), self.initial_sha)
         self.assertFalse((self.repo / "shared.txt").exists())
 
+    def test_crash_after_merge_dirty_tx_adopts_current_head(self):
+        """M5/H：真实 worker 不提交（prepare 时树脏）→ tx.unitHead 只是提交前
+        基线，无法证明合并已落。崩溃恢复时从当前单元分支头重推导：树干净 +
+        头已可达集成分支 → 采纳（不重放、不产生重复提交）。"""
+        mid = self.create()
+        store = self.mgr.store_for(mid)
+        wm = WorktreeManager(str(self.repo), store, mid)
+        info = wm.ensure(0, "单元A")
+        wt = Path(info["path"])
+        base_head = wm.rev(wt)  # tx.unitHead 会记录这个（脏树基线）
+        (wt / "feature-1.txt").write_text("from unit worker 1\n", "utf-8")
+        # 崩溃进程：commit + merge 都真实完成（merge 落在集成工作树），
+        # 但 plan 停在 integrating/prepared
+        git(wt, "add", "-A")
+        git(wt, "commit", "-q", "-m", "unit 0 work")
+        committed = wm.rev(wt)
+        integ = wm.ensure_integration()
+        git(integ["path"], "merge", "--no-edit", info["branch"])
+        tx = {"phase": "prepared", "branch": info["branch"],
+              "unitHead": base_head, "dirty": True, "startedAt": 1}
+        self.craft_crash(mid, "integrating", tx, {**info, "headSha": committed})
+
+        self.mgr.start(mid)
+        self.assertEqual(self.wait_terminal(mid, timeout=30), "done")
+
+        adopted = [d for d in self.integ_events(mid, 0)
+                   if d.get("phase") == "integrated" and d.get("reconciled")]
+        self.assertEqual(len(adopted), 1,
+                         "应走采纳路径而非重放: %r" % self.integ_events(mid, 0))
+        self.assertEqual(adopted[0].get("alreadyMerged"), committed,
+                         "采纳的是当前单元头（重推导），不是脏基线")
+        plan = self.plan(mid)
+        self.assertEqual(plan["units"][0]["state"], "integrated")
+        self.assertEqual(
+            len(git(self.repo, "log", "--oneline",
+                    wm.integration_branch, "--", "feature-1.txt")
+                .splitlines()), 1, "不得产生重复提交")
+        self.assertEqual(git(self.repo, "rev-parse", "HEAD"), self.initial_sha)
+
     def test_stale_index_lock_cleared_on_reconcile(self):
         """硬崩溃残留 index.lock：mission 自有 worktree 锁被清除；用户主
         仓库的锁是 external —— fail closed：不删除、集成等待（带退避重试），

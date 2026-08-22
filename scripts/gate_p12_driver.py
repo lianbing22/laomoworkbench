@@ -32,6 +32,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -1948,6 +1949,304 @@ def gate_g(ev: Evidence, scratch: Path) -> dict:
     return result
 
 
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+H_UNIT = ("创建 h.txt，内容恰好为一行：REAL-H-INTEGRATION。"
+          "除此以外不要创建或修改任何文件，不要执行 git 命令。")
+
+
+def gate_h_child(phase: str, scratch_s: str, evdir_s: str) -> int:
+    """Gate H child: phase1 freezes the process EXACTLY in the integration
+    WAL window (real merge landed, plan.json still integrating/prepared) via
+    a driver-side wrap of WorktreeManager.integrate; phase2 is the new
+    control plane calling recover() only."""
+    scratch = Path(scratch_s)
+    ev = Evidence(Path(evdir_s))
+    repo = scratch / "fixture-h" / "repo"
+    adapter = CodexRuntimeAdapter(bin_path=GATE_BIN, default_cwd=str(repo),
+                                  debug_log=ev.log)
+    tap = TurnTap(ev, adapter)
+    ptap = PromptTap(ev, adapter)
+    mgr = MissionManager(adapter, repo)
+
+    def appserver_pid():
+        proc = adapter.process
+        return proc.proc.pid if proc and proc.proc else None
+
+    if phase == "phase1":
+        from mission import worktree as wt_mod
+        original = wt_mod.WorktreeManager.integrate
+        wedged = threading.Event()
+
+        def wedging(self, index, title=None, branch=None):
+            res = original(self, index, title, branch)
+            if res.get("ok") and not wedged.is_set():
+                wedged.set()
+                plan = self.store.load_plan()
+                unit = next(u for u in plan["units"] if u["index"] == index)
+                tx = unit.get("integration") or {}
+
+                def g(*args):
+                    return subprocess.run(
+                        ["git", "-C", str(self.workspace), *args],
+                        capture_output=True, text=True).stdout.strip()
+
+                integ_head = g("rev-parse", self.integration_branch)
+                ancestor = subprocess.run(
+                    ["git", "-C", str(self.workspace), "merge-base",
+                     "--is-ancestor", str(tx.get("unitHead")),
+                     self.integration_branch]).returncode == 0
+                mission = json.loads(
+                    (self.store.root / "mission.json").read_text("utf-8"))
+                base = mission.get("baseSha")
+                events = [json.loads(l) for l in
+                          (self.store.root / "events.ndjson")
+                          .read_text("utf-8").splitlines() if l.strip()]
+                scene = {
+                    "gatewayPid": os.getpid(), "appserverPid": appserver_pid(),
+                    "missionId": self.store.root.name,
+                    "unitState": unit.get("state"),
+                    "txPhase": tx.get("phase"),
+                    "unitHead": tx.get("unitHead"), "dirty": tx.get("dirty"),
+                    "unitHeadAtCrash": (
+                        subprocess.run(["git", "-C", str(info_path), "rev-parse",
+                                        "HEAD"], capture_output=True,
+                                       text=True).stdout.strip()
+                        if (info_path := str((unit.get("worktree") or {})
+                                             .get("path") or "")) else None),
+                    "lastVerdict": unit.get("lastVerdict"),
+                    "integrationBranch": self.integration_branch,
+                    "integrationHeadAtCrash": integ_head,
+                    "unitHeadIsAncestor": ancestor,
+                    "hTxt": g("show", f"{self.integration_branch}:h.txt"),
+                    "integratedEvents": sum(
+                        1 for e in events if e["type"] == "integration"
+                        and isinstance(e.get("detail"), dict)
+                        and e["detail"].get("phase") == "integrated"),
+                    "commitCount": (int(g("rev-list", "--count",
+                                           f"{base}..{integ_head}"))
+                                    if base else None),
+                    "workerTurns": tap.unit_turns("/u0"),
+                    "evaluatorTurnCount": len(
+                        [c for c in ptap.in_cwd("/u0") if c["read_only"]]),
+                    "workerTurnCount": len(
+                        [c for c in ptap.in_cwd("/u0") if not c["read_only"]]),
+                    "ts": time.time(),
+                }
+                (ev.root / "wedge-scene.json").write_text(
+                    json.dumps(scene, ensure_ascii=False, indent=1), "utf-8")
+                ev.log("WEDGE: merge landed; frozen before plan persistence "
+                       "(awaiting SIGKILL)")
+                while True:
+                    time.sleep(1.0)  # supervisor SIGKILLs us here
+            return res
+
+        wt_mod.WorktreeManager.integrate = wedging
+        created = mgr.create(
+            "单单元：创建 h.txt 并完成集成",
+            cwd=str(repo), acceptance_criteria=["h.txt 内容正确"],
+            verification={"requiredFiles": ["h.txt"],
+                          "commands": ["grep -q REAL-H-INTEGRATION h.txt"]})
+        mid = created["mission"]["id"]
+        store = mgr.store_for(mid)
+        h_unit = {"id": "h", "index": 0, "title": "单元H",
+                  "description": H_UNIT,
+                  "acceptance": ["h.txt 存在且内容包含 REAL-H-INTEGRATION"],
+                  "dependencies": [], "state": "pending", "status": "pending",
+                  "attempt": 0, "repairCount": 0, "conflictCount": 0,
+                  "conflict": None,
+                  "worktree": {"path": None, "branch": None,
+                               "baseSha": None, "headSha": None},
+                  "jobId": None, "delta": None, "repairDirective": None,
+                  "lastVerdict": None,
+                  "worker": {"startedAt": None, "finishedAt": None},
+                  "integration": None}
+        store.save_plan({"version": 2, "replans": 0, "gitIntegration": True,
+                         "units": [h_unit]})
+        store.save_state({"state": "running", "cycles": 0, "currentUnit": 0,
+                          "noProgress": 0, "progressSignature": "",
+                          "tokensUsed": 0, "wallElapsedMs": 0,
+                          "agentActiveMs": 0, "waitingMs": 0, "pausedMs": 0,
+                          "phaseStartedAt": 0})
+        mgr.start(mid)
+        deadline = time.monotonic() + MISSION_TIMEOUT
+        while time.monotonic() < deadline:
+            st = mgr.status(mid)["mission"]
+            if st.get("state") in ("done", "failed", "blocked", "cancelled"):
+                ev.log(f"phase1 terminal WITHOUT wedge: {st.get('state')}")
+                return 1
+            time.sleep(POLL)
+        return 1
+
+    # phase2: recover() only — let the official recovery chain find the wedge
+    t_recover = time.time()
+    resumed = mgr.recover()
+    mid = resumed[0] if resumed else ""
+    state = {}
+    deadline = time.monotonic() + MISSION_TIMEOUT
+    while mid and time.monotonic() < deadline:
+        state = mgr.status(mid)["mission"]
+        if state.get("state") in ("done", "failed", "blocked", "cancelled"):
+            break
+        time.sleep(POLL)
+    (ev.root / "phase2-result.json").write_text(json.dumps({
+        "gatewayPid": os.getpid(), "appserverPid": appserver_pid(),
+        "resumed": resumed, "missionId": mid,
+        "finalState": state.get("state"), "recoverAt": t_recover,
+        "u0WorkerTurns": [c for c in ptap.in_cwd("/u0") if not c["read_only"]],
+        "u0EvaluatorTurns": [c for c in ptap.in_cwd("/u0") if c["read_only"]],
+    }, ensure_ascii=False, indent=1), "utf-8")
+    adapter.shutdown()
+    ev.close()
+    return 0 if state.get("state") == "done" else 1
+
+
+def gate_h(ev: Evidence, scratch: Path) -> dict:
+    ev.log("Gate H — Integration WAL Crash Reconcile (freeze in the "
+           "merge-landed / plan-not-persisted window)")
+    repo = scratch / "fixture-h" / "repo"
+    base_sha = init_fixture(repo)
+    before = porcelain(repo)
+    checks: dict[str, bool] = {}
+    detail: dict = {}
+    child1 = None
+    try:
+        child1 = subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__),
+             "--gate-h-child", "phase1", str(scratch), str(ev.root)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        scene = {}
+        deadline = time.monotonic() + 300
+        while time.monotonic() < deadline:
+            sp = ev.root / "wedge-scene.json"
+            if sp.is_file():
+                try:
+                    scene = json.loads(sp.read_text("utf-8"))
+                    break
+                except Exception:
+                    pass
+            time.sleep(0.2)
+        checks["real-worker-pass"] = bool(
+            scene and scene.get("workerTurnCount", 0) >= 1
+            and scene.get("evaluatorTurnCount", 0) >= 1
+            and scene.get("lastVerdict") == "PASS")
+        checks["wal-prepared"] = bool(
+            scene and scene.get("unitState") == "integrating"
+            and scene.get("txPhase") == "prepared")
+        checks["tx-honest"] = bool(
+            scene and scene.get("unitHead")
+            and isinstance(scene.get("dirty"), bool)
+            and scene.get("unitHeadAtCrash"))
+        ancestor_recheck = subprocess.run(
+            ["git", "-C", str(repo), "merge-base", "--is-ancestor",
+             str(scene.get("unitHead")), scene.get("integrationBranch")]
+        ).returncode == 0 if scene else False
+        checks["git-merge-landed"] = bool(
+            scene.get("unitHeadIsAncestor") and ancestor_recheck)
+        checks["artifact-on-integration"] = bool(
+            scene and "REAL-H-INTEGRATION" in str(scene.get("hTxt")))
+        checks["plan-not-yet-integrated"] = bool(
+            scene and scene.get("integratedEvents") == 0
+            and scene.get("unitState") != "integrated")
+        detail["wedgeScene"] = {k: scene.get(k) for k in
+                                ("gatewayPid", "appserverPid", "missionId",
+                                 "unitState", "txPhase", "unitHead", "dirty",
+                                 "integrationHeadAtCrash", "commitCount")}
+        if not scene:
+            raise AssertionError("wedge scene never appeared")
+        mid = scene["missionId"]
+        runs = repo / ".laomo" / "runs" / mid
+        ev.log(f"wedge scene ready (mid={mid}); SIGKILL gateway "
+               f"{scene['gatewayPid']}")
+
+        plan_pre = json.loads((runs / "plan.json").read_text("utf-8"))
+        os.kill(child1.pid, signal.SIGKILL)
+        child1.wait()
+        checks["gateway-sigkill-real"] = not pid_alive(child1.pid)
+
+        time.sleep(4.0)  # crash gap
+        old_app = scene.get("appserverPid")
+        plan_post = json.loads((runs / "plan.json").read_text("utf-8"))
+        u0_post = plan_post["units"][0]
+        integ_head_gap = git(repo, "rev-parse", scene["integrationBranch"])
+        checks["crash-state-preserved"] = bool(
+            old_app and not pid_alive(old_app)
+            and u0_post.get("state") == "integrating"
+            and (u0_post.get("integration") or {}).get("phase") == "prepared")
+        checks["integration-head-stable"] = (
+            integ_head_gap == scene["integrationHeadAtCrash"])
+        detail["gap"] = {"appserverDead": not pid_alive(old_app),
+                         "integrationHead": integ_head_gap}
+
+        child2 = subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__),
+             "--gate-h-child", "phase2", str(scratch), str(ev.root)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        rc = child2.wait(timeout=MISSION_TIMEOUT + 120)
+        p2 = json.loads((ev.root / "phase2-result.json").read_text("utf-8"))
+        checks["recover-found-mission"] = mid in (p2.get("resumed") or [])
+        detail["phase2"] = {k: p2.get(k) for k in
+                            ("gatewayPid", "appserverPid", "resumed",
+                             "finalState")}
+
+        events = [json.loads(l) for l in
+                  (runs / "events.ndjson").read_text("utf-8").splitlines()
+                  if l.strip()]
+        adoption = next((e for e in events
+                         if e["type"] == "integration"
+                         and isinstance(e.get("detail"), dict)
+                         and e["detail"].get("phase") == "integrated"
+                         and e["detail"].get("reconciled")), None)
+        provable = (scene.get("unitHead") if scene.get("dirty") is False
+                    else scene.get("unitHeadAtCrash"))
+        checks["reconciled-adoption-event"] = bool(
+            adoption
+            and adoption["detail"].get("alreadyMerged") == provable
+            and adoption["detail"].get("headSha")
+            == scene.get("integrationHeadAtCrash"))
+        detail["adoptionEvent"] = adoption.get("detail") if adoption else None
+
+        final_head = git(repo, "rev-parse", scene["integrationBranch"])
+        final_count = int(git(repo, "rev-list", "--count",
+                              f"{base_sha}..{final_head}"))
+        checks["integration-head-not-duplicated"] = (
+            final_head == scene["integrationHeadAtCrash"]
+            and final_count == scene.get("commitCount"))
+        checks["worker-not-replayed"] = len(p2.get("u0WorkerTurns") or []) == 0
+        checks["evaluator-not-replayed"] = len(p2.get("u0EvaluatorTurns") or []) == 0
+
+        plan_final = json.loads((runs / "plan.json").read_text("utf-8"))
+        u0_final = plan_final["units"][0]
+        checks["unit-integrated-cleaned"] = (
+            u0_final.get("state") == "integrated"
+            and (u0_final.get("integration") or {}).get("phase") == "cleaned")
+        checks["source-isolation"] = (
+            p2.get("finalState") == "done"
+            and git(repo, "rev-parse", "HEAD") == base_sha
+            and porcelain(repo) == before
+            and not (repo / "h.txt").exists())
+        detail["final"] = {"head": final_head, "commitCount": final_count,
+                           "child2Rc": rc}
+    finally:
+        if child1 and child1.poll() is None:
+            child1.kill()
+
+    verdict = all(checks.values())
+    result = {"gate": "H", "checks": checks, "detail": detail,
+              "verdict": "PASS" if verdict else "FAIL"}
+    ev.write("summary.json", result)
+    ev.log(f"Gate H verdict: {result['verdict']} checks={checks}")
+    return result
+
+
+# ---------------------------------------------------------------- registry
+
 # ---------------------------------------------------------------- registry
 
 # ---------------------------------------------------------------- registry
@@ -1973,6 +2272,7 @@ GATES = {
     "E": lambda ev, scratch: gate_e(ev, scratch),
     "F": lambda ev, scratch: gate_f(ev, scratch),
     "G": lambda ev, scratch: gate_g(ev, scratch),
+    "H": lambda ev, scratch: gate_h(ev, scratch),
 }
 
 
@@ -1984,6 +2284,8 @@ def report(results: list[dict]) -> None:
 
 
 def main() -> int:
+    if len(sys.argv) >= 5 and sys.argv[1] == "--gate-h-child":
+        return gate_h_child(sys.argv[2], sys.argv[3], sys.argv[4])
     if len(sys.argv) >= 4 and sys.argv[1] == "--gate-g-child":
         phase = sys.argv[2]
         scratch = Path(sys.argv[3]).resolve()
