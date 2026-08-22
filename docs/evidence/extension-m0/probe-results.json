@@ -1,0 +1,1428 @@
+{
+ "codexVersion": "0.149.0-alpha.4.1",
+ "probedAt": "2026-08-23T06:35:15+0800",
+ "initialize": {
+  "userAgent": "laomo-m0-probe/0.149.0-alpha.4.1 (Mac OS 26.5.1; arm64) unknown (laomo-m0-probe; 0.1)",
+  "codexHome": "/Users/lianb/.codex",
+  "platformFamily": "unix",
+  "platformOs": "macos"
+ },
+ "pluginList": {
+  "marketplaces": [
+   {
+    "name": "openai-primary-runtime",
+    "path": "/Users/lianb/.cache/codex-runtimes/codex-primary-runtime/plugins/openai-primary-runtime/.agents/plugins/marketplace.json",
+    "interface": null,
+    "plugins": [
+     {
+      "id": "documents@openai-primary-runtime",
+      "name": "documents",
+      "installed": true,
+      "enabled": true,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_USE",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": null,
+      "localVersion": "26.819.11345",
+      "version": null
+     },
+     {
+      "id": "pdf@openai-primary-runtime",
+      "name": "pdf",
+      "installed": true,
+      "enabled": true,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_USE",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": null,
+      "localVersion": "26.819.11345",
+      "version": null
+     },
+     {
+      "id": "spreadsheets@openai-primary-runtime",
+      "name": "spreadsheets",
+      "installed": true,
+      "enabled": true,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_USE",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": null,
+      "localVersion": "26.819.11345",
+      "version": null
+     },
+     {
+      "id": "presentations@openai-primary-runtime",
+      "name": "presentations",
+      "installed": true,
+      "enabled": true,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_USE",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": null,
+      "localVersion": "26.819.11345",
+      "version": null
+     },
+     {
+      "id": "template-creator@openai-primary-runtime",
+      "name": "template-creator",
+      "installed": true,
+      "enabled": true,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_USE",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": null,
+      "localVersion": "26.819.11345",
+      "version": null
+     }
+    ],
+    "pluginCount": 5
+   },
+   {
+    "name": "openai-bundled",
+    "path": "/Users/lianb/.codex/.tmp/bundled-marketplaces/openai-bundled/.agents/plugins/marketplace.json",
+    "interface": {
+     "displayName": "OpenAI Bundled"
+    },
+    "plugins": [
+     {
+      "id": "codex-app-tools@openai-bundled",
+      "name": "codex-app-tools",
+      "installed": true,
+      "enabled": true,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": null,
+      "localVersion": "0.1.0",
+      "version": null
+     },
+     {
+      "id": "sites@openai-bundled",
+      "name": "sites",
+      "installed": true,
+      "enabled": true,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": null,
+      "localVersion": "0.1.43",
+      "version": null
+     },
+     {
+      "id": "browser@openai-bundled",
+      "name": "browser",
+      "installed": true,
+      "enabled": true,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": null,
+      "localVersion": "26.818.41509",
+      "version": null
+     },
+     {
+      "id": "chrome@openai-bundled",
+      "name": "chrome",
+      "installed": true,
+      "enabled": true,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": null,
+      "localVersion": "26.818.41509",
+      "version": null
+     },
+     {
+      "id": "computer-use@openai-bundled",
+      "name": "computer-use",
+      "installed": true,
+      "enabled": true,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": null,
+      "localVersion": "1.0.1000816",
+      "version": null
+     },
+     {
+      "id": "messages@openai-bundled",
+      "name": "messages",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": null,
+      "localVersion": "1.0.1000816",
+      "version": null
+     },
+     {
+      "id": "record-and-replay@openai-bundled",
+      "name": "record-and-replay",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": null,
+      "localVersion": "1.0.1000816",
+      "version": null
+     },
+     {
+      "id": "latex@openai-bundled",
+      "name": "latex",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": null,
+      "localVersion": "0.2.6",
+      "version": null
+     },
+     {
+      "id": "visualize@openai-bundled",
+      "name": "visualize",
+      "installed": true,
+      "enabled": true,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": null,
+      "localVersion": "1.0.22",
+      "version": null
+     }
+    ],
+    "pluginCount": 9
+   },
+   {
+    "name": "openai-curated-remote",
+    "path": null,
+    "interface": {
+     "displayName": "OpenAI Curated Remote"
+    },
+    "plugins": [
+     {
+      "id": "gmail@openai-curated-remote",
+      "name": "gmail",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "0.1.9"
+     },
+     {
+      "id": "github@openai-curated-remote",
+      "name": "github",
+      "installed": true,
+      "enabled": true,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": "0.1.11-5f7cd798dc99",
+      "version": "0.1.11-5f7cd798dc99"
+     },
+     {
+      "id": "google-drive@openai-curated-remote",
+      "name": "google-drive",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "0.1.11"
+     },
+     {
+      "id": "google-calendar@openai-curated-remote",
+      "name": "google-calendar",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "1.2.6"
+     },
+     {
+      "id": "notion@openai-curated-remote",
+      "name": "notion",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "0.1.7"
+     },
+     {
+      "id": "slack@openai-curated-remote",
+      "name": "slack",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "0.1.7"
+     },
+     {
+      "id": "outlook-email@openai-curated-remote",
+      "name": "outlook-email",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "0.1.7"
+     },
+     {
+      "id": "canva@openai-curated-remote",
+      "name": "canva",
+      "installed": true,
+      "enabled": true,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": "14.0.0",
+      "version": "14.0.0"
+     },
+     {
+      "id": "outlook-calendar@openai-curated-remote",
+      "name": "outlook-calendar",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "0.1.8"
+     },
+     {
+      "id": "app-69f3c30d68288191bbd428a394a78407@openai-curated-remote",
+      "name": "app-69f3c30d68288191bbd428a394a78407",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "1.0.0"
+     },
+     {
+      "id": "granola@openai-curated-remote",
+      "name": "granola",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "1.0.0"
+     },
+     {
+      "id": "shopify@openai-curated-remote",
+      "name": "shopify",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "3.0.0"
+     },
+     {
+      "id": "atlassian-rovo@openai-curated-remote",
+      "name": "atlassian-rovo",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "1.0.6"
+     },
+     {
+      "id": "fireflies@openai-curated-remote",
+      "name": "fireflies",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "1.0.0"
+     },
+     {
+      "id": "supabase@openai-curated-remote",
+      "name": "supabase",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "1.0.0"
+     },
+     {
+      "id": "posthog@openai-curated-remote",
+      "name": "posthog",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "1.0.0"
+     },
+     {
+      "id": "app-69d88b99c5c481918e8da9225737e1e9@openai-curated-remote",
+      "name": "app-69d88b99c5c481918e8da9225737e1e9",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "2.0.0"
+     },
+     {
+      "id": "app-6a20b18a639081918c1b438f8381b27e@openai-curated-remote",
+      "name": "app-6a20b18a639081918c1b438f8381b27e",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "1.0.0"
+     },
+     {
+      "id": "teams@openai-curated-remote",
+      "name": "teams",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "0.1.8"
+     },
+     {
+      "id": "linear@openai-curated-remote",
+      "name": "linear",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "5.0.1"
+     },
+     {
+      "id": "monday-com@openai-curated-remote",
+      "name": "monday-com",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "2.0.0"
+     },
+     {
+      "id": "superhuman@openai-curated-remote",
+      "name": "superhuman",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "2.0.1"
+     },
+     {
+      "id": "hubspot@openai-curated-remote",
+      "name": "hubspot",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "4.0.0"
+     },
+     {
+      "id": "app-6943b73823548191a9f9216c6790c453@openai-curated-remote",
+      "name": "app-6943b73823548191a9f9216c6790c453",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "1.0.0"
+     },
+     {
+      "id": "app-69bc11db874881918718abaca20b68ce@openai-curated-remote",
+      "name": "app-69bc11db874881918718abaca20b68ce",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "4.0.0"
+     },
+     {
+      "id": "sharepoint@openai-curated-remote",
+      "name": "sharepoint",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "0.1.7"
+     },
+     {
+      "id": "otter-ai@openai-curated-remote",
+      "name": "otter-ai",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "3.0.0"
+     },
+     {
+      "id": "windsor-ai@openai-curated-remote",
+      "name": "windsor-ai",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "3.0.0"
+     },
+     {
+      "id": "app-6a0783a98c4c8191841404d786d4a4b9@openai-curated-remote",
+      "name": "app-6a0783a98c4c8191841404d786d4a4b9",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "3.0.0"
+     },
+     {
+      "id": "apollo@openai-curated-remote",
+      "name": "apollo",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "4.0.1"
+     },
+     {
+      "id": "data-analytics@openai-curated-remote",
+      "name": "data-analytics",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_USE",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "0.2.8-13ceeea1f599"
+     },
+     {
+      "id": "zoominfo@openai-curated-remote",
+      "name": "zoominfo",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "6.0.0"
+     },
+     {
+      "id": "app-6a2baf2fad748191812393c3e00308ef@openai-curated-remote",
+      "name": "app-6a2baf2fad748191812393c3e00308ef",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "2.0.0"
+     },
+     {
+      "id": "datadog@openai-curated-remote",
+      "name": "datadog",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "10.0.0"
+     },
+     {
+      "id": "app-69ea4ed2cf7c8191b742ef3622479ddd@openai-curated-remote",
+      "name": "app-69ea4ed2cf7c8191b742ef3622479ddd",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "3.0.0"
+     },
+     {
+      "id": "app-69d73fc8aa5c8191bec1583760b130c7@openai-curated-remote",
+      "name": "app-69d73fc8aa5c8191bec1583760b130c7",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "1.0.0"
+     },
+     {
+      "id": "quickbooks@openai-curated-remote",
+      "name": "quickbooks",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "6.0.0"
+     },
+     {
+      "id": "app-6a3293e129088191abf0875820e839da@openai-curated-remote",
+      "name": "app-6a3293e129088191abf0875820e839da",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "1.2.1"
+     },
+     {
+      "id": "vercel@openai-curated-remote",
+      "name": "vercel",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "0.21.4"
+     },
+     {
+      "id": "app-69ddbaba3fb48191a825f22c21b0599d@openai-curated-remote",
+      "name": "app-69ddbaba3fb48191a825f22c21b0599d",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "2.0.0"
+     },
+     {
+      "id": "app-69457f8444848191918f7c00fea68076@openai-curated-remote",
+      "name": "app-69457f8444848191918f7c00fea68076",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "2.0.0"
+     },
+     {
+      "id": "app-694a63a053f081918b9a3738bd3640c9@openai-curated-remote",
+      "name": "app-694a63a053f081918b9a3738bd3640c9",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "3.0.0"
+     },
+     {
+      "id": "app-6a330a7730c081919892632d5baaec58@openai-curated-remote",
+      "name": "app-6a330a7730c081919892632d5baaec58",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "4.0.1"
+     },
+     {
+      "id": "clickup@openai-curated-remote",
+      "name": "clickup",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "1.0.3"
+     },
+     {
+      "id": "zoho@openai-curated-remote",
+      "name": "zoho",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "2.0.0"
+     },
+     {
+      "id": "wix@openai-curated-remote",
+      "name": "wix",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "6.0.0"
+     },
+     {
+      "id": "neon-postgres@openai-curated-remote",
+      "name": "neon-postgres",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "1.0.0"
+     },
+     {
+      "id": "app-694421e60cc88191a1e5bb4aa79950e4@openai-curated-remote",
+      "name": "app-694421e60cc88191a1e5bb4aa79950e4",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "3.0.0"
+     },
+     {
+      "id": "asana@openai-curated-remote",
+      "name": "asana",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "7.0.0"
+     },
+     {
+      "id": "app-6966958473488191b775fdb667c52eab@openai-curated-remote",
+      "name": "app-6966958473488191b775fdb667c52eab",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "1.0.0"
+     },
+     {
+      "id": "app-69dd11f3e50c8191b1ca48d03cf7e2ad@openai-curated-remote",
+      "name": "app-69dd11f3e50c8191b1ca48d03cf7e2ad",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "8.0.0"
+     },
+     {
+      "id": "public-equity-investing@openai-curated-remote",
+      "name": "public-equity-investing",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_USE",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "0.1.31"
+     },
+     {
+      "id": "airtable@openai-curated-remote",
+      "name": "airtable",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "6.0.1"
+     },
+     {
+      "id": "product-design@openai-curated-remote",
+      "name": "product-design",
+      "installed": true,
+      "enabled": true,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_USE",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": "0.1.52",
+      "version": "0.1.52"
+     },
+     {
+      "id": "codex-security@openai-curated-remote",
+      "name": "codex-security",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "0.1.21"
+     },
+     {
+      "id": "app-69ef18c674308191a2f952431f91ea61@openai-curated-remote",
+      "name": "app-69ef18c674308191a2f952431f91ea61",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "1.0.0"
+     },
+     {
+      "id": "semrush@openai-curated-remote",
+      "name": "semrush",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "2.0.1"
+     },
+     {
+      "id": "app-69e5f69b54d8819185e1638e73c15e3b@openai-curated-remote",
+      "name": "app-69e5f69b54d8819185e1638e73c15e3b",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "3.0.0"
+     },
+     {
+      "id": "finances@openai-curated-remote",
+      "name": "finances",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "0.1.0"
+     },
+     {
+      "id": "app-6a1f227d5a848191ae3317c66947b440@openai-curated-remote",
+      "name": "app-6a1f227d5a848191ae3317c66947b440",
+      "installed": false,
+      "enabled": false,
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "localVersion": null,
+      "version": "1.0.0"
+     }
+    ],
+    "pluginCount": 60
+   }
+  ],
+  "marketplaceLoadErrors": [],
+  "featuredPluginIds": [
+   "gmail@openai-curated-remote",
+   "google-drive@openai-curated-remote",
+   "outlook-email@openai-curated-remote",
+   "github@openai-curated-remote",
+   "sharepoint@openai-curated-remote",
+   "slack@openai-curated-remote",
+   "teams@openai-curated-remote",
+   "outlook-calendar@openai-curated-remote",
+   "google-calendar@openai-curated-remote",
+   "atlassian-rovo@openai-curated-remote",
+   "notion@openai-curated-remote",
+   "canva@openai-curated-remote",
+   "figma@openai-curated-remote",
+   "linear@openai-curated-remote",
+   "data-analytics@openai-curated-remote",
+   "superpowers@openai-curated-remote",
+   "hubspot@openai-curated-remote",
+   "asana@openai-curated-remote",
+   "product-design@openai-curated-remote",
+   "box@openai-curated-remote",
+   "vercel@openai-curated-remote",
+   "granola@openai-curated-remote",
+   "supabase@openai-curated-remote",
+   "monday-com@openai-curated-remote",
+   "airtable@openai-curated-remote",
+   "zoom@openai-curated-remote",
+   "sales@openai-curated-remote",
+   "codex-security@openai-curated-remote",
+   "lovable@openai-curated-remote"
+  ]
+ },
+ "pluginInstalled": {
+  "marketplaces": [
+   {
+    "name": "openai-primary-runtime",
+    "path": "/Users/lianb/.cache/codex-runtimes/codex-primary-runtime/plugins/openai-primary-runtime/.agents/plugins/marketplace.json",
+    "interface": null,
+    "plugins": [
+     {
+      "id": "documents@openai-primary-runtime",
+      "name": "documents",
+      "installed": true,
+      "enabled": true
+     },
+     {
+      "id": "pdf@openai-primary-runtime",
+      "name": "pdf",
+      "installed": true,
+      "enabled": true
+     },
+     {
+      "id": "spreadsheets@openai-primary-runtime",
+      "name": "spreadsheets",
+      "installed": true,
+      "enabled": true
+     },
+     {
+      "id": "presentations@openai-primary-runtime",
+      "name": "presentations",
+      "installed": true,
+      "enabled": true
+     },
+     {
+      "id": "template-creator@openai-primary-runtime",
+      "name": "template-creator",
+      "installed": true,
+      "enabled": true
+     }
+    ]
+   },
+   {
+    "name": "openai-bundled",
+    "path": "/Users/lianb/.codex/.tmp/bundled-marketplaces/openai-bundled/.agents/plugins/marketplace.json",
+    "interface": {
+     "displayName": "OpenAI Bundled"
+    },
+    "plugins": [
+     {
+      "id": "codex-app-tools@openai-bundled",
+      "name": "codex-app-tools",
+      "installed": true,
+      "enabled": true
+     },
+     {
+      "id": "sites@openai-bundled",
+      "name": "sites",
+      "installed": true,
+      "enabled": true
+     },
+     {
+      "id": "browser@openai-bundled",
+      "name": "browser",
+      "installed": true,
+      "enabled": true
+     },
+     {
+      "id": "chrome@openai-bundled",
+      "name": "chrome",
+      "installed": true,
+      "enabled": true
+     },
+     {
+      "id": "computer-use@openai-bundled",
+      "name": "computer-use",
+      "installed": true,
+      "enabled": true
+     },
+     {
+      "id": "visualize@openai-bundled",
+      "name": "visualize",
+      "installed": true,
+      "enabled": true
+     }
+    ]
+   },
+   {
+    "name": "openai-curated-remote",
+    "path": null,
+    "interface": {
+     "displayName": "OpenAI Curated Remote"
+    },
+    "plugins": [
+     {
+      "id": "canva@openai-curated-remote",
+      "name": "canva",
+      "installed": true,
+      "enabled": true
+     },
+     {
+      "id": "creative-production@openai-curated-remote",
+      "name": "creative-production",
+      "installed": true,
+      "enabled": true
+     },
+     {
+      "id": "openai-templates@openai-curated-remote",
+      "name": "openai-templates",
+      "installed": true,
+      "enabled": true
+     },
+     {
+      "id": "figma@openai-curated-remote",
+      "name": "figma",
+      "installed": true,
+      "enabled": true
+     },
+     {
+      "id": "github@openai-curated-remote",
+      "name": "github",
+      "installed": true,
+      "enabled": true
+     },
+     {
+      "id": "heygen@openai-curated-remote",
+      "name": "heygen",
+      "installed": true,
+      "enabled": true
+     },
+     {
+      "id": "openai-developers@openai-curated-remote",
+      "name": "openai-developers",
+      "installed": true,
+      "enabled": true
+     },
+     {
+      "id": "plugin-management@openai-curated-remote",
+      "name": "plugin-management",
+      "installed": true,
+      "enabled": true
+     },
+     {
+      "id": "product-design@openai-curated-remote",
+      "name": "product-design",
+      "installed": true,
+      "enabled": true
+     },
+     {
+      "id": "superpowers@openai-curated-remote",
+      "name": "superpowers",
+      "installed": true,
+      "enabled": true
+     }
+    ]
+   }
+  ],
+  "marketplaceLoadErrors": []
+ },
+ "mcpServerStatus": {
+  "data": [
+   {
+    "name": "codex_app",
+    "pluginId": "codex-app-tools@openai-bundled",
+    "serverInfo": null,
+    "authStatus": "unsupported",
+    "toolCount": 0,
+    "toolNames": []
+   },
+   {
+    "name": "codex_apps",
+    "pluginId": null,
+    "serverInfo": {
+     "name": "plugin-runtime",
+     "title": null,
+     "version": "0.1.0",
+     "description": null,
+     "icons": null,
+     "websiteUrl": null
+    },
+    "authStatus": "bearerToken",
+    "toolCount": 247,
+    "toolNames": [
+     "canva.autofill-design",
+     "canva.cancel-editing-transaction",
+     "canva.commit-editing-transaction",
+     "canva.copy-design",
+     "canva.create-design-from-brand-template",
+     "canva.create-design-from-candidate",
+     "canva.create-folder",
+     "canva.fetch",
+     "canva.generate-design",
+     "canva.get-assets",
+     "canva.get-brand-template-dataset",
+     "canva.get-design",
+     "canva.get-design-candidates",
+     "canva.get-design-content",
+     "canva.get-design-pages",
+     "canva.get-design-thumbnail",
+     "canva.get-design-tool-job",
+     "canva.get-presenter-notes",
+     "canva.image-to-design",
+     "canva.import-design-from-url",
+     "canva.list-brand-kits",
+     "canva.list-comments",
+     "canva.list-folder-items",
+     "canva.move-item-to-folder",
+     "canva.perform-editing-operations",
+     "canva.prepare-design-generation",
+     "canva.resize-design",
+     "canva.resolve-shortlink",
+     "canva.search",
+     "canva.search-brand-templates",
+     "canva.search-designs",
+     "canva.search-folders",
+     "canva.start-editing-transaction",
+     "canva.track-event-lifecycle",
+     "canva.upload-asset-from-url",
+     "codex_document_control.execute_document_command",
+     "codex_document_control.get_document_tool_schemas",
+     "codex_document_control.list_document_sessions",
+     "figma.add_code_connect_map",
+     "figma.create_new_file"
+    ]
+   },
+   {
+    "name": "computer-use",
+    "pluginId": null,
+    "serverInfo": null,
+    "authStatus": "unsupported",
+    "toolCount": 0,
+    "toolNames": []
+   },
+   {
+    "name": "creative_production_mcp",
+    "pluginId": "creative-production@openai-curated-remote",
+    "serverInfo": {
+     "name": "creative-production",
+     "title": null,
+     "version": "0.1.25",
+     "description": null,
+     "icons": null,
+     "websiteUrl": null
+    },
+    "authStatus": "unsupported",
+    "toolCount": 1,
+    "toolNames": [
+     "creative_production_board"
+    ]
+   },
+   {
+    "name": "kimi-cu",
+    "pluginId": null,
+    "serverInfo": {
+     "name": "kimi-cu",
+     "title": null,
+     "version": "0.5.4",
+     "description": null,
+     "icons": null,
+     "websiteUrl": null
+    },
+    "authStatus": "unsupported",
+    "toolCount": 10,
+    "toolNames": [
+     "click",
+     "drag",
+     "get_app_state",
+     "list_apps",
+     "perform_secondary_action",
+     "press_key",
+     "scroll",
+     "select_text",
+     "set_value",
+     "type_text"
+    ]
+   },
+   {
+    "name": "node_repl",
+    "pluginId": null,
+    "serverInfo": {
+     "name": "rmcp",
+     "title": null,
+     "version": "1.5.0",
+     "description": null,
+     "icons": null,
+     "websiteUrl": null
+    },
+    "authStatus": "unsupported",
+    "toolCount": 3,
+    "toolNames": [
+     "js",
+     "js_add_node_module_dir",
+     "js_reset"
+    ]
+   },
+   {
+    "name": "openai-api-key-local-confirmation",
+    "pluginId": "openai-developers@openai-curated-remote",
+    "serverInfo": {
+     "name": "OpenAI Developers MCP",
+     "title": null,
+     "version": "0.1.0",
+     "description": null,
+     "icons": null,
+     "websiteUrl": null
+    },
+    "authStatus": "unsupported",
+    "toolCount": 1,
+    "toolNames": [
+     "confirm_openai_api_key_local_destination"
+    ]
+   },
+   {
+    "name": "weknora",
+    "pluginId": null,
+    "serverInfo": {
+     "name": "weknora-server",
+     "title": null,
+     "version": "1.1.1",
+     "description": null,
+     "icons": null,
+     "websiteUrl": null
+    },
+    "authStatus": "unsupported",
+    "toolCount": 30,
+    "toolNames": [
+     "agent_chat",
+     "chat",
+     "create_knowledge_base",
+     "create_knowledge_from_file",
+     "create_knowledge_from_text",
+     "create_knowledge_from_url",
+     "create_model",
+     "create_session",
+     "create_tenant",
+     "delete_chunk",
+     "delete_knowledge",
+     "delete_knowledge_base",
+     "delete_session",
+     "get_agent",
+     "get_knowledge",
+     "get_knowledge_base",
+     "get_model",
+     "get_session",
+     "hybrid_search",
+     "list_agents",
+     "list_chunks",
+     "list_knowledge",
+     "list_knowledge_bases",
+     "list_models",
+     "list_sessions",
+     "list_shared_knowledge_bases",
+     "list_tenants",
+     "wiki_index_view",
+     "wiki_read_page",
+     "wiki_search"
+    ]
+   },
+   {
+    "name": "wmux",
+    "pluginId": null,
+    "serverInfo": {
+     "name": "wmux",
+     "title": null,
+     "version": "3.38.4",
+     "description": null,
+     "icons": null,
+     "websiteUrl": null
+    },
+    "authStatus": "unsupported",
+    "toolCount": 87,
+    "toolNames": [
+     "a2a_broadcast",
+     "a2a_discover",
+     "a2a_set_skills",
+     "a2a_task_cancel",
+     "a2a_task_query",
+     "a2a_task_send",
+     "a2a_task_update",
+     "a2a_whoami",
+     "browser_click",
+     "browser_close",
+     "browser_console",
+     "browser_cookies",
+     "browser_dialog",
+     "browser_download",
+     "browser_drag",
+     "browser_emulate",
+     "browser_evaluate",
+     "browser_extract_data",
+     "browser_extract_text",
+     "browser_file_upload",
+     "browser_fill",
+     "browser_highlight",
+     "browser_hover",
+     "browser_navigate",
+     "browser_navigate_back",
+     "browser_network",
+     "browser_open",
+     "browser_pdf",
+     "browser_press_key",
+     "browser_resize",
+     "browser_response_body",
+     "browser_screenshot",
+     "browser_scroll",
+     "browser_scroll_into_view",
+     "browser_select",
+     "browser_session_list",
+     "browser_session_start",
+     "browser_session_status",
+     "browser_session_stop",
+     "browser_smart_snapshot"
+    ]
+   }
+  ],
+  "nextCursor": null
+ },
+ "pluginReadError_requiresMarketplace": {
+  "code": -32600,
+  "message": "plugin/read requires exactly one of marketplacePath or remoteMarketplaceName"
+ },
+ "configReadMcpKeys": [
+  "computer-use",
+  "kimi-cu",
+  "node_repl",
+  "weknora",
+  "wmux"
+ ],
+ "configReadMcpShapes": {
+  "computer-use": [
+   "args",
+   "command",
+   "cwd",
+   "enabled",
+   "environment_id",
+   "tool_timeout_sec"
+  ],
+  "wmux": [
+   "args",
+   "command",
+   "enabled",
+   "environment_id",
+   "tool_timeout_sec"
+  ],
+  "kimi-cu": [
+   "args",
+   "command",
+   "enabled",
+   "environment_id",
+   "tool_timeout_sec"
+  ],
+  "weknora": [
+   "args",
+   "command",
+   "enabled",
+   "env",
+   "environment_id",
+   "tool_timeout_sec"
+  ],
+  "node_repl": [
+   "args",
+   "command",
+   "enabled",
+   "env",
+   "environment_id",
+   "startup_timeout_sec",
+   "tool_timeout_sec"
+  ]
+ }
+}
