@@ -188,6 +188,35 @@ def _mission_manager() -> Any:
 
 
 _MISSIONS: Any = None
+
+# --- Extension Platform (P2.0) ------------------------------------------------
+# Gateway-local surface over the codex runtime's native plugin/marketplace/MCP
+# capabilities (web/extensions/). HTTP parse + runtime guard + error mapping
+# only — aggregation business logic lives in ExtensionService.
+
+
+def _extension_service() -> Any:
+    """ExtensionService over the codex adapter's codex_request transport.
+    None when the clean runtime is not codex (callers answer honestly with
+    CODEX_RUNTIME_REQUIRED — never DSH fake data)."""
+    adapter = RUNTIMES.adapter_for("clean")
+    if adapter is None or not hasattr(adapter, "codex_request"):
+        return None
+    return adapter
+
+
+_EXTENSIONS: Any = None
+
+
+def _extensions_svc() -> Any:
+    global _EXTENSIONS
+    if _EXTENSIONS is None:
+        from extensions import ExtensionService
+        _EXTENSIONS = ExtensionService(_extension_service())
+    return _EXTENSIONS
+
+
+
 # CORS allow-list: only loopback product surfaces may call this gateway's APIs.
 # Any other Origin (e.g. an arbitrary website open in the browser) must not be
 # able to read the vault or drive write endpoints. "null" covers file:// pages.
@@ -1617,6 +1646,16 @@ class BoujoyHandler(BaseHTTPRequestHandler):
             except ProviderError as exc:
                 self._error(400, str(exc))
             return
+        if path == "/api/extensions":
+            from extensions import ExtensionError
+            try:
+                adapter = RUNTIMES.adapter_for("clean")
+                cwd = adapter.workspace_cwd() if adapter else None
+                self._json(_extensions_svc().overview(cwd))
+            except ExtensionError as exc:
+                self._error(503 if exc.code == "CODEX_RUNTIME_REQUIRED" else 400,
+                            str(exc))
+            return
         if path == "/api/missions":
             from mission import MissionError
             try:
@@ -1933,6 +1972,53 @@ class BoujoyHandler(BaseHTTPRequestHandler):
                 body=body,
                 filter_deleted=endpoint in {"session.list", "session.search", "workspace.list"},
             )
+            return
+        if path.startswith("/api/extensions/"):
+            from extensions import ExtensionError
+            action = path[len("/api/extensions/"):].strip("/")
+            try:
+                payload = json.loads(body or b"{}")
+                svc = _extensions_svc()
+                if action == "plugins/detail":
+                    result = svc.plugin_detail(
+                        str(payload.get("pluginName") or ""),
+                        marketplace_path=payload.get("marketplacePath"),
+                        remote_marketplace_name=payload.get("remoteMarketplaceName"))
+                elif action == "plugin-install":
+                    result = svc.plugin_install(
+                        str(payload.get("pluginName") or ""),
+                        marketplace_path=payload.get("marketplacePath"),
+                        remote_marketplace_name=payload.get("remoteMarketplaceName"))
+                elif action == "plugin-uninstall":
+                    result = svc.plugin_uninstall(str(payload.get("canonicalId") or ""))
+                elif action == "market-add":
+                    result = svc.market_add(str(payload.get("source") or ""),
+                                            payload.get("refName"))
+                elif action == "market-remove":
+                    result = svc.market_remove(str(payload.get("marketplaceName") or ""))
+                elif action == "market-upgrade":
+                    result = svc.market_upgrade(payload.get("marketplaceName"))
+                elif action == "mcp-save":
+                    entry = payload.get("entry")
+                    if not isinstance(entry, dict):
+                        raise ValueError("entry 必须是对象")
+                    result = svc.mcp_save(entry)
+                elif action == "mcp-delete":
+                    result = svc.mcp_delete(str(payload.get("name") or ""))
+                else:
+                    self._error(404, "未知 extension 操作")
+                    return
+                self._json(result)
+            except ExtensionError as exc:
+                status = {"CODEX_RUNTIME_REQUIRED": 503,
+                          "CAPABILITY_UNAVAILABLE": 501,
+                          "POSTCONDITION_FAILED": 502,
+                          "invalid-argument": 400,
+                          "invalid-name": 400}.get(exc.code, 400)
+                self._json({"ok": False, "code": exc.code, "error": str(exc)},
+                           status=status)
+            except (json.JSONDecodeError, ValueError) as exc:
+                self._error(400, str(exc))
             return
         if path.startswith("/api/missions/"):
             from mission import MissionError
