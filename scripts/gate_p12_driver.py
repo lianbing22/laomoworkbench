@@ -2459,6 +2459,211 @@ def gate_i(ev: Evidence, scratch: Path) -> dict:
     return result
 
 
+def gate_j(ev: Evidence, scratch: Path) -> dict:
+    ev.log("Gate J — Fresh Final Evaluator + Evidence Manifest")
+    repo = scratch / "fixture-j" / "repo"
+    base_sha = init_fixture(repo)
+    before = porcelain(repo)
+
+    adapter = CodexRuntimeAdapter(bin_path=GATE_BIN, default_cwd=str(repo),
+                                  debug_log=ev.log)
+    tap = TurnTap(ev, adapter)
+    ptap = PromptTap(ev, adapter)
+    mgr = MissionManager(adapter, repo)
+    checks: dict[str, bool] = {}
+    detail: dict = {}
+    try:
+        created = mgr.create(
+            "两个并行单元各产出一个文件",
+            cwd=str(repo),
+            acceptance_criteria=["a.txt 与 b.txt 产出正确"],
+            options={"maxParallelWorkers": 2},
+            verification={"requiredFiles": ["a.txt", "b.txt"],
+                          "commands": ["grep -q REAL-J-A a.txt",
+                                       "grep -q REAL-J-B b.txt"]})
+        mid = created["mission"]["id"]
+        runs = repo / ".laomo" / "runs" / mid
+
+        def unit(uid, index, title, desc, marker):
+            return {"id": uid, "index": index, "title": title,
+                    "description": desc,
+                    "acceptance": [f"{marker} 所在文件存在且内容正确"],
+                    "dependencies": [], "state": "pending", "status": "pending",
+                    "attempt": 0, "repairCount": 0, "conflictCount": 0,
+                    "conflict": None,
+                    "worktree": {"path": None, "branch": None,
+                                 "baseSha": None, "headSha": None},
+                    "jobId": None, "delta": None, "repairDirective": None,
+                    "lastVerdict": None,
+                    "worker": {"startedAt": None, "finishedAt": None},
+                    "integration": None}
+        store = mgr.store_for(mid)
+        store.save_plan({"version": 2, "replans": 0, "gitIntegration": True,
+                         "units": [
+                             unit("a", 0, "单元A",
+                                  "创建 a.txt，内容恰好为一行：REAL-J-A。"
+                                  "除此以外不要创建或修改任何文件，"
+                                  "不要执行 git 命令。", "REAL-J-A"),
+                             unit("b", 1, "单元B",
+                                  "创建 b.txt，内容恰好为一行：REAL-J-B。"
+                                  "除此以外不要创建或修改任何文件，"
+                                  "不要执行 git 命令。", "REAL-J-B")]})
+        store.save_state({"state": "running", "cycles": 0, "currentUnit": 0,
+                          "noProgress": 0, "progressSignature": "",
+                          "tokensUsed": 0, "wallElapsedMs": 0,
+                          "agentActiveMs": 0, "waitingMs": 0, "pausedMs": 0,
+                          "phaseStartedAt": 0})
+        mgr.start(mid)
+        deadline = time.monotonic() + MISSION_TIMEOUT
+        state = {}
+        while time.monotonic() < deadline:
+            state = mgr.status(mid)["mission"]
+            if state.get("state") in ("done", "failed", "blocked", "cancelled"):
+                break
+            time.sleep(POLL)
+        ev.log(f"mission terminal: {state.get('state')}")
+        checks["mission-done"] = state.get("state") == "done"
+
+        events = [json.loads(l) for l in
+                  (runs / "events.ndjson").read_text("utf-8").splitlines()
+                  if l.strip()]
+
+        def evts(etype, **kw):
+            out = []
+            for e in events:
+                if e["type"] != etype:
+                    continue
+                d = e.get("detail") if isinstance(e.get("detail"), dict) else {}
+                if all(d.get(k) == v for k, v in kw.items()):
+                    out.append(e)
+            return out
+
+        # 1. machine verification PASSED before the final evaluator ran
+        machine_pass = evts("verification", passed=True)
+        final_ev = [e for e in evts("final-verdict")]
+        checks["machine-pass-before-final"] = bool(
+            machine_pass and final_ev
+            and machine_pass[0]["ts"] < final_ev[0]["ts"])
+
+        # 2/3/4/5. fresh read-only final evaluator in the integration workspace
+        final_calls = [c for c in ptap.calls if c["read_only"]
+                       and str(c["cwd"]).endswith("/integration")]
+        checks["final-evaluator-exists"] = bool(final_calls)
+        f = final_calls[-1] if final_calls else {}
+        other_threads = set()
+        with tap.lock:
+            for tid, t in tap.threads.items():
+                cwd = str(t.get("cwd") or "")
+                if cwd.endswith("/u0") or cwd.endswith("/u1") \
+                        or not cwd.endswith("/integration"):
+                    if t.get("turns"):
+                        other_threads.add(tid)
+        final_thread = None
+        with tap.lock:
+            for tid, t in tap.threads.items():
+                if t.get("cwd") and str(t["cwd"]).endswith("/integration"):
+                    for turn in t["turns"].values():
+                        if turn.get("startedAt") \
+                                and abs(turn["startedAt"] - f.get("ts", 0)) < 5:
+                            final_thread = tid
+        checks["final-evaluator-fresh-thread"] = bool(
+            final_thread and final_thread not in other_threads)
+        checks["final-evaluator-read-only"] = bool(f.get("read_only"))
+        checks["final-evaluator-cwd-integration"] = bool(
+            f.get("cwd") and str(f["cwd"]).endswith("/integration"))
+        # 6. it SAW acceptance criteria + machine results + workspace
+        checks["final-evaluator-sees-evidence"] = bool(
+            f and "机器验收已通过" in f["prompt"]
+            and "全部验收标准" in f["prompt"] and "工作区" in f["prompt"])
+        detail["finalEvaluator"] = {
+            "threadId": final_thread, "cwd": f.get("cwd"),
+            "readOnly": f.get("read_only"),
+            "promptHead": (f.get("prompt") or "")[:160]}
+
+        # 7/9. DONE strictly AFTER final evaluator PASS — by event ORDER
+        # (the two events can land in the same millisecond; the append-only
+        # events.ndjson sequence is the causal record)
+        final_pass = [e for e in evts("final-verdict")
+                      if isinstance(e.get("detail"), dict)
+                      and e["detail"].get("verdict") == "PASS"]
+        done_ev = next((e for e in evts("transition")
+                        if isinstance(e.get("detail"), dict)
+                        and e["detail"].get("state") == "done"), None)
+        final_idx = events.index(final_pass[0]) if final_pass else -1
+        done_idx = events.index(done_ev) if done_ev else -1
+        checks["done-only-after-final-pass"] = bool(
+            final_idx >= 0 and done_idx > final_idx)
+
+        # 10. evidence manifest complete and correct
+        import hashlib as _hl
+        deadline = time.monotonic() + 15
+        mpath = runs / "evidence" / "manifest.json"
+        while time.monotonic() < deadline and not mpath.is_file():
+            time.sleep(0.2)
+        manifest = json.loads(mpath.read_text("utf-8")) if mpath.is_file() else {}
+        entries = manifest.get("entries") or {}
+        kinds = {e.get("kind") for e in entries.values()}
+        need_kinds = {"mission", "state", "plan", "progress", "handoff",
+                      "verdict", "verification", "artifact", "git-diff"}
+        bad_paths, bad_hash, missing = [], [], []
+        for rel, e in entries.items():
+            p = Path(e["path"])
+            if not p.is_file():
+                bad_paths.append(rel)
+                continue
+            digest = _hl.sha256(p.read_bytes()).hexdigest()
+            if e.get("sha256") and digest != e["sha256"]:
+                bad_hash.append(rel)
+            if e.get("missing"):
+                missing.append(rel)
+        artifact_entries = {r for r in entries if r.startswith("artifact/")}
+        checks["manifest-complete"] = bool(
+            entries and need_kinds <= kinds
+            and {"artifact/a.txt", "artifact/b.txt"} <= artifact_entries)
+        checks["manifest-paths-valid"] = not bad_paths
+        checks["manifest-sha256-correct"] = not bad_hash
+        checks["manifest-no-missing-artifacts"] = not missing
+        detail["manifest"] = {
+            "entries": len(entries), "kinds": sorted(kinds),
+            "badPaths": bad_paths, "badHash": bad_hash, "missing": missing,
+            "sha256": manifest.get("sha256")}
+
+        # 11. durability: a FRESH control plane must not alter any of it
+        manifest_bytes = mpath.read_bytes()
+        state_bytes = (runs / "state.json").read_bytes()
+        adapter2 = CodexRuntimeAdapter(bin_path=GATE_BIN,
+                                       default_cwd=str(repo),
+                                       debug_log=ev.log)
+        try:
+            mgr2 = MissionManager(adapter2, repo)
+            mgr2.recover()
+            _ = mgr2.status(mid)
+            _ = mgr2.list()
+        finally:
+            adapter2.shutdown()
+        checks["manifest-durable"] = (
+            mpath.read_bytes() == manifest_bytes
+            and (runs / "state.json").read_bytes() == state_bytes
+            and json.loads((runs / "state.json").read_text("utf-8"))
+            .get("state") == "done")
+
+        checks["source-isolation"] = (
+            git(repo, "rev-parse", "HEAD") == base_sha
+            and porcelain(repo) == before)
+        detail["mission"] = {"id": mid, "state": state.get("state")}
+    finally:
+        adapter.shutdown()
+
+    verdict = all(checks.values())
+    result = {"gate": "J", "checks": checks, "detail": detail,
+              "verdict": "PASS" if verdict else "FAIL"}
+    ev.write("summary.json", result)
+    ev.log(f"Gate J verdict: {result['verdict']} checks={checks}")
+    return result
+
+
+# ---------------------------------------------------------------- registry
+
 # ---------------------------------------------------------------- registry
 
 # ---------------------------------------------------------------- registry
@@ -2490,6 +2695,7 @@ GATES = {
     "G": lambda ev, scratch: gate_g(ev, scratch),
     "H": lambda ev, scratch: gate_h(ev, scratch),
     "I": lambda ev, scratch: gate_i(ev, scratch),
+    "J": lambda ev, scratch: gate_j(ev, scratch),
 }
 
 

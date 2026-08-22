@@ -1152,6 +1152,8 @@ class TestHarnessVerificationGate(MissionLoopTest):
         self.assertEqual(last["cwd"], str(self.root.resolve()),
                          "非 git 使命的 final evaluator cwd 应为 mission cwd")
         self.assertIn(f"工作区：{last['cwd']}", last["prompt"])
+        self.assertIn("机器验收已通过", last["prompt"],
+                      "final evaluator 必须能看到机器验收结果（Gate J 契约）")
         self.assertFalse((self.mdir(mid).parent.parent / "worktrees" / mid
                           / "integration").is_dir(),
                          "非 git 使命不得创建 integration worktree")

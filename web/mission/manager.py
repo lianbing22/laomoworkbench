@@ -1081,10 +1081,14 @@ class MissionRunner(threading.Thread):
         criteria = mission.get("acceptanceCriteria") or []
         for u in plan["units"]:
             criteria.extend(u.get("acceptance") or [])
+        verif = self.store.verification_results() or {}
         prompt = (
             "你是最终验收员（Final Evaluator）。只读沙箱，逐条核验全部验收标准。\n"
             f"目标：{mission.get('objective')}\n工作区：{workspace}\n"
-            "全部验收标准：\n- " + "\n- ".join(criteria) + "\n"
+            + (f"机器验收已通过：{verif.get('checks') and len(verif['checks'])} 项检查"
+               f"全部 PASS（明细：{self.store.verification_dir / 'results.json'}）。\n"
+               if (verif.get("passed") and verif.get("checks")) else "")
+            + "全部验收标准：\n- " + "\n- ".join(criteria) + "\n"
             "可运行测试与只读检查。末尾必须输出：\n"
             "<<<LAOMO_VERDICT\n"
             '{"verdict":"PASS|NEEDS_WORK|BLOCKED","reasons":["..."],"repair":"..."}'
