@@ -197,12 +197,18 @@ verdict（PASS/NEEDS_WORK/BLOCKED 徽章）、最后 checkpoint 摘要、运行�
 
 ## 测试（Agent T 范围）
 
-tests/mission_test.py（90 用例）：FakeAdapter（run_turn 可编程脚本化返回/标记块
+tests/mission_test.py（92 用例）：FakeAdapter（run_turn 可编程脚本化返回/标记块
 注入/超时模拟）覆盖：状态机全路径、default-fail（无可解析 verdict）、repair 上限
 熔断、no-progress 熔断、墙钟熔断、pause/resume/cancel 幂等、waiting 注册与 wake
 delta、crash-resume（重建 MissionManager 后 waiting 恢复）、DONE 三重条件、以及
 P1.1 新增：blocked 终态、作业生命周期全权（cancel 终止+真死/终态、failed exitCode、
 paused 期死亡 → orphaned）、PID 复用检测、四桶时间账、no-progress 重启延续、
 机器验收门禁（失败无 DONE/每字段存证/HTTP 检查）、evidence manifest（sha256+
-不可变）、关停门禁（终态拒绝一切动作）。不得触碰真实 codex（真实验证由主线程
+不可变）、关停门禁（终态拒绝一切动作）、重挂 watcher 收真实退出码（28a/28b，
+Gate A 现场 bug 的单测还原）。不得触碰真实 codex（真实验证由主线程
 Gate 负责）。
+
+真跑门禁（真实 codex + 真实网关）：`scripts/gate_p11_driver.py <scratch>`，
+`GATE_PORT` 指定端口、`GATE_CODEX_BIN` 指定 codex 可执行；Gate A–E 五门禁
+（≥60s 作业 pause/resume、cancel 真死、网关崩溃恢复、机器门禁失败无 DONE、
+修复后机器 PASS→Final PASS→DONE+manifest 不可变）。
