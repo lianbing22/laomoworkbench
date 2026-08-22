@@ -63,8 +63,11 @@ class Evidence:
     def log(self, msg: str) -> None:
         line = f"[{time.strftime('%H:%M:%S')}] {msg}"
         print(line, flush=True)
-        self._fh.write(line + "\n")
-        self._fh.flush()
+        try:
+            self._fh.write(line + "\n")
+            self._fh.flush()
+        except (ValueError, OSError):
+            pass  # reader threads may flush after close at teardown
 
     def raw(self, rec: dict) -> None:
         with self.timeline.open("a", encoding="utf-8") as fh:
@@ -171,16 +174,23 @@ class PromptTap:
         def wrapped(*, prompt, **kwargs):
             started = time.time()
             result = original(prompt=prompt, **kwargs)
-            self.calls.append({
+            rec = {
                 "ts": round(started, 3),
                 "endedAt": round(time.time(), 3),
                 "cwd": kwargs.get("cwd"),
                 "read_only": bool(kwargs.get("read_only")),
                 "prompt": (prompt or "")[:600],
                 "ok": result.get("ok"),
-                "text": (result.get("text") or "")[:300],
-            })
-            return result
+                "text": (result.get("text") or "")[:4000],
+                "error": (result.get("error") or "")[:300],
+            }
+            self.calls.append(rec)
+            try:
+                with (ev.root / "turns.ndjson").open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            except OSError:
+                pass
+            return rec and result
 
         adapter.run_turn = wrapped
 
@@ -831,6 +841,224 @@ def gate_c(ev: Evidence, scratch: Path) -> dict:
     return result
 
 
+JOB_UNIT_DESC = (
+    "本单元必须经过一个真实后台长任务才能完成，分两轮：\n"
+    "第一轮：不要自己等待长命令。直接在回复末尾输出 LAOMO_JOB 标记块结束本轮，"
+    "内容为：command=\"sleep 65; printf 'BACKGROUND-DONE\\n' > job-output.txt; "
+    "printf 'JOB-LOG-DONE\\n'\"，reason=\"真实长任务门禁\"，expectedSeconds=70。"
+    "不要写 cwd 字段。\n"
+    "第二轮（被系统唤醒后）：读取工作目录中的 job-output.txt，"
+    "然后创建 final.txt，内容为两行：第一行 BACKGROUND-DONE，第二行 WAKE-RESUMED。"
+    "除此之外不要创建或修改任何其它文件，全程不要执行 git 命令。")
+
+
+def gate_d(ev: Evidence, scratch: Path) -> dict:
+    ev.log("Gate D — Long Job Wait/Wake (real codex, real >=60s job)")
+    repo = scratch / "fixture-d" / "repo"
+    base_sha = init_fixture(repo)
+    before = porcelain(repo)
+
+    adapter = CodexRuntimeAdapter(bin_path=GATE_BIN, default_cwd=str(repo),
+                                  debug_log=ev.log)
+    tap = TurnTap(ev, adapter)
+    ptap = PromptTap(ev, adapter)
+    mgr = MissionManager(adapter, repo)
+    checks: dict[str, bool] = {}
+    detail: dict = {}
+    watch = {"waiting": None, "alive": None, "pgid": None, "pid": None,
+             "sampleTs": None}
+    stop_watch = threading.Event()
+    try:
+        created = mgr.create(
+            "完成一个必须经过真实后台长任务的产物",
+            cwd=str(repo),
+            acceptance_criteria=["final.txt 包含 BACKGROUND-DONE 与 WAKE-RESUMED"],
+            verification={"requiredFiles": ["final.txt", "job-output.txt"],
+                          "commands": ["grep -q BACKGROUND-DONE final.txt",
+                                       "grep -q WAKE-RESUMED final.txt",
+                                       "grep -q BACKGROUND-DONE job-output.txt"]})
+        mid = created["mission"]["id"]
+        runs = repo / ".laomo" / "runs" / mid
+        store = mgr.store_for(mid)
+        store.save_plan({"version": 2, "replans": 0, "gitIntegration": True,
+                         "units": [{"id": "job", "index": 0, "title": "长任务单元",
+                                    "description": JOB_UNIT_DESC,
+                                    "acceptance": ["final.txt 存在且包含 "
+                                                   "BACKGROUND-DONE 与 WAKE-RESUMED"],
+                                    "dependencies": [],
+                                    "state": "pending", "status": "pending",
+                                    "attempt": 0, "repairCount": 0,
+                                    "conflictCount": 0, "conflict": None,
+                                    "worktree": {"path": None, "branch": None,
+                                                 "baseSha": None, "headSha": None},
+                                    "jobId": None, "delta": None,
+                                    "repairDirective": None, "lastVerdict": None,
+                                    "worker": {"startedAt": None, "finishedAt": None},
+                                    "integration": None}]})
+        store.save_state({"state": "running", "cycles": 0, "currentUnit": 0,
+                          "noProgress": 0, "progressSignature": "",
+                          "tokensUsed": 0, "wallElapsedMs": 0,
+                          "agentActiveMs": 0, "waitingMs": 0, "pausedMs": 0,
+                          "phaseStartedAt": 0})
+
+        def watcher():
+            plan_path = runs / "plan.json"
+            while not stop_watch.is_set():
+                try:
+                    plan = json.loads(plan_path.read_text("utf-8"))
+                    u = plan["units"][0]
+                    if u.get("state") == "waiting" and watch["waiting"] is None:
+                        watch["waiting"] = time.time()
+                    if u.get("state") == "waiting" and u.get("jobId"):
+                        jp = runs / "jobs" / (u["jobId"] + ".json")
+                        if jp.is_file():
+                            j = json.loads(jp.read_text("utf-8"))
+                            pid = j.get("pid")
+                            if pid and j.get("status") == "running":
+                                try:
+                                    os.kill(pid, 0)
+                                    watch["alive"] = True
+                                    watch["pid"] = pid
+                                    watch["pgid"] = subprocess.run(
+                                        ["ps", "-o", "pgid=", "-p", str(pid)],
+                                        capture_output=True,
+                                        text=True).stdout.strip()
+                                    watch["sampleTs"] = time.time()
+                                except OSError:
+                                    watch["alive"] = False
+                except Exception:
+                    pass
+                stop_watch.wait(0.4)
+        threading.Thread(target=watcher, daemon=True).start()
+
+        mgr.start(mid)
+        deadline = time.monotonic() + MISSION_TIMEOUT
+        state = {}
+        while time.monotonic() < deadline:
+            state = mgr.status(mid)["mission"]
+            if state.get("state") in ("done", "failed", "blocked", "cancelled"):
+                break
+            time.sleep(POLL)
+        stop_watch.set()
+        ev.log(f"mission terminal: {state.get('state')} "
+               f"(stopReason={state.get('stopReason')})")
+
+        plan = json.loads((runs / "plan.json").read_text("utf-8"))
+        unit = plan["units"][0]
+        events = [json.loads(l) for l in
+                  (runs / "events.ndjson").read_text("utf-8").splitlines()
+                  if l.strip()]
+
+        checks["mission-done"] = state.get("state") == "done"
+        checks["unit-integrated"] = unit["state"] == "integrated"
+        detail["mission"] = {"id": mid, "state": state.get("state"),
+                             "stopReason": state.get("stopReason")}
+
+        # the job record: real process, honest exit, unit cwd
+        job_files = sorted((runs / "jobs").glob("*.json"))
+        job = json.loads(job_files[0].read_text("utf-8")) if job_files else {}
+        checks["job-marker-real"] = bool(job.get("command")) \
+            and "sleep 65" in str(job.get("command"))
+        checks["job-real-process"] = bool(
+            job.get("pid") and job.get("pgid") and job.get("startIdentity"))
+        detail["job"] = {k: job.get(k) for k in
+                         ("jobId", "pid", "pgid", "cwd", "command", "status",
+                          "exitCode", "exitKind", "exitUnknown", "startedAt",
+                          "finishedAt", "expectedWakeAt", "startIdentity")}
+        checks["job-cwd-unit"] = bool(
+            job.get("cwd") and str(job["cwd"]).endswith("/u0"))
+        checks["job-exit-honest"] = (job.get("status") == "completed"
+                                     and job.get("exitCode") == 0
+                                     and job.get("exitUnknown") is False
+                                     and job.get("exitKind") == "exited")
+        duration_ms = (job.get("finishedAt") or 0) - (job.get("startedAt") or 0)
+        checks["long-enough"] = duration_ms >= 60_000
+        checks["unit-waiting"] = watch["waiting"] is not None
+
+        # OS-level: model idle while the background process lived
+        checks["os-alive-while-model-idle"] = bool(
+            watch["alive"] and watch["pgid"]
+            and str(watch["pgid"]).strip() == str(watch["pid"]))
+        detail["osSample"] = {k: watch[k] for k in
+                              ("waiting", "alive", "pid", "pgid", "sampleTs")}
+
+        # turn timeline from the raw tap (u0)
+        turns = tap.unit_turns("/u0")
+        turn1 = turns[0] if turns else None
+        wake_ev = next((e for e in events if e["type"] == "wake"
+                        and isinstance(e.get("detail"), dict)
+                        and e["detail"].get("jobId") == job.get("jobId")), None)
+        wake_ms = wake_ev["ts"] if wake_ev else None
+        turn2 = next((t for t in turns
+                      if wake_ms is not None
+                      and (t.get("startedAt") or 0) * 1000 >= wake_ms), None)
+        detail["turns"] = turns
+        detail["wakeTs"] = wake_ms
+
+        checks["worker-turn-ended"] = bool(
+            turn1 and turn1.get("endedAt")
+            and job.get("startedAt")
+            and turn1["endedAt"] * 1000 < job["startedAt"])
+        checks["wake-event"] = wake_ev is not None
+        # ordering: turn1.end < job.start < job.finish <= wake <= turn2.start
+        checks["timeline-ordered"] = bool(
+            turn1 and turn2 and wake_ms is not None
+            and job.get("startedAt") and job.get("finishedAt")
+            and turn1["endedAt"] * 1000 < job["startedAt"]
+            < job["finishedAt"] <= wake_ms
+            <= turn2["startedAt"] * 1000)
+        # zero codex turns for this unit while the job ran
+        during = [t for t in turns
+                  if turn1 and job.get("startedAt") and job.get("finishedAt")
+                  and turn1["endedAt"] * 1000 <= (t.get("startedAt") or 0) * 1000
+                  < job["finishedAt"]]
+        checks["model-not-polling"] = not during
+        checks["fresh-turn-after-wake"] = bool(
+            turn1 and turn2
+            and turn1["threadId"] != turn2["threadId"]
+            and turn1["turnId"] != turn2["turnId"])
+        detail["turn1"] = {k: turn1.get(k) for k in
+                           ("threadId", "turnId", "startedAt", "endedAt")} if turn1 else None
+        detail["turn2"] = {k: turn2.get(k) for k in
+                           ("threadId", "turnId", "startedAt", "endedAt")} if turn2 else None
+
+        # delta carried into the second turn's prompt
+        t2_call = next((c for c in ptap.in_cwd("/u0")
+                        if turn2 and abs(c["ts"] - turn2["startedAt"]) < 5
+                        and not c["read_only"]), None)
+        checks["delta-resumed"] = bool(
+            t2_call and "自上次唤醒的增量" in t2_call["prompt"]
+            and "job-output" in (t2_call["prompt"]
+                                 + (unit.get("delta") or "")))
+        detail["turn2PromptHead"] = (t2_call["prompt"][:200]
+                                     if t2_call else None)
+
+        integ_branch = f"laomo/{mid}/integration"
+        final_txt = git(repo, "show", f"{integ_branch}:final.txt")
+        job_out = git(repo, "show", f"{integ_branch}:job-output.txt")
+        (ev.root / "final.txt").write_text(final_txt, "utf-8")
+        checks["final-content"] = ("BACKGROUND-DONE" in final_txt
+                                   and "WAKE-RESUMED" in final_txt
+                                   and "BACKGROUND-DONE" in job_out)
+        detail["finalTxt"] = final_txt.strip()
+
+        checks["source-isolation"] = (
+            git(repo, "rev-parse", "HEAD") == base_sha
+            and porcelain(repo) == before)
+    finally:
+        stop_watch.set()
+        adapter.shutdown()
+
+    verdict = all(checks.values())
+    result = {"gate": "D", "checks": checks, "detail": detail,
+              "verdict": "PASS" if verdict else "FAIL"}
+    ev.write("summary.json", result)
+    ev.log(f"Gate D verdict: {result['verdict']} checks={checks}")
+    return result
+
+
+# ---------------------------------------------------------------- registry
+
 # ---------------------------------------------------------------- registry
 
 # ---------------------------------------------------------------- registry
@@ -844,6 +1072,7 @@ GATES = {
     "A": lambda ev, scratch: gate_a(ev, scratch),
     "B": lambda ev, scratch: gate_b(ev, scratch),
     "C": lambda ev, scratch: gate_c(ev, scratch),
+    "D": lambda ev, scratch: gate_d(ev, scratch),
 }
 
 
