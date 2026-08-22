@@ -196,6 +196,12 @@ class WorktreeTest(unittest.TestCase):
     def intbranch(self, mid):
         return f"laomo/{mid}/integration"
 
+    def integ_events(self, mid, unit):
+        return [e["detail"] for e in self.events(mid)
+                if e["type"] == "integration"
+                and isinstance(e.get("detail"), dict)
+                and e["detail"].get("unit") == unit]
+
     def show(self, mid, relpath):
         """File content as committed on the integration branch (stripped)."""
         return git(self.repo, "show", f"{self.intbranch(mid)}:{relpath}")
@@ -328,40 +334,103 @@ class SerialWorktreeTest(WorktreeTest):
         return d
 
 
+
+
+def resolve_conflict_file(path):
+    """Test stand-in for the resolver worker: concatenate both sides of git
+    conflict markers (ours then theirs). Returns True when markers were
+    found and resolved."""
+    try:
+        text = Path(path).read_text("utf-8")
+    except OSError:
+        return False
+    if "<<<<<<<" not in text:
+        return False
+    out, mode, ours, theirs = [], None, [], []
+    for line in text.splitlines():
+        if line.startswith("<<<<<<<"):
+            mode = "ours"
+            continue
+        if line.startswith("=======") and mode == "ours":
+            mode = "theirs"
+            continue
+        if line.startswith(">>>>>>>") and mode == "theirs":
+            out.extend(ours)
+            out.extend(theirs)
+            ours, theirs, mode = [], [], None
+            continue
+        if mode == "ours":
+            ours.append(line)
+        elif mode == "theirs":
+            theirs.append(line)
+        else:
+            out.append(line)
+    Path(path).write_text("\n".join(out) + "\n", "utf-8")
+    return True
+
+
 class WorktreeConflictTest(WorktreeTest):
-    def test_conflicting_integration_blocks_mission_and_marks_unit(self):
+    """M5-C: an integration conflict no longer blocks the mission — it is
+    materialized INTO the unit worktree (merge left in progress), the
+    resolver worker resolves there, the unit evaluator must PASS again, and
+    only then does integration re-run (clean fast-forward)."""
+
+    def test_conflicting_integration_auto_resolves_and_completes(self):
         self.adapter.shared = True
         self.adapter.script("planner", plan_block(UNIT_PLAN_2))
         self.adapter.script("worker", handoff_text(note="单元完成。"),
-                            handoff_text(note="单元完成。"))
+                            handoff_text(note="单元完成。"),
+                            handoff_text(note="冲突已解决。"))
+        self.adapter.defaults["worker"] = handoff_text(note="冲突已解决。")
         self.adapter.defaults["evaluator"] = verdict_block("PASS", ["条件满足"])
         mid = self.create()
         integ = self.intdir(mid)
+        resolved = {"n": 0}
 
         def on_worker(prompt, cwd, n):
-            # 单元 #2（index 1）开工后，集成分支被外部提交改动同一文件
-            if "单元 #2" in (prompt or ""):
+            p2 = "单元 #2" in (prompt or "")
+            # 单元 #2 首轮开工后，集成分支被外部提交改动同一文件
+            if p2 and "集成冲突" not in (prompt or ""):
                 with open(integ / "shared.txt", "a", encoding="utf-8") as fh:
                     fh.write("external\n")
                 git(integ, "add", "-A")
                 git(integ, "commit", "-q", "-m", "external change")
+            # resolver 轮：真实 worker 会就地解决冲突标记；WritingAdapter
+            # 会整文件覆写 shared.txt，这里直接写出合并结果代替
+            if p2 and "集成冲突" in (prompt or ""):
+                base = (integ / "shared.txt").read_text("utf-8")
+                (Path(cwd) / "shared.txt").write_text(
+                    base + "from unit worker 2\n", "utf-8")
+                resolved["n"] += 1
 
         self.adapter.on_worker = on_worker
         self.mgr.start(mid)
-        self.assertEqual(self.wait_terminal(mid), "blocked")
+        self.assertEqual(self.wait_terminal(mid, timeout=30), "done")
 
-        u0, u1 = self.plan(mid)["units"]
+        plan = self.plan(mid)
+        u0, u1 = plan["units"][0], plan["units"][1]
         self.assertEqual(u0["state"], "integrated")
-        self.assertEqual(u1["state"], "conflict")
-        conflicts = [e for e in self.events(mid)
-                     if e["type"] == "integration"
-                     and (e["detail"] or {}).get("phase") == "conflict"]
-        self.assertEqual(len(conflicts), 1)
-        self.assertEqual(conflicts[0]["detail"]["unit"], 1)
-        # merge 已 abort：集成工作树无冲突残留，集成分支保持外部提交内容
+        self.assertEqual(u1["state"], "integrated")
+        self.assertEqual(int(u1.get("conflictCount") or 0), 1,
+                         "恰好一次冲突自动解决")
+        self.assertEqual(resolved["n"], 1, "resolver worker 应解决一次标记")
+        conflict = u1.get("conflict") or {}
+        self.assertTrue(conflict.get("integrationHead"))
+        self.assertTrue(conflict.get("mergeBase"))
+        self.assertEqual([f.get("path") for f in conflict.get("files") or []],
+                         ["shared.txt"], "冲突记录应精确到文件与两侧 blob")
+        phases = [d.get("phase") for d in self.integ_events(mid, 1)]
+        self.assertIn("conflict-resolve", phases)
+        # 集成分支无 MERGE_HEAD 残留；双方内容都保留
         self.assertFalse(git_ok(integ, "rev-parse", "-q", "--verify", "MERGE_HEAD"))
-        self.assertNotIn("from unit worker 2", (integ / "shared.txt").read_text("utf-8"))
-        self.assertNotIn("from unit worker 2", self.show(mid, "shared.txt"))
+        merged = self.show(mid, "shared.txt")
+        self.assertIn("external", merged, "集成侧内容必须保留")
+        self.assertIn("from unit worker 2", merged, "单元侧内容必须保留")
+        # Resolver 之后必须重新过 unit evaluator（gate 5）
+        u1_evals = [c for c in self.adapter.calls_for("evaluator")
+                    if str(c.get("cwd") or "").endswith("/u1")]
+        self.assertEqual(len(u1_evals), 2,
+                         "冲突解决后必须重新验收：实际 %d 次" % len(u1_evals))
         # 用户主仓库全程未被触碰
         self.assertEqual(git(self.repo, "rev-parse", "HEAD"), self.initial_sha)
         self.assertFalse((self.repo / "shared.txt").exists())
@@ -472,12 +541,6 @@ class IntegrationReconcileTest(WorktreeTest):
         self.adapter.script("worker", handoff_text(note="单元B 完成。"))
         self.adapter.defaults["evaluator"] = verdict_block("PASS", ["条件满足"])
 
-    def integ_events(self, mid, unit):
-        return [e["detail"] for e in self.events(mid)
-                if e["type"] == "integration"
-                and isinstance(e.get("detail"), dict)
-                and e["detail"].get("unit") == unit]
-
     def test_crash_after_merge_adopts_git_truth(self):
         """M5 核心：git merge 已成功合入集成分支 → 进程崩溃 → plan.json 仍写
         integrating。重启后以 git 为真相直接采纳合并结果（不重放、不产生新
@@ -552,9 +615,9 @@ class IntegrationReconcileTest(WorktreeTest):
         self.assertEqual(plan["units"][1]["state"], "integrated")
         self.assertEqual(git(self.repo, "rev-parse", "HEAD"), self.initial_sha)
 
-    def test_crashed_conflicted_merge_aborted_then_blocks(self):
+    def test_crashed_conflicted_merge_aborted_then_auto_resolves(self):
         """崩溃发生在冲突 merge 中途（集成工作树残留 MERGE_HEAD）：先 abort
-        保持集成分支干净，再重放 → 冲突如实落 conflict，mission blocked。"""
+        保持集成分支干净，重放遇到冲突 → M5-C 自动解决（非破坏性）→ DONE。"""
         mid = self.create()
         store = self.mgr.store_for(mid)
         wm = WorktreeManager(str(self.repo), store, mid)
@@ -579,20 +642,31 @@ class IntegrationReconcileTest(WorktreeTest):
               "unitHead": unit_head, "dirty": False, "startedAt": 1}
         self.craft_crash(mid, "integrating", tx, {**info, "headSha": unit_head})
 
+        # M5-C：崩溃恢复重放遇到冲突不再 blocked —— 冲突物化进单元工作树，
+        # resolver 轮把两侧内容合并写入，重新验收后干净集成
+        def on_worker(prompt, cwd, n):
+            if "集成冲突" in (prompt or ""):
+                (Path(cwd) / "shared.txt").write_text(
+                    "external\nfrom unit worker 1\n", "utf-8")
+        self.adapter.on_worker = on_worker
+
         self.mgr.start(mid)
-        self.assertEqual(self.wait_terminal(mid), "blocked")
+        self.assertEqual(self.wait_terminal(mid, timeout=30), "done")
 
         u0 = self.plan(mid)["units"][0]
-        self.assertEqual(u0["state"], "conflict")
+        self.assertEqual(u0["state"], "integrated")
+        self.assertEqual(int(u0.get("conflictCount") or 0), 1)
         self.assertFalse(git_ok(integ, "rev-parse", "-q", "--verify", "MERGE_HEAD"),
                          "reconcile 后不得残留 MERGE_HEAD")
-        self.assertEqual((integ / "shared.txt").read_text("utf-8"), "external\n")
-        self.assertEqual(self.show(mid, "shared.txt"), "external")
+        # 双方内容都保留在集成分支上
+        self.assertEqual(self.show(mid, "shared.txt"),
+                         "external\nfrom unit worker 1")
         phases = [d.get("phase") for d in self.integ_events(mid, 0)]
         self.assertIn("aborted-stale-merge", phases)
-        self.assertIn("conflict", phases)
+        self.assertIn("conflict-resolve", phases)
+        self.assertIn("integrated", phases)
         state = json.loads((self.mdir(mid) / "state.json").read_text("utf-8"))
-        self.assertIn("集成冲突", str(state.get("stopReason")))
+        self.assertFalse(state.get("stopReason"), "自动解决后不应有 stopReason")
         # 用户主仓库全程未被触碰
         self.assertEqual(git(self.repo, "rev-parse", "HEAD"), self.initial_sha)
         self.assertFalse((self.repo / "shared.txt").exists())
@@ -686,6 +760,185 @@ class LockOwnershipTest(WorktreeTest):
         self.assertFalse(wt_lock.exists(), "mission 工作树锁应被清除")
         self.assertFalse(integ_lock.exists(), "集成工作树锁应被清除")
         self.assertTrue(repo_lock.exists(), "用户主仓库的锁绝不能被删除")
+
+
+class ConflictResolverGatesTest(WorktreeTest):
+    """M5-C gates: second race during resolve, budget exhaustion, crash
+    during the resolver — the resolver always works in the UNIT worktree
+    and never loses non-conflicting work."""
+
+    def test_second_race_during_resolve_enters_round_two(self):
+        """Gate 6：B 解决冲突期间集成分支再次前进（C 已集成）→ B 再集成时
+        二次冲突 → 第二轮解决 → 双方全部保留。同时锁定 Gate 4：resolver
+        只发生在单元工作树，集成工作树内容在解决期间不被改动。"""
+        mid = self.create()
+        integ = self.intdir(mid)
+        snapshots = []
+
+        def on_worker(prompt, cwd, n):
+            p2 = "单元 #2" in (prompt or "")
+            if not p2:
+                return
+            if "集成冲突" not in (prompt or ""):
+                with open(integ / "shared.txt", "a", encoding="utf-8") as fh:
+                    fh.write("external-1\n")
+                git(integ, "add", "-A")
+                git(integ, "commit", "-q", "-m", "external 1")
+                return
+            if "第 1/2 次" in (prompt or ""):
+                # B 在解决期间，集成分支又前进了（第二轮竞争）
+                with open(integ / "shared.txt", "a", encoding="utf-8") as fh:
+                    fh.write("external-2\n")
+                git(integ, "add", "-A")
+                git(integ, "commit", "-q", "-m", "external 2")
+            # Gate 4：resolver 只允许在单元工作树；记录集成侧快照
+            snapshots.append((integ / "shared.txt").read_text("utf-8"))
+            base = (integ / "shared.txt").read_text("utf-8")
+            (Path(cwd) / "shared.txt").write_text(
+                base + "from unit worker 2\n", "utf-8")
+            self.assertTrue(str(cwd).endswith("/u1"),
+                            "resolver 必须发生在单元工作树: %s" % cwd)
+
+        self.adapter.shared = True
+        self.adapter.on_worker = on_worker
+        self.adapter.script("planner", plan_block(UNIT_PLAN_2))
+        self.adapter.defaults["worker"] = handoff_text(note="完成。")
+        self.adapter.defaults["evaluator"] = verdict_block("PASS", ["条件满足"])
+        self.mgr.start(mid)
+        self.assertEqual(self.wait_terminal(mid, timeout=40), "done")
+
+        plan = self.plan(mid)
+        u1 = plan["units"][1]
+        self.assertEqual(u1["state"], "integrated")
+        self.assertEqual(int(u1.get("conflictCount") or 0), 2,
+                         "二次竞争必须进入第二轮解决: %r" % u1.get("conflict"))
+        phases = [d.get("phase") for d in self.integ_events(mid, 1)]
+        self.assertEqual(phases.count("conflict-resolve"), 2)
+        merged = self.show(mid, "shared.txt")
+        for piece in ("external-1", "external-2", "from unit worker 2"):
+            self.assertIn(piece, merged, "三方内容都必须保留: %r" % merged)
+        # Gate 3：集成分支无 MERGE_HEAD 残留
+        self.assertFalse(git_ok(integ, "rev-parse", "-q", "--verify", "MERGE_HEAD"))
+        self.assertEqual(git(self.repo, "rev-parse", "HEAD"), self.initial_sha)
+
+    def test_budget_exhausted_blocks_with_evidence_preserved(self):
+        """Gate 7：每轮都产生新冲突 → conflictCount 超过预算 → 单元诚实落
+        conflict、mission blocked；单元工作树/分支/冲突证据全部保留。"""
+        mid = self.create()
+        integ = self.intdir(mid)
+
+        def on_worker(prompt, cwd, n):
+            if "单元 #2" not in (prompt or ""):
+                return
+            # 每一轮都在集成分支上追加外部改动，确保永远冲突
+            with open(integ / "shared.txt", "a", encoding="utf-8") as fh:
+                fh.write("external-%d\n" % n)
+            git(integ, "add", "-A")
+            git(integ, "commit", "-q", "-m", "external %d" % n)
+
+        self.adapter.shared = True
+        self.adapter.on_worker = on_worker
+        self.adapter.script("planner", plan_block(UNIT_PLAN_2))
+        self.adapter.defaults["worker"] = handoff_text(note="完成。")
+        self.adapter.defaults["evaluator"] = verdict_block("PASS", ["条件满足"])
+        self.mgr.start(mid)
+        self.assertEqual(self.wait_terminal(mid, timeout=40), "blocked")
+
+        u1 = self.plan(mid)["units"][1]
+        self.assertEqual(u1["state"], "conflict")
+        self.assertEqual(int(u1.get("conflictCount") or 0), 2,
+                         "恰好两次自动解决尝试；第三次冲突不再记账直接停止")
+        conflict = u1.get("conflict") or {}
+        self.assertTrue(conflict.get("files"), "冲突证据必须保留")
+        # 预算耗尽后单元工作树被还原到冲突前状态（无标记、无 MERGE_HEAD）
+        wt = Path(u1["worktree"]["path"])
+        self.assertTrue(wt.is_dir(), "单元工作树必须保留给人接管")
+        self.assertFalse(git_ok(wt, "rev-parse", "-q", "--verify", "MERGE_HEAD"))
+        shared = (wt / "shared.txt").read_text("utf-8")
+        self.assertNotIn("<<<<<<<", shared, "不得残留冲突标记")
+        self.assertFalse(git_ok(integ, "rev-parse", "-q", "--verify", "MERGE_HEAD"))
+        # 集成分支保持外部内容；用户主仓库未被触碰
+        self.assertIn("external", self.show(mid, "shared.txt"))
+        self.assertEqual(git(self.repo, "rev-parse", "HEAD"), self.initial_sha)
+        state = json.loads((self.mdir(mid) / "state.json").read_text("utf-8"))
+        self.assertIn("集成冲突", str(state.get("stopReason")))
+
+    def test_crash_during_resolver_resumes_and_completes(self):
+        """Gate 8：网关死在 resolver 中途（单元 resolving、工作树停在冲突
+        merge 状态）→ 重启后从现场继续解决，不从头开发。"""
+        mid = self.create()
+        store = self.mgr.store_for(mid)
+        wm = WorktreeManager(str(self.repo), store, mid)
+        # 手工构造崩溃现场：u0 已集成；u1 已完成自己的工作并进入冲突解决
+        info0 = wm.ensure(0, "单元A")
+        (Path(info0["path"]) / "feature-1.txt").write_text("u0\n", "utf-8")
+        self.assertTrue(wm.integrate(0, "单元A", branch=info0["branch"])["ok"])
+        wm.cleanup(0, branch=info0["branch"])
+        info1 = wm.ensure(1, "单元B")
+        u1wt = Path(info1["path"])
+        (u1wt / "shared.txt").write_text("from unit worker 2\n", "utf-8")
+        git(u1wt, "add", "-A")
+        git(u1wt, "commit", "-q", "-m", "unit 1 work")
+        integ = wm.integration_dir()
+        (integ / "shared.txt").write_text("external\n", "utf-8")
+        git(integ, "add", "-A")
+        git(integ, "commit", "-q", "-m", "external change")
+        mres = wm.merge_integration_into_unit(1)
+        self.assertTrue(mres["conflict"], "现场应停在冲突 merge 状态")
+        plan = {
+            "version": 2, "replans": 0, "gitIntegration": True,
+            "units": [
+                {"id": "a", "index": 0, "title": "单元A", "description": "",
+                 "acceptance": ["x"], "dependencies": [],
+                 "state": "integrated", "status": "integrated",
+                 "attempt": 1, "repairCount": 0, "conflictCount": 0,
+                 "conflict": None,
+                 "worktree": info0, "jobId": None, "delta": None,
+                 "repairDirective": None, "lastVerdict": "PASS",
+                 "integration": {"phase": "cleaned"},
+                 "worker": {"startedAt": 1, "finishedAt": 2}},
+                {"id": "b", "index": 1, "title": "单元B", "description": "",
+                 "acceptance": ["y"], "dependencies": ["a"],
+                 "state": "resolving", "status": "resolving",
+                 "attempt": 1, "repairCount": 0, "conflictCount": 1,
+                 "conflict": {"attempt": 1, "files": mres["files"],
+                              "integrationHead": mres["integrationHead"],
+                              "unitHead": mres["unitHead"],
+                              "mergeBase": mres["mergeBase"]},
+                 "worktree": info1, "jobId": None, "delta": None,
+                 "repairDirective": "集成冲突：请解决 shared.txt 的冲突标记。",
+                 "lastVerdict": "PASS",
+                 "integration": {"phase": "conflict-resolve"},
+                 "worker": {"startedAt": 1, "finishedAt": 2}},
+            ],
+        }
+        store.save_plan(plan)
+        store.save_state({"state": "running", "cycles": 2, "currentUnit": 1,
+                          "noProgress": 0, "progressSignature": "",
+                          "tokensUsed": 0, "wallElapsedMs": 0,
+                          "agentActiveMs": 0, "waitingMs": 0, "pausedMs": 0,
+                          "phaseStartedAt": 0})
+
+        def on_worker(prompt, cwd, n):
+            if "集成冲突" in (prompt or ""):
+                # 真实冲突标记在现场文件里：就地合并两侧
+                self.assertTrue(resolve_conflict_file(Path(cwd) / "shared.txt"),
+                                "崩溃现场应保留真实冲突标记")
+        self.adapter.on_worker = on_worker
+        self.adapter.defaults["worker"] = handoff_text(note="冲突已解决。")
+        self.adapter.defaults["evaluator"] = verdict_block("PASS", ["条件满足"])
+        self.mgr.start(mid)
+        self.assertEqual(self.wait_terminal(mid, timeout=30), "done",
+                         "重启后应从冲突现场继续完成: %r" % self.mgr.status(mid))
+
+        u1 = self.plan(mid)["units"][1]
+        self.assertEqual(u1["state"], "integrated")
+        self.assertEqual(int(u1.get("conflictCount") or 0), 1,
+                         "崩溃恢复不得额外烧冲突预算")
+        merged = self.show(mid, "shared.txt")
+        self.assertIn("external", merged)
+        self.assertIn("from unit worker 2", merged)
+        self.assertEqual(git(self.repo, "rev-parse", "HEAD"), self.initial_sha)
 
 
 class VerificationWorkspaceTest(WorktreeTest):
@@ -847,6 +1100,203 @@ class VerificationWorkspaceTest(WorktreeTest):
         self.assertTrue(diff.is_file(), "应产出 git-diff 证据")
         text = diff.read_text("utf-8")
         self.assertIn("feature-1.txt", text, "diff 应体现集成分支携带的工作")
+
+
+class WorktreeConflictHelpersTest(WorktreeTest):
+    """M5-C: non-destructive conflict repair — the merge is materialized
+    INSIDE the unit worktree so the resolver worker keeps every byte of the
+    unit's PASSed work.
+
+    * merge_integration_into_unit: conflict=True leaves the merge in
+      progress (MERGE_HEAD present, markers in the files) and reports the
+      unmerged paths with both sides' blob shas; non-conflicting files stay
+      byte-identical
+    * a plain resolve+commit concludes the merge (unit_merge_state
+      "merged") and wm.integrate then lands fast-forward
+    * abort_unit_merge returns the worktree to its pre-merge head
+    * unit_merge_state classifies clean / merged / missing
+    * the report is idempotent: replaying against an unconcluded merge
+      returns the same shape without running a second git merge
+    """
+
+    def make_divergent_unit(self):
+        """u0 commits unit work (base.txt edit + 4 new files); the
+        integration branch then gets an external commit editing base.txt
+        DIFFERENTLY — exactly one conflicting file, base.txt. Returns
+        (wm, mid, info, wt, integ)."""
+        mid = self.create()
+        store = self.mgr.store_for(mid)
+        wm = WorktreeManager(str(self.repo), store, mid)
+        info = wm.ensure(0, "单元A")
+        wt = Path(info["path"])
+        (wt / "base.txt").write_text("unit base\n", "utf-8")
+        for i in range(1, 5):
+            (wt / f"f{i}.txt").write_text(f"unit file {i}\n", "utf-8")
+        git(wt, "add", "-A")
+        git(wt, "commit", "-q", "-m", "unit 0 work")
+        integ = self.intdir(mid)
+        (integ / "base.txt").write_text("integ base\n", "utf-8")
+        git(integ, "add", "-A")
+        git(integ, "commit", "-q", "-m", "external change")
+        return wm, mid, info, wt, integ
+
+    def test_merge_into_unit_conflict_reports_both_blob_shas(self):
+        wm, mid, info, wt, integ = self.make_divergent_unit()
+        unit_head = git(wt, "rev-parse", "HEAD")
+        integ_sha = git(self.repo, "rev-parse", self.intbranch(mid))
+        before = {f"f{i}.txt": (wt / f"f{i}.txt").read_bytes()
+                  for i in range(1, 5)}
+
+        res = wm.merge_integration_into_unit(0)
+        self.assertFalse(res["ok"])
+        self.assertTrue(res["conflict"])
+        self.assertEqual(res["unitHead"], unit_head)
+        self.assertEqual(res["integrationHead"], integ_sha)
+        self.assertEqual(res["mergeBase"], self.initial_sha)
+        ours = git(self.repo, "rev-parse", f"{info['branch']}:base.txt")
+        theirs = git(self.repo, "rev-parse", f"{self.intbranch(mid)}:base.txt")
+        self.assertNotEqual(ours, theirs, "两侧 blob 必须不同才构成冲突")
+        self.assertEqual(res["files"],
+                         [{"path": "base.txt", "oursSha": ours,
+                           "theirsSha": theirs}])
+        # 冲突留在单元工作树里：MERGE_HEAD 在、真实文件带冲突标记
+        self.assertTrue(git_ok(wt, "rev-parse", "-q", "--verify", "MERGE_HEAD"))
+        self.assertIn("<<<<<<<", (wt / "base.txt").read_text("utf-8"))
+        # 非冲突文件逐字节未动（单元已 PASS 的工作不被破坏）
+        for name, blob in before.items():
+            self.assertEqual((wt / name).read_bytes(), blob,
+                             f"非冲突文件不得被改动: {name}")
+        # 失败形态：不存在的单元 worktree / 缺少集成分支
+        miss = wm.merge_integration_into_unit(42)
+        self.assertFalse(miss["ok"])
+        self.assertFalse(miss["conflict"])
+        self.assertTrue(miss.get("reason"))
+
+    def test_resolved_unit_merge_completes_and_integrates(self):
+        wm, mid, info, wt, integ = self.make_divergent_unit()
+        res = wm.merge_integration_into_unit(0)
+        self.assertTrue(res["conflict"])
+        # resolver worker 编辑真实冲突文件后普通提交（结论化 merge）
+        (wt / "base.txt").write_text("resolved\n", "utf-8")
+        git(wt, "add", "-A")
+        git(wt, "commit", "-q", "-m", "resolve conflict")
+        self.assertFalse(git_ok(wt, "rev-parse", "-q", "--verify", "MERGE_HEAD"))
+        self.assertEqual(wm.unit_merge_state(0), "merged")
+        # 集成成为干净的 fast-forward（集成分支已被单元包含）
+        integ_res = wm.integrate(0, "单元A", branch=info["branch"])
+        self.assertTrue(integ_res.get("ok"), integ_res)
+        self.assertEqual(self.show(mid, "base.txt"), "resolved")
+        self.assertEqual(self.show(mid, "f1.txt"), "unit file 1")
+        # 用户主仓库全程未被触碰
+        self.assertEqual(git(self.repo, "rev-parse", "HEAD"), self.initial_sha)
+
+    def test_abort_unit_merge_restores_pre_merge_state(self):
+        wm, mid, info, wt, integ = self.make_divergent_unit()
+        pre = git(wt, "rev-parse", "HEAD")
+        res = wm.merge_integration_into_unit(0)
+        self.assertTrue(res["conflict"])
+
+        self.assertTrue(wm.abort_unit_merge(0))
+        self.assertFalse(git_ok(wt, "rev-parse", "-q", "--verify", "MERGE_HEAD"),
+                         "abort 后不得残留 MERGE_HEAD")
+        self.assertEqual(git(wt, "rev-parse", "HEAD"), pre,
+                         "abort 应回到 merge 前的单元头")
+        self.assertEqual((wt / "base.txt").read_text("utf-8"), "unit base\n",
+                         "冲突文件应恢复为单元一侧的内容")
+        self.assertEqual(wm.unit_merge_state(0), "clean")
+        # 不存在的单元 → False（无可 abort）
+        self.assertFalse(wm.abort_unit_merge(42))
+
+    def test_unit_merge_state_classifications(self):
+        mid = self.create()
+        store = self.mgr.store_for(mid)
+        wm = WorktreeManager(str(self.repo), store, mid)
+        info = wm.ensure(0, "单元A")
+        wt = Path(info["path"])
+        # 全新单元（恰在集成头上）与带普通提交的单元都是 clean：
+        # 单元分支本来就切自集成头，包含集成分支不等于“已结论 merge”
+        self.assertEqual(wm.unit_merge_state(0), "clean")
+        (wt / "f1.txt").write_text("unit file 1\n", "utf-8")
+        git(wt, "add", "-A")
+        git(wt, "commit", "-q", "-m", "unit work")
+        self.assertEqual(wm.unit_merge_state(0), "clean")
+        # 工作树不存在 → missing
+        self.assertEqual(wm.unit_merge_state(9), "missing")
+        # 集成分支前进（不相交文件）→ 干净合并成一个 merge commit → merged
+        integ = self.intdir(mid)
+        (integ / "integ-extra.txt").write_text("extra\n", "utf-8")
+        git(integ, "add", "-A")
+        git(integ, "commit", "-q", "-m", "external extra")
+        unit_head = git(wt, "rev-parse", "HEAD")
+        res = wm.merge_integration_into_unit(0)
+        self.assertTrue(res["ok"], res)
+        self.assertFalse(res["conflict"])
+        self.assertEqual(res["files"], [])
+        self.assertEqual(res["unitHead"], unit_head)
+        self.assertTrue((wt / "integ-extra.txt").exists(),
+                        "干净合并应带入集成侧内容")
+        self.assertEqual(wm.unit_merge_state(0), "merged")
+
+    def test_merge_report_is_idempotent_on_unconcluded_merge(self):
+        wm, mid, info, wt, integ = self.make_divergent_unit()
+        first = wm.merge_integration_into_unit(0)
+        self.assertTrue(first["conflict"])
+        # 第二次调用（resume 路径）：不得再跑 git merge（git 也会拒绝），
+        # 而是以完全相同的形状报告当前未合并状态
+        second = wm.merge_integration_into_unit(0)
+        self.assertFalse(second["ok"])
+        self.assertTrue(second["conflict"])
+        for key in ("unitHead", "integrationHead", "mergeBase", "files"):
+            self.assertEqual(second[key], first[key], key)
+        self.assertTrue(git_ok(wt, "rev-parse", "-q", "--verify", "MERGE_HEAD"),
+                        "重放后 merge 仍应在进行中")
+        self.assertEqual(wm.unit_merge_state(0), "conflicted")
+
+    def test_marker_probe_and_control_plane_conclusion(self):
+        wm, mid, info, wt, integ = self.make_divergent_unit()
+        # 无 merge 进行中 → 无未解决标记
+        self.assertFalse(wm.has_unresolved_markers(0))
+        res = wm.merge_integration_into_unit(0)
+        self.assertTrue(res["conflict"])
+        self.assertTrue(wm.has_unresolved_markers(0),
+                        "带冲突标记的工作文件应被判为未解决")
+        # resolver 只编辑文件、不跑 git：内容已解决但 merge 仍未结论
+        (wt / "base.txt").write_text("resolved\n", "utf-8")
+        self.assertFalse(wm.has_unresolved_markers(0),
+                         "工作文件已无标记 → 已解决（index 仍报 unmerged 也不影响）")
+        self.assertTrue(git_ok(wt, "rev-parse", "-q", "--verify", "MERGE_HEAD"),
+                        "结论前 MERGE_HEAD 应仍在")
+        self.assertEqual(wm.unit_merge_state(0), "conflicted")
+        # 控制面代为结论：add -A + commit --no-edit（用 MERGE_MSG 成 merge 提交）
+        done = wm.conclude_unit_merge(0)
+        self.assertTrue(done["ok"], done)
+        self.assertTrue(done["headSha"])
+        self.assertFalse(git_ok(wt, "rev-parse", "-q", "--verify", "MERGE_HEAD"),
+                         "结论后 MERGE_HEAD 应消失")
+        parents = git(wt, "rev-list", "--parents", "-n", "1", "HEAD").split()
+        self.assertGreaterEqual(len(parents), 3, "结论后 HEAD 应为 merge commit")
+        self.assertEqual(parents[0], done["headSha"])
+        self.assertEqual(wm.unit_merge_state(0), "merged")
+        # 结论之后的集成干净通过（集成分支被单元包含 → fast-forward）
+        integ_res = wm.integrate(0, "单元A", branch=info["branch"])
+        self.assertTrue(integ_res.get("ok"), integ_res)
+        self.assertEqual(self.show(mid, "base.txt"), "resolved")
+        self.assertEqual(self.show(mid, "f1.txt"), "unit file 1")
+        self.assertEqual(git(self.repo, "rev-parse", "HEAD"), self.initial_sha,
+                         "用户主仓库绝不能被触碰")
+
+    def test_conclude_unit_merge_fails_without_merge_in_progress(self):
+        wm, mid, info, wt, integ = self.make_divergent_unit()
+        done = wm.conclude_unit_merge(0)
+        self.assertFalse(done["ok"])
+        self.assertIsNone(done["headSha"])
+        self.assertTrue(done.get("reason"))
+        # 不存在的单元 worktree 同样 ok=False（永不抛异常）
+        miss = wm.conclude_unit_merge(42)
+        self.assertFalse(miss["ok"])
+        self.assertIsNone(miss["headSha"])
+        self.assertTrue(miss.get("reason"))
+        self.assertFalse(wm.has_unresolved_markers(42))
 
 
 if __name__ == "__main__":

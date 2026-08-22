@@ -13,7 +13,7 @@ from typing import Any, Callable
 
 from .dag import (UNIT_DEP_DONE, UNIT_EVALUATING, UNIT_INTEGRATED,
                   UNIT_INTEGRATING, UNIT_PASSED, UNIT_PENDING, UNIT_READY,
-                  UNIT_REPAIRING, UNIT_RUNNING, UNIT_WAITING,
+                  UNIT_REPAIRING, UNIT_RESOLVING, UNIT_RUNNING, UNIT_WAITING,
                   dependency_satisfied, normalize_plan, plan_requires_integration)
 from .jobs import (JobWatcher, _process_identity, _terminate_job_process,
                    job_log_tail)
@@ -528,7 +528,8 @@ class MissionRunner(threading.Thread):
             if slots > 0:
                 need = [u["index"] for u in plan["units"]
                         if u["state"] in (UNIT_RUNNING, UNIT_EVALUATING,
-                                          UNIT_REPAIRING, UNIT_WAITING)
+                                          UNIT_REPAIRING, UNIT_RESOLVING,
+                                          UNIT_WAITING)
                         and u["index"] not in owned]
                 ready = [u["index"] for u in plan["units"]
                          if u["state"] == UNIT_READY and u["index"] not in owned]
@@ -572,10 +573,15 @@ class MissionRunner(threading.Thread):
     def _integrate_harvested(self, state: dict[str, Any], index: int) -> str:
         """A unit PASSed: integrate (Control Plane duty) then advance the
         mission's currentUnit hint for the next runnable unit. Returns
-        "ok" | "conflict" | "failed" | "none"."""
+        "ok" | "repair" | "conflict" | "failed" | "none"."""
         integ = self._integrate(state, index)
         if integ in ("conflict", "failed"):
             return integ
+        if integ == "repair":
+            # the conflicting unit itself is the current task again — its
+            # redo re-enters through the normal repairing dispatch
+            self._transition(state, "running", currentUnit=index)
+            return "repair"
         nxt = self._next_ready(self.store.load_plan())
         self._transition(state, "running",
                          currentUnit=nxt if nxt is not None else index)
@@ -594,8 +600,9 @@ class MissionRunner(threading.Thread):
         `integration` record (pre-merge unitHead + dirty flag) is persisted
         ATOMICALLY with state=integrating BEFORE git runs, so a crash at any
         point can be reconciled from git truth (see _reconcile_integration).
-        Returns "ok" | "conflict" | "failed" | "none" (never had a worktree —
-        P1.1 mode edits the workspace directly)."""
+        Returns "ok" | "repair" (conflict staged for redo-on-new-base) |
+        "conflict" | "failed" | "none" (never had a worktree — P1.1 mode
+        edits the workspace directly)."""
         unit = self._unit(index)
         if unit is None:
             return "failed"
@@ -630,6 +637,19 @@ class MissionRunner(threading.Thread):
                   "startedAt": _now_ms(), "backfilled": True}
             unit["integration"] = tx
             self._save_unit(unit)
+        if wtree.unit_merge_state(index) == "conflicted":
+            # The resolver worker edits files but never runs git, so the
+            # control plane settles the merge itself. Markers still in the
+            # files => the resolution is genuinely incomplete: resume the
+            # SAME conflict attempt (no extra budget; the no-progress fuse
+            # bounds the loop). No markers => the worker finished: stage +
+            # commit the resolution (the merge commit) and fall through —
+            # the integration merge below then fast-forwards.
+            if wtree.has_unresolved_markers(index):
+                self._stage_conflict_resolution(wtree, unit, index, info, tx,
+                                                resume=True)
+                return "repair"
+            wtree.conclude_unit_merge(index)
         result = wtree.integrate(index, unit.get("title"), branch=info.get("branch"))
         if result.get("ok"):
             unit["worktree"] = wtree.refresh_head(unit.get("worktree") or info)
@@ -648,6 +668,8 @@ class MissionRunner(threading.Thread):
             self._save_unit(unit)
             return "ok"
         if result.get("conflict"):
+            if self._stage_conflict_resolution(wtree, unit, index, info, tx):
+                return "repair"
             unit["integration"] = {**tx, "phase": "conflict"}
             unit["state"] = unit["status"] = "conflict"
             self._save_unit(unit)
@@ -660,6 +682,74 @@ class MissionRunner(threading.Thread):
         self.store.event("integration", {"unit": index, "phase": "failed",
                                          "reason": (result.get("reason") or "")[:200]})
         return "failed"
+
+    # budget for automatic conflict resolution: past this the unit lands on
+    # its honest `conflict` state and the mission stops for a human
+    CONFLICT_REPAIRS = 2
+
+    def _stage_conflict_resolution(self, wtree: WorktreeManager,
+                                   unit: dict[str, Any], index: int,
+                                   info: dict[str, Any], tx: dict[str, Any],
+                                   resume: bool = False) -> bool:
+        """M5-C: the integration merge conflicted — materialize the conflict
+        INSIDE the unit worktree (git merge <integration> there, left in
+        progress with markers) so the resolver worker keeps every byte of
+        the unit's already-PASSed non-conflicting work. The unit goes to
+        `resolving` with a directive naming the conflicted files and both
+        sides' blob shas; the worker resolves in its own worktree, the unit
+        evaluator must PASS again, and only then does integration re-run
+        (the resolution commit completes the merge, so re-integration is a
+        clean fast-forward). Returns False when the budget is exhausted or
+        the merge cannot be staged — the caller then falls back to the
+        honest conflict/blocked stop. resume=True re-arms a resolution that
+        was left unconcluded (same attempt, no extra budget)."""
+        conflicts = int(unit.get("conflictCount") or 0) + (0 if resume else 1)
+        if conflicts > self.CONFLICT_REPAIRS:
+            wtree.abort_unit_merge(index)  # leave the unit pristine for a human
+            return False
+        mres = wtree.merge_integration_into_unit(index)
+        if not mres.get("ok") and not mres.get("conflict"):
+            wtree.abort_unit_merge(index)
+            return False
+        files = [f.get("path") for f in (mres.get("files") or [])
+                 if f.get("path")][:10]
+        unit["conflictCount"] = conflicts
+        unit["conflict"] = {
+            "attempt": conflicts, "startedAt": _now_ms(),
+            "integrationHead": mres.get("integrationHead"),
+            "unitHead": mres.get("unitHead"),
+            "mergeBase": mres.get("mergeBase"),
+            "files": mres.get("files") or [],
+            "clean": bool(mres.get("ok")),  # merged without textual conflict
+        }
+        unit["integration"] = {**tx, "phase": "conflict-resolve"}
+        unit["state"] = unit["status"] = UNIT_RESOLVING
+        if mres.get("ok"):
+            directive = (
+                f"集成分支的最新内容已并入你的工作树（无文本冲突，已提交 merge）。"
+                "请核对本单元的验收标准仍然满足——集成侧的改动可能与你的工作在"
+                "语义上冲突。确认或修正后结束本轮。")
+        else:
+            directive = (
+                f"集成冲突（第 {conflicts}/{self.CONFLICT_REPAIRS} 次自动解决）："
+                f"集成分支的最新内容已 merge 进你的工作树并停在冲突状态"
+                f"（integrationHead={(mres.get('integrationHead') or '')[:12]}，"
+                f"mergeBase={(mres.get('mergeBase') or '')[:12]}）。"
+                "以下文件两侧都有改动，请直接在工作树中解决冲突标记"
+                "（保留双方意图，不要丢弃集成侧内容），不要执行 git 命令：\n- "
+                + "\n- ".join(files))
+        unit["repairDirective"] = directive[:4000]
+        self._save_unit(unit)
+        self.store.write_progress_md()
+        self.store.event("integration", {"unit": index,
+                                         "phase": "conflict-resume" if resume
+                                         else "conflict-resolve",
+                                         "attempt": conflicts,
+                                         "files": files,
+                                         "integrationHead": mres.get("integrationHead"),
+                                         "unitHead": mres.get("unitHead"),
+                                         "mergeBase": mres.get("mergeBase")})
+        return True
 
     def _reconcile_integration(self, state: dict[str, Any], index: int) -> str:
         """M5 crash reconcile for a unit wedged in `integrating`. Git is the
@@ -1385,6 +1475,15 @@ class MissionManager:
             store = MissionStore(run_root)
             state = store.load_state()
             name = state.get("state")
+            if name == "done" and not store.evidence_manifest():
+                # the manifest lands milliseconds after the done state save;
+                # a crash in that window must not leave DONE without durable
+                # evidence (DONE = code + verification + final PASS +
+                # evidence durable). Idempotent: an existing manifest is
+                # returned unchanged by the emitter itself.
+                MissionRunner(self, mission_id)._emit_evidence_manifest()
+                store.event("recover", "done: evidence manifest rebuilt")
+                continue
             if name in TERMINAL_STATES or name in ("draft", None):
                 continue
             if name == "paused":

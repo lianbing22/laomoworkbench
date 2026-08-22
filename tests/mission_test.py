@@ -1160,6 +1160,42 @@ class TestHarnessVerificationGate(MissionLoopTest):
 
 
 class TestEvidenceManifest(MissionLoopTest):
+    def test_39_done_without_manifest_recover_repairs_evidence(self):
+        """DONE 状态落盘与 manifest 写入之间的崩溃窗口：recover() 对
+        done-but-no-manifest 的 mission 幂等重建 evidence，且不复活 runner。"""
+        marker = self.root / "marker.txt"
+
+        def plant(prompt):
+            marker.write_text("ok", encoding="utf-8")
+            return handoff_text()
+
+        self.adapter.script("worker", plant)
+        self.adapter.set_default("evaluator", verdict_block("PASS", ["条件满足"]))
+        mid = self.create_mission(cwd=str(self.root), verification={
+            "requiredFiles": ["marker.txt"]})
+        self.mgr.start(mid)
+        self.assertTrue(self.wait_state(self.mgr, mid, ["done"], timeout=30))
+        manifest = self.mdir(mid) / "evidence" / "manifest.json"
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not manifest.is_file():
+            time.sleep(POLL_INTERVAL)
+        self.assertTrue(manifest.is_file(), "DONE 后应落盘 manifest")
+        # 模拟崩溃窗口：manifest 丢失
+        manifest.unlink()
+        self.mgr.recover()
+        self.assertTrue(manifest.is_file(), "recover 必须重建缺失的 manifest")
+        data = self.read_json(manifest)
+        self.assertEqual(data.get("state"), "done")
+        self.assertIn("artifact/marker.txt", data.get("entries") or {})
+        # 幂等：重建结果确定（相同 sha256），且不复活已终结 mission
+        first = data.get("sha256")
+        manifest.unlink()
+        self.mgr.recover()
+        again = self.read_json(manifest)
+        self.assertEqual(again.get("sha256"), first, "重建必须幂等")
+        self.assertEqual(self.state_vals(self.mgr, mid) & {"done"}, {"done"},
+                         "recover 不得复活已终结的 mission")
+
     def test_26_manifest_at_done_with_hashes_immutable(self):
         artifact = self.root / "artifact.txt"
         artifact.write_text("v1", encoding="utf-8")

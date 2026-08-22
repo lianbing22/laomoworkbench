@@ -1,5 +1,5 @@
 """WorktreeManager: per-unit git worktrees + mission integration isolation
-(P1.2/M3/M5-B).
+(P1.2/M3/M5-B/M5-C).
 
 The user's checked-out branch is NEVER touched. Every work unit builds in
 its own git worktree inside the mission's namespace
@@ -12,11 +12,21 @@ integration worktree, never in the user's working copy — and the
 integration branch deliberately survives mission DONE: the user merges it
 back explicitly when they choose to. Non-git workspaces (or a workspace
 whose repo is unavailable) fall back to the P1.1 behavior: the worker
-edits the workspace directory itself and integration is a no-op. Conflicts
-from integration are reported, not resolved — the mission blocks on the
-unit's `conflict` state with the merge aborted (a resolver is deliberately
-out of scope; M5 instead made integration a crash-safe transaction: see
-WorktreeManager.is_merged / MissionRunner._reconcile).
+edits the workspace directory itself and integration is a no-op. A content
+conflict aborts the merge so the integration branch stays clean, and M5-C
+adds the git primitives the CONTROL PLANE uses to repair automatically
+(merge into unit — non-destructive by design): merge_integration_into_unit
+materializes the conflict INSIDE the unit worktree and deliberately leaves
+it in progress so the resolver worker edits the real conflicted files and
+keeps every byte of the unit's PASSed work; unit_merge_state classifies a
+crashed unit worktree; has_unresolved_markers judges the resolver's WORKING
+files (the worker edits content but never runs git, so the control plane
+concludes a resolved merge itself via conclude_unit_merge);
+abort_unit_merge backs an exhausted redo out. The
+policy — when to repair, how often, when to give up — deliberately stays
+in the control plane (this module only serves git truth; see
+WorktreeManager.is_merged / MissionRunner._reconcile for the crash-safe
+transaction side).
 
 Stale-lock cleanup is ownership-aware (M5-B): only index.lock files inside
 THIS mission's worktrees root may be removed; a lock anywhere else (e.g.
@@ -301,6 +311,169 @@ class WorktreeManager:
             self._git(idir, "merge", "--abort")
         return {"ok": False, "conflict": conflict,
                 "reason": out[:400] or "merge failed"}
+
+    # -- conflict repair primitives (M5-C) -------------------------------------
+
+    def _unmerged_files(self, path: Path) -> list[dict[str, Any]]:
+        """Both sides of every unmerged path in a conflicted worktree:
+        ours = stage 2 (the unit's PASSed work), theirs = stage 3 (the
+        integration side). Blob shas, not content — the resolver worker
+        reads the marked-up files in its own worktree."""
+        _, out = self._git(path, "diff", "--name-only", "--diff-filter=U")
+        files: list[dict[str, Any]] = []
+        for name in (ln for ln in out.splitlines() if ln.strip()):
+            ours = theirs = None
+            _, lsout = self._git(path, "ls-files", "-u", "--", name)
+            for line in lsout.splitlines():
+                parts = line.partition("\t")[0].split()
+                if len(parts) < 3:
+                    continue
+                if parts[2] == "2":
+                    ours = parts[1]
+                elif parts[2] == "3":
+                    theirs = parts[1]
+            files.append({"path": name, "oursSha": ours, "theirsSha": theirs})
+        return files
+
+    def merge_integration_into_unit(self, index: int) -> dict[str, Any]:
+        """Merge the integration branch INTO the unit worktree so the repair
+        keeps every byte of the unit's PASSed work (non-destructive by
+        design — no reset, no rebase). On a content conflict the merge is
+        deliberately LEFT IN PROGRESS in the unit worktree: the resolver
+        worker edits the real conflicted files (markers and all) and
+        concludes with a plain `git commit`, after which integrate() merges
+        the unit branch fast-forward. Idempotent for the resume path: when
+        the worktree already has an unconcluded merge (MERGE_HEAD present —
+        a crash or a replay), no new `git merge` runs (git would refuse);
+        the CURRENT unmerged state is reported with the exact same shape so
+        the manager can refresh its directive without burning the conflict
+        budget. Returns {ok, conflict, integrationHead, unitHead, mergeBase,
+        files, reason}; ok=True only for a cleanly completed merge (files
+        empty), ok=False + conflict=False when the worktree / integration
+        branch is missing or git itself errored."""
+        path = self._worktree_dir(index)
+        shape = {"ok": False, "conflict": False, "integrationHead": None,
+                 "unitHead": None, "mergeBase": None,
+                 "files": [], "reason": ""}
+        if not path.is_dir() or not self.rev(path):
+            return {**shape, "reason": "worktree 不存在"}
+        # during an unconcluded merge HEAD is still the pre-merge unit head
+        unit_head = self.rev(path)
+        ok, _ = self._git(path, "rev-parse", "-q", "--verify", "MERGE_HEAD")
+        if ok:  # resume/replay: report the in-progress merge as-is
+            merge_head = self.rev(path, "MERGE_HEAD")
+            _, merge_base = self._git(path, "merge-base", "HEAD", "MERGE_HEAD")
+            return {**shape, "conflict": True, "integrationHead": merge_head,
+                    "unitHead": unit_head, "mergeBase": merge_base or None,
+                    "files": self._unmerged_files(path),
+                    "reason": "merge 尚未结论（崩溃/重放）：报告当前未合并状态"}
+        integ_head = self.rev(path, self.integration_branch)
+        if not integ_head:
+            return {**shape, "unitHead": unit_head, "reason": "集成分支不可用"}
+        _, merge_base = self._git(path, "merge-base", "HEAD",
+                                  self.integration_branch)
+        ok, out = self._git(path, *self.COMMIT_USER, "merge", "--no-edit",
+                            "-m", f"laomo: merge integration into unit "
+                                  f"#{index + 1}",
+                            self.integration_branch)
+        if ok:
+            return {**shape, "ok": True, "integrationHead": integ_head,
+                    "unitHead": unit_head, "mergeBase": merge_base or None,
+                    "reason": ""}
+        ok, _ = self._git(path, "rev-parse", "-q", "--verify", "MERGE_HEAD")
+        if not ok:  # a plain git error, not a content conflict
+            return {**shape, "integrationHead": integ_head,
+                    "unitHead": unit_head, "mergeBase": merge_base or None,
+                    "reason": out[:400] or "merge failed"}
+        # content conflict: keep the merge in progress in the unit worktree
+        return {**shape, "conflict": True, "integrationHead": integ_head,
+                "unitHead": unit_head, "mergeBase": merge_base or None,
+                "files": self._unmerged_files(path),
+                "reason": out[:400] or "content conflict"}
+
+    def unit_merge_state(self, index: int) -> str:
+        """Crash-classification probe for the unit worktree: \"conflicted\"
+        (MERGE_HEAD present — resolution incomplete, whether or not the
+        worker already edited the files), \"merged\" (no MERGE_HEAD and HEAD
+        is a merge commit that contains the integration branch — the
+        resolution was committed), \"clean\" (nothing in progress),
+        \"missing\" (worktree gone). Ancestry alone cannot mean \"merged\"
+        because every unit branch is cut FROM the integration head and thus
+        always contains it; the merge-commit shape (2+ parents) is the
+        discriminator, so a normal unit with plain commits stays \"clean\".
+        Classification is against the CURRENT integration branch (a merge
+        concluded against an older integration head that has since advanced
+        reads as \"clean\" — the manager's tx record holds that history)."""
+        path = self._worktree_dir(index)
+        if not path.is_dir() or not self.rev(path):
+            return "missing"
+        ok, _ = self._git(path, "rev-parse", "-q", "--verify", "MERGE_HEAD")
+        if ok:
+            return "conflicted"
+        ok, parents = self._git(path, "rev-list", "--parents", "-n", "1", "HEAD")
+        if ok and len(parents.split()) >= 3:  # HEAD is a merge commit
+            ok, _ = self._git(path, "merge-base", "--is-ancestor",
+                              self.integration_branch, "HEAD")
+            if ok:
+                return "merged"
+        return "clean"
+
+    def has_unresolved_markers(self, index: int) -> bool:
+        """True when the unit worktree has an unconcluded merge AND at least
+        one unmerged path's WORKING-FILE still carries conflict markers —
+        the resolver worker has not actually finished. The worker edits
+        files but never runs git (the control plane owns git), so the index
+        stages may still record conflicts even after a finished resolution:
+        judge the file CONTENT, not the index. Only the unambiguous marker
+        starts are checked (`<<<<<<<` / `>>>>>>>`); a bare `=======` line is
+        legal content (e.g. markdown setext headings) and must not trip
+        this probe."""
+        path = self._worktree_dir(index)
+        ok, _ = self._git(path, "rev-parse", "-q", "--verify", "MERGE_HEAD")
+        if not ok:
+            return False
+        ok, out = self._git(path, "diff", "--name-only", "--diff-filter=U")
+        if not ok:
+            return False
+        for rel in out.splitlines():
+            if not rel.strip():
+                continue
+            try:
+                text = (path / rel).read_text("utf-8", errors="replace")
+            except OSError:
+                continue
+            for line in text.splitlines():
+                if line.startswith(("<<<<<<<", ">>>>>>>")):
+                    return True
+        return False
+
+    def conclude_unit_merge(self, index: int) -> dict[str, Any]:
+        """Control-plane conclusion of a RESOLVED merge: the resolver worker
+        is forbidden from git, so the control plane stages the edited files
+        and commits — during MERGE_HEAD this creates the merge commit (the
+        prepared MERGE_MSG), after which integrate() fast-forwards the
+        integration branch. Returns {ok, headSha, reason}; never raises."""
+        path = self._worktree_dir(index)
+        ok, _ = self._git(path, "rev-parse", "-q", "--verify", "MERGE_HEAD")
+        if not ok:
+            return {"ok": False, "headSha": None, "reason": "无进行中的 merge"}
+        self._git(path, "add", "-A")
+        ok, out = self._git(path, *self.COMMIT_USER, "commit", "--no-edit")
+        head = self.rev(path)
+        if not ok or not head:
+            return {"ok": False, "headSha": head,
+                    "reason": (out or "commit failed")[:300]}
+        return {"ok": True, "headSha": head, "reason": ""}
+
+    def abort_unit_merge(self, index: int) -> bool:
+        """`git merge --abort` in the unit worktree — used when the redo
+        budget is exhausted so the unit branch/worktree stay pristine at
+        their pre-merge head for a human. False when there is no worktree
+        or no merge in progress to abort."""
+        path = self._worktree_dir(index)
+        if not path.is_dir():
+            return False
+        return self._git(path, "merge", "--abort")[0]
 
     def cleanup(self, index: int, branch: str | None = None) -> None:
         """Remove the unit worktree and its branch (after a successful

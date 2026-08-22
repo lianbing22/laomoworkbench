@@ -31,7 +31,8 @@ from pathlib import Path
 from typing import Any
 
 from .dag import (UNIT_EVALUATING, UNIT_INTEGRATING, UNIT_INTEGRATED,
-                  UNIT_PASSED, UNIT_REPAIRING, UNIT_RUNNING, UNIT_WAITING)
+                  UNIT_PASSED, UNIT_REPAIRING, UNIT_RESOLVING, UNIT_RUNNING,
+                  UNIT_WAITING)
 from .jobs import JobWatcher, _ps_start_identity, job_log_tail
 from .models import (EVALUATOR_TURN_TIMEOUT, WORKER_TURN_TIMEOUT,
                      TERMINAL_STATES, _JOB_RE, _VERDICT_RE, _HANDOFF_RE,
@@ -134,6 +135,17 @@ class UnitRunner:
             if st == UNIT_REPAIRING:
                 if int(unit.get("repairCount", 0)) >= self.policy.max_repair:
                     return (self.LIMIT, payload)
+                self.runner._mirror("repairing", **payload)
+                if not self._phase_worker(unit, repair=True, payload=payload):
+                    return (self.STOP, payload)
+                continue
+            if st == UNIT_RESOLVING:
+                # M5-C: the integration conflict is materialized in this
+                # unit's worktree (merge left in progress); the worker
+                # resolves the markers, then the unit evaluator must PASS
+                # again before integration re-runs
+                if int(unit.get("conflictCount", 0)) > self.runner.CONFLICT_REPAIRS:
+                    return (self.CONFLICT, payload)
                 self.runner._mirror("repairing", **payload)
                 if not self._phase_worker(unit, repair=True, payload=payload):
                     return (self.STOP, payload)
@@ -411,9 +423,15 @@ class UnitRunner:
         with self.runner._sig_lock:
             with self.store.lock:
                 plan = self.store.load_plan()
+                # conflictCount rides along in the signature: a conflict
+                # round genuinely advances the world (its loop is budgeted
+                # by CONFLICT_REPAIRS, not by this fuse) and must never be
+                # misread as stagnation.
                 sig = hashlib.sha1(json.dumps({
-                    "statuses": [u.get("state") if u.get("state") in ("passed", "integrated", "blocked", "failed", "cancelled")
-                                 else "active" for u in plan["units"]],
+                    "statuses": [[u.get("state") if u.get("state") in ("passed", "integrated", "blocked", "failed", "cancelled")
+                                  else "active",
+                                  int(u.get("conflictCount") or 0)]
+                                 for u in plan["units"]],
                     "handoff": hashlib.sha1(self.store.load_handoff().encode()).hexdigest()[:12],
                 }, sort_keys=True).encode()).hexdigest()
                 disk = self.store.load_state()

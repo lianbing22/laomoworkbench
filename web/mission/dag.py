@@ -21,6 +21,7 @@ UNIT_RUNNING = "running"
 UNIT_WAITING = "waiting"
 UNIT_EVALUATING = "evaluating"
 UNIT_REPAIRING = "repairing"
+UNIT_RESOLVING = "resolving"  # M5-C: integration conflict, resolver at work
 UNIT_PASSED = "passed"
 UNIT_INTEGRATING = "integrating"
 UNIT_INTEGRATED = "integrated"
@@ -31,7 +32,7 @@ UNIT_CANCELLED = "cancelled"
 
 # states that count as "the unit is occupying a worker slot"
 UNIT_ACTIVE = {UNIT_READY, UNIT_RUNNING, UNIT_WAITING, UNIT_EVALUATING,
-               UNIT_REPAIRING, UNIT_INTEGRATING}
+               UNIT_REPAIRING, UNIT_RESOLVING, UNIT_INTEGRATING}
 # a dependency counts as satisfied when it reached at least this stage
 UNIT_DEP_DONE = {UNIT_PASSED, UNIT_INTEGRATED}
 
@@ -109,6 +110,10 @@ def normalize_plan(raw_units: list[Any],
             "dependencies": [],
             "state": UNIT_PENDING, "status": UNIT_PENDING,  # status = legacy mirror
             "attempt": 0, "repairCount": 0,
+            # M5-C: integration conflicts are budgeted separately from
+            # evaluator repairs — they are different failures and both
+            # matter as evidence
+            "conflictCount": 0, "conflict": None,
             "worktree": {"path": None, "branch": None, "baseSha": None, "headSha": None},
             "jobId": None, "delta": None, "repairDirective": None,
             "lastVerdict": None,
