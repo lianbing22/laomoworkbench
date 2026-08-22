@@ -154,6 +154,11 @@
                     <button id="providerButton" class="composer-tool attach-tool provider-tool" type="button" title="模型服务" aria-label="模型服务"><span>⚙</span><small>服务</small></button>
                     <select id="modelSelect" class="inline-select model-select" aria-label="模型"><option>读取模型…</option></select>
                     <select id="effortSelect" class="inline-select effort-select" aria-label="推理强度" title="推理强度"><option value="">强度…</option></select>
+                    <select id="workModeSelect" class="inline-select" aria-label="工作模式" title="工作模式：计划=只规划不执行（自动切只读）；自动=自主执行到底（自动切全自动）；聊天=普通对话">
+                      <option value="chat">聊天</option>
+                      <option value="plan">计划</option>
+                      <option value="auto">自动</option>
+                    </select>
                     <select id="permissionSelect" class="inline-select" aria-label="权限模式">
                       <option value="workspace-write">工作区写入（询问）</option>
                       <option value="full-auto">全自动（免批准）</option>
