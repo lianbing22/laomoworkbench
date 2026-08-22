@@ -11,6 +11,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
+from .dag import normalize_plan
 from .jobs import (JobWatcher, _process_identity, _ps_start_identity,
                    _terminate_job_process, job_log_tail)
 from .models import (EVALUATOR_TURN_TIMEOUT, RUNS_DIRNAME, WORKER_TURN_TIMEOUT,
@@ -254,14 +255,16 @@ class MissionRunner(threading.Thread):
             + (f"总验收标准：\n- " + "\n- ".join(mission.get("acceptanceCriteria") or []) + "\n"
                if mission.get("acceptanceCriteria") else "")
             + "要求：2-6 个单元；每个单元给出 title、description、acceptance（可勾选的验收标准列表）。\n"
+              "单元之间若存在先后依赖（后续单元需要前置结果），请给每个单元一个稳定 id（如 schema）"
+              "并把依赖写入 dependencies（前置单元的 id 或 title 列表）；无依赖的并行单元不要写 dependencies。\n"
               "只在回复末尾输出标记块（JSON 数组，不要其它格式）：\n"
               "<<<LAOMO_PLAN\n"
-              '[{"title":"...","description":"...","acceptance":["..."]}]'
+              '[{"id":"schema","title":"...","description":"...","acceptance":["..."],"dependencies":[]}]'
               "\nLAOMO_PLAN>>>"
         )
         result = self._turn(state, prompt)
-        units = parse_json_marker(result.get("text") or "", _PLAN_RE)
-        if not isinstance(units, list) or not units:
+        raw_units = parse_json_marker(result.get("text") or "", _PLAN_RE)
+        if not isinstance(raw_units, list) or not raw_units:
             # default-fail: unparseable plan retries once via replan cycle cap
             state["planningFailures"] = int(state.get("planningFailures", 0)) + 1
             if state["planningFailures"] >= 2:
@@ -269,23 +272,15 @@ class MissionRunner(threading.Thread):
                 return False
             self.store.event("planning", "unparseable plan output")
             return True
-        plan = {"units": [], "replans": 0}
-        for i, u in enumerate(units):
-            if not isinstance(u, dict) or not u.get("title"):
-                continue
-            plan["units"].append({
-                "index": len(plan["units"]),
-                "title": str(u.get("title"))[:120],
-                "description": str(u.get("description") or "")[:600],
-                "acceptance": [str(a) for a in (u.get("acceptance") or [])][:8],
-                "status": "pending", "repairCount": 0,
-            })
-        if not plan["units"]:
+        units, notes = normalize_plan(raw_units)
+        if not units:
             self._transition(state, "failed", stopReason="planner 未产出有效单元")
             return False
+        plan = {"version": 2, "units": units, "replans": 0}
         self.store.save_plan(plan)
-        self.store.event("planning", {"units": len(plan["units"])})
-        self._transition(state, "running", currentUnit=0)
+        self.store.event("planning", {"units": len(units), "dag": notes})
+        first = self._next_pending(plan, current=-1)
+        self._transition(state, "running", currentUnit=first if first is not None else 0)
         return True
 
     def _unit(self, index: int) -> dict[str, Any] | None:
@@ -309,13 +304,18 @@ class MissionRunner(threading.Thread):
             self._transition(state, "failed", stopReason=f"工作单元 {index} 不存在")
             return False
         mission = self.store.load_mission()
+        unit["state"] = unit["status"] = "running"
+        unit["attempt"] = int(unit.get("attempt", 0)) + 1
+        unit["worker"]["startedAt"] = _now_ms()
         if repair:
-            directive = state.get("repairDirective") or "修复验收未通过的问题"
             unit["repairCount"] = int(unit.get("repairCount", 0)) + 1
+            unit["repairDirective"] = str(state.get("repairDirective") or "修复验收未通过的问题")[:2000]
             self._save_unit(unit)
             self.store.write_repair(
                 f"{state.get('cycles')}-{index}-{unit['repairCount']}",
-                f"# RepairDirective\n\n{directive}\n\n## verdict\n{json.dumps(state.get('lastVerdict') or {}, ensure_ascii=False)}")
+                f"# RepairDirective\n\n{unit['repairDirective']}\n\n## verdict\n{json.dumps(state.get('lastVerdict') or {}, ensure_ascii=False)}")
+        else:
+            self._save_unit(unit)
         prompt = (
             "你是 Mission Worker（构建者）。只做当前这一个工作单元，不要做别的。\n"
             f"总目标：{mission.get('objective')}\n"
@@ -345,6 +345,11 @@ class MissionRunner(threading.Thread):
         if isinstance(job, dict) and job.get("command"):
             self._register_job(state, index, job)
             return True
+        unit = self._unit(index)
+        if unit is not None:
+            unit["worker"]["finishedAt"] = _now_ms()
+            unit["delta"] = None
+            self._save_unit(unit)
         state.pop("delta", None)
         self._transition(state, "evaluating")
         return True
@@ -379,6 +384,12 @@ class MissionRunner(threading.Thread):
         watcher = JobWatcher(job, self.store, self._on_job_wake, proc=proc)
         self.manager.attach_watcher(self.mission_id, watcher)
         watcher.start()
+        u = self._unit(unit_index)
+        if u is not None:
+            u["state"] = u["status"] = "waiting"
+            u["jobId"] = job_id
+            u["worker"]["finishedAt"] = _now_ms()
+            self._save_unit(u)
         self.store.event("job", {"jobId": job_id, "pid": proc.pid,
                                  "command": command[:120], "expectedWakeAt": expected})
         self._transition(state, "waiting", waitingJobId=job_id)
@@ -412,6 +423,13 @@ class MissionRunner(threading.Thread):
                  f"{woken.get('command') or job_id}\n--- 日志尾部 ---\n{tail}")
         state.pop("waitingJobId", None)
         state["delta"] = delta[:6000]
+        job_unit_idx = persisted.get("unitIndex")
+        if job_unit_idx is not None:
+            u = self._unit(int(job_unit_idx))
+            if u is not None:
+                u["state"] = u["status"] = "running"
+                u["delta"] = delta[:6000]
+                self._save_unit(u)
         self.store.event("wake", {"jobId": job_id, "exitKind": exit_kind})
         self._transition(state, "running")
         return True
@@ -423,6 +441,8 @@ class MissionRunner(threading.Thread):
             self._transition(state, "failed", stopReason="evaluating: 单元缺失")
             return False
         mission = self.store.load_mission()
+        unit["state"] = unit["status"] = "evaluating"
+        self._save_unit(unit)
         prompt = (
             "你是独立验收员（Evaluator）。你与构建者无关，只依据事实验收。\n"
             "你处于只读沙箱：不得创建/修改/删除任何文件，只能读取与运行只读检查。\n"
@@ -449,11 +469,14 @@ class MissionRunner(threading.Thread):
         state["lastVerdict"] = {"unit": index, **{k: verdict.get(k) for k in ("verdict", "reasons")}}
         self.store.event("verdict", state["lastVerdict"])
 
-        # no-progress signature: unit status map + handoff hash. Persisted so
-        # a crash between cycles cannot reset the counter (crash-resumable).
+        # no-progress signature: STABLE per-unit progress (passed/blocked) +
+        # handoff hash. Transient per-unit states (running/waiting/evaluating)
+        # must not count as progress: a repair loop would otherwise never trip
+        # the breaker. Persisted so a crash cannot reset the counter.
         plan = self.store.load_plan()
         sig = hashlib.sha1(json.dumps({
-            "statuses": [u.get("status") for u in plan["units"]],
+            "statuses": [u.get("state") if u.get("state") in ("passed", "integrated", "blocked", "failed", "cancelled")
+                         else "active" for u in plan["units"]],
             "handoff": hashlib.sha1(self.store.load_handoff().encode()).hexdigest()[:12],
         }, sort_keys=True).encode()).hexdigest()
         if sig == self._last_progress_sig:
@@ -469,7 +492,7 @@ class MissionRunner(threading.Thread):
 
         v = verdict.get("verdict")
         if v == "PASS":
-            unit["status"] = "passed"
+            unit["state"] = unit["status"] = "passed"
             unit["lastVerdict"] = "PASS"
             self._save_unit(unit)
             self._checkpoint(state, index, unit, verdict)
@@ -483,7 +506,7 @@ class MissionRunner(threading.Thread):
                 self._transition(state, "running", currentUnit=nxt)
             return True
         if v == "BLOCKED":
-            unit["status"] = "blocked"
+            unit["state"] = unit["status"] = "blocked"
             unit["lastVerdict"] = "BLOCKED"
             self._save_unit(unit)
             self._checkpoint(state, index, unit, verdict)
@@ -492,7 +515,9 @@ class MissionRunner(threading.Thread):
                               stopReason="evaluator 判定 BLOCKED：" + "; ".join(verdict.get("reasons") or [])[:200])
             return False
         # NEEDS_WORK
+        unit["state"] = unit["status"] = "repairing"
         unit["lastVerdict"] = "NEEDS_WORK"
+        unit["repairDirective"] = str(verdict.get("repair") or "; ".join(verdict.get("reasons") or []))[:2000]
         self._save_unit(unit)
         if int(unit.get("repairCount", 0)) >= self.policy.max_repair:
             self._transition(state, "failed",
@@ -504,6 +529,16 @@ class MissionRunner(threading.Thread):
 
     @staticmethod
     def _next_pending(plan_index: dict[str, Any], current: int) -> int | None:
+        """Next runnable unit: pending + all dependencies passed/integrated.
+        Backward-compatible fallback for broken graphs (unknown dep ids)."""
+        by_id = {u["id"]: u for u in plan_index["units"]}
+        statuses = {u["id"]: (u.get("state") or u.get("status")) for u in plan_index["units"]}
+        for u in plan_index["units"]:
+            if u["status"] != "pending" or u["index"] == current:
+                continue
+            deps = [d for d in (u.get("dependencies") or []) if d in by_id]
+            if all(statuses.get(d) in ("passed", "integrated") for d in deps):
+                return u["index"]
         for u in plan_index["units"]:
             if u["status"] == "pending" and u["index"] != current:
                 return u["index"]
@@ -523,7 +558,7 @@ class MissionRunner(threading.Thread):
     def _update_progress_md(self) -> None:
         plan = self.store.load_plan()
         rows = [f"- [{u['status']}] #{u['index'] + 1} {u['title']}（repair×{u.get('repairCount', 0)}，"
-                f"最后判定 {u.get('lastVerdict', '—')}）" for u in plan["units"]]
+                f"最后判定 {u.get('lastVerdict') or '—'}）" for u in plan["units"]]
         self.store.write_progress(
             f"# Mission 进度\n\n更新：{time.strftime('%Y-%m-%d %H:%M:%S')}\n\n" + "\n".join(rows))
 
@@ -541,28 +576,26 @@ class MissionRunner(threading.Thread):
             + "\n".join(f"- #{u['index'] + 1} {u['title']} 状态 {u['status']} 最后判定 {u.get('lastVerdict')}"
                         for u in gaps)
             + "\n\n输出（只输出标记块）：\n<<<LAOMO_PLAN\n"
-              '[{"title":"...","description":"...","acceptance":["..."]}]'
+              '[{"id":"schema","title":"...","description":"...","acceptance":["..."],"dependencies":[]}]'
               "\nLAOMO_PLAN>>>"
         )
         result = self._turn(state, prompt)
-        units = parse_json_marker(result.get("text") or "", _PLAN_RE)
-        if not isinstance(units, list) or not units:
+        raw_units = parse_json_marker(result.get("text") or "", _PLAN_RE)
+        if not isinstance(raw_units, list) or not raw_units:
             self._transition(state, "failed", stopReason="replanner 输出不可解析")
             return False
-        next_index = max((u["index"] for u in plan["units"]), default=-1) + 1
-        for u in units:
-            if isinstance(u, dict) and u.get("title"):
-                plan["units"].append({
-                    "index": next_index, "title": str(u.get("title"))[:120],
-                    "description": str(u.get("description") or "")[:600],
-                    "acceptance": [str(a) for a in (u.get("acceptance") or [])][:8],
-                    "status": "pending", "repairCount": 0,
-                })
-                next_index += 1
+        added, notes = normalize_plan(raw_units, existing=plan["units"])
+        plan["units"].extend(added)
         plan["replans"] = int(plan.get("replans", 0)) + 1
         self.store.save_plan(plan)
-        self.store.event("replanning", {"added": next_index - max((u["index"] for u in plan["units"]), default=0)})
-        self._transition(state, "running", currentUnit=next_index - 1 if next_index else 0)
+        self.store.event("replanning", {"added": len(added), "dag": notes})
+        # the replanner's new units address the gaps: run the first runnable one
+        first = self._next_pending(
+            {**plan, "units": [u for u in plan["units"] if u["index"] >= added[0]["index"]]},
+            current=-1)
+        if first is None:
+            first = self._next_pending(plan, current=-1)
+        self._transition(state, "running", currentUnit=first if first is not None else 0)
         return True
 
     def _phase_verification(self, state: dict[str, Any]) -> bool:

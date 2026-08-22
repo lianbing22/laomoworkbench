@@ -14,10 +14,11 @@ Design invariants:
 - stop discipline: repair cap, no-progress cap, cycle cap, wall-clock cap
 """
 
+from .dag import *  # noqa: F401,F403  (DAG normalization)
 from .manager import *  # noqa: F401,F403  (MissionRunner + MissionManager)
 from .models import *  # noqa: F401,F403  (constants/helpers/StopPolicy)
 from .store import *  # noqa: F401,F403  (MissionStore)
 from .jobs import *  # noqa: F401,F403  (JobWatcher + process helpers)
 from .verification import *  # noqa: F401,F403  (VerificationRunner)
 
-__all__ = ['ACTIVE_STATES', 'AGENT_PHASES', 'ALL_PHASES', 'DEFAULT_STOP_POLICY', 'EVALUATOR_TURN_TIMEOUT', 'JOB_POLL_INTERVAL', 'JOB_STATES', 'JOB_TERMINATE_GRACE', 'JOB_WAKE_GRACE', 'JobWatcher', 'MissionError', 'MissionManager', 'MissionRunner', 'MissionStore', 'RUNS_DIRNAME', 'StopPolicy', 'TERMINAL_STATES', 'VERIFY_CMD_TIMEOUT', 'VERIFY_TAIL', 'VerificationRunner', 'WORKER_TURN_TIMEOUT', 'job_log_tail', 'parse_json_marker']
+__all__ = ['ACTIVE_STATES', 'AGENT_PHASES', 'ALL_PHASES', 'DEFAULT_STOP_POLICY', 'EVALUATOR_TURN_TIMEOUT', 'JOB_POLL_INTERVAL', 'JOB_STATES', 'JOB_TERMINATE_GRACE', 'JOB_WAKE_GRACE', 'JobWatcher', 'MissionError', 'MissionManager', 'MissionRunner', 'MissionStore', 'RUNS_DIRNAME', 'StopPolicy', 'TERMINAL_STATES', 'VERIFY_CMD_TIMEOUT', 'VERIFY_TAIL', 'VerificationRunner', 'WORKER_TURN_TIMEOUT', 'job_log_tail', 'parse_json_marker', 'PLAN_VERSION', 'UNIT_ACTIVE', 'UNIT_BLOCKED', 'UNIT_CANCELLED', 'UNIT_CONFLICT', 'UNIT_DEP_DONE', 'UNIT_EVALUATING', 'UNIT_FAILED', 'UNIT_INTEGRATED', 'UNIT_INTEGRATING', 'UNIT_PASSED', 'UNIT_PENDING', 'UNIT_READY', 'UNIT_REPAIRING', 'UNIT_RUNNING', 'UNIT_WAITING', 'normalize_plan', 'slugify']
