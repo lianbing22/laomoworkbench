@@ -36,6 +36,7 @@
 | **Provider management** | Built-in ChatGPT plus custom OpenAI-compatible endpoints; secrets only ever enter the macOS Keychain; connection testing; per-model reasoning effort. |
 | **Observable runs** | Goal auto-drive, plan projection, token/context pressure, tool traces, background jobs with wait–wake (LAOMO_JOB protocol). |
 | **Artifact preview** | `/api/preview?path=…` serves agent-built pages under a sandbox CSP — pasting an absolute path after the origin works too. |
+| **Extension platform** | Nav 07: Codex-native **plugin marketplace** (browse / detail / risk preview / install / uninstall, marketplace source management) + **MCP manager** (STDIO/HTTP config written through Codex config RPCs, runtime status reported verbatim). Codex ≥ 0.149 recommended; capability is detected at runtime, never version-gated. |
 | **Local services** | Vault search, expert/style libraries, AIHOT news aggregation — all cached locally. |
 
 ## Quick Start

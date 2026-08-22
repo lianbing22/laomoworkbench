@@ -4,15 +4,17 @@
 不在此维护版本状态；契约细节见 [mission-contract.md](mission-contract.md) /
 [provider-contract.md](provider-contract.md)。
 
-更新时间：2026-08-23（`fca0d13` 后）
+更新时间：2026-08-23（P2.0 Extension Platform v1 完成）
 
 ## 总判定
 
-**LAOMO WORKBENCH — USABLE（真实项目阶段）**
+**LAOMO WORKBENCH — USABLE（真实项目阶段）+ Extension Platform v1 READY**
 
 P0 / P0.5 / P1 / P1.1 / P1.2 全部完成；真实 Codex 门禁 Gate 0/A–J +
-Usability 验收全部 PASS。当前阶段：3 个真实项目试运行（dogfood），之后再
-毕业压测（Gate K）与 H2。
+Usability 验收全部 PASS。**P2.0 Extension Platform v1（2026-08-23）：**
+导航 07 扩展页 = Codex 原生插件市场 + 市场源管理 + MCP 管理器，
+契约见 [extension-contract.md](extension-contract.md)，
+真实 Codex read-only E2E PASS（`docs/evidence/extension-m5/`）。
 
 ## 阶段台账
 
@@ -23,6 +25,7 @@ Usability 验收全部 PASS。当前阶段：3 个真实项目试运行（dogfoo
 | P1.1 | Mission Reliability：blocked 终态、作业全权生命周期、PID 复用检测、四桶时间账、机器验收门禁、manifest 不可变 | 完成（Gate A–E PASS，`scripts/gate_p11_driver.py`） |
 | P1.2 | 并行 DAG 调度 + Git worktree 隔离 + 集成事务 + 冲突解决 + 集成树终验（M1–M5-C） | 完成（Gate 0/A–J + Usability 全 PASS，`aaf2751`，`scripts/gate_p12_driver.py` + `scripts/gate_p12_runtime_concurrency.py`） |
 | 真实项目 #1 | full-auto 权限、`/api/preview` 产物预览、工作模式 Chat/Plan/Auto、native folder picker、Host 能力补齐（`85d1f88`–`f5c950c`）、状态隔离 `LAOMO_HOST_STATE_ROOT`（`373072a`） | 完成 |
+| **P2.0 v1** | **Extension Platform**：`web/extensions/` 服务层（canonical 身份/降级/postcondition）+ `/api/extensions/*` 网关面 + 导航 07 UI（插件/市场源/MCP 三 tab）+ M0 协议冻结（`438ad46`）+ 真实 read-only E2E | **完成（M0–M5）** |
 | 真实项目 #2–#3 | dogfood 试运行（参数锁定：`maxParallelWorkers=2`、3–6 单元、30min–2h、机器验收必选、禁生产/部署/迁移权限、DONE 后人工复核） | **进行中** |
 
 ## 排期（dogfood 稳定后）
@@ -42,7 +45,7 @@ Usability 验收全部 PASS。当前阶段：3 个真实项目试运行（dogfoo
 - **P1.5 Vault / Knowledge Context Layer**
 - Multi-Mission / Vault / 新 Agent 系统：全部等真实项目阶段收口
 
-## 自动化测试（166 项 + 26 subtests）
+## 自动化测试（211 项 + 26 subtests）
 
 运行：`python3 -m pytest tests/ -q`（仓库根；pytest 为开发依赖，运行时本体
 零第三方依赖）。
@@ -55,6 +58,8 @@ Usability 验收全部 PASS。当前阶段：3 个真实项目试运行（dogfoo
 | `tests/codex_adapter_test.py` | 39 | Host 能力（settings/credentials/preset/workspace/provider/RPC 翻译）、状态隔离 |
 | `tests/provider_test.py` | 34 | Provider Profiles、钥匙串、连接测试 |
 | `tests/boujoy_preview_test.py` | 8 | 预览沙箱（cwd 限制、CSP、绝对路径） |
+| `tests/extensions_test.py` | 35 | 扩展平台服务层：能力探测/降级、canonical 身份不合并、mutation postcondition、MCP 序列化/校验/secret 警告 |
+| `tests/extensions_gateway_test.py` | 10 | `/api/extensions/*`：runtime guard、错误映射、workspace cwd 传递、部分降级 |
 
 ## 真实运行时认证（manual / local，不进普通 CI）
 
@@ -63,6 +68,15 @@ Usability 验收全部 PASS。当前阶段：3 个真实项目试运行（dogfoo
 `2c0a6ba`（C）→ `23f612e`（D）→ `5561c90`（E）→ `d692d18`（F）→
 `f1c908c`（G）→ `38abe1a`（H）→ `efee945`（I）→ `63bd7b9`（J）→
 `aaf2751`（Usability）。
+
+**Extension Platform v1 真实 read-only E2E：PASS**（8777 测试网关 +
+隔离 host-state + 真实 codex app-server，2026-08-23，证据
+`docs/evidence/extension-m5/`）：3 个真实市场（含 3073 插件远程目录）、
+21 个已装插件 canonical id 全量、5 个真实 MCP 配置 + 真实运行态
+（codex_apps 247 工具 / weknora 30 工具）、plugin 详情风险预览。
+用户真实 `~/.codex` 配置零改动（前后 mcp 条目一致）；未执行任何
+install/uninstall/marketplace/MCP mutation——mutation 认证由 mock
+postcondition 测试构成，destructive E2E 留待专用 disposable fixture。
 
 关键实证（写进契约的教训）：
 

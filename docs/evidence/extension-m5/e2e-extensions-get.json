@@ -1,0 +1,1078 @@
+{
+ "ok": true,
+ "capability": {
+  "supported": true,
+  "runtime": "codex"
+ },
+ "workspace": {
+  "cwd": "/Users/lianb/Downloads/bh"
+ },
+ "plugins": {
+  "supported": true,
+  "marketplaces": [
+   {
+    "name": "openai-primary-runtime",
+    "kind": "local",
+    "path": "/Users/lianb/.cache/codex-runtimes/codex-primary-runtime/plugins/openai-primary-runtime/.agents/plugins/marketplace.json",
+    "interface": null,
+    "plugins": [
+     {
+      "id": "documents@openai-primary-runtime",
+      "name": "documents",
+      "marketplace": "openai-primary-runtime",
+      "installed": true,
+      "enabled": true,
+      "version": "26.819.11345",
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_USE",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "description": "Create and edit documents",
+      "marketplacePath": "/Users/lianb/.cache/codex-runtimes/codex-primary-runtime/plugins/openai-primary-runtime/plugins/documents"
+     },
+     {
+      "id": "pdf@openai-primary-runtime",
+      "name": "pdf",
+      "marketplace": "openai-primary-runtime",
+      "installed": true,
+      "enabled": true,
+      "version": "26.819.11345",
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_USE",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "description": "Read, create, and verify PDFs",
+      "marketplacePath": "/Users/lianb/.cache/codex-runtimes/codex-primary-runtime/plugins/openai-primary-runtime/plugins/pdf"
+     },
+     {
+      "id": "spreadsheets@openai-primary-runtime",
+      "name": "spreadsheets",
+      "marketplace": "openai-primary-runtime",
+      "installed": true,
+      "enabled": true,
+      "version": "26.819.11345",
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_USE",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "description": "Create and edit spreadsheets",
+      "marketplacePath": "/Users/lianb/.cache/codex-runtimes/codex-primary-runtime/plugins/openai-primary-runtime/plugins/spreadsheets"
+     },
+     {
+      "id": "presentations@openai-primary-runtime",
+      "name": "presentations",
+      "marketplace": "openai-primary-runtime",
+      "installed": true,
+      "enabled": true,
+      "version": "26.819.11345",
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_USE",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "description": "Create and edit presentations",
+      "marketplacePath": "/Users/lianb/.cache/codex-runtimes/codex-primary-runtime/plugins/openai-primary-runtime/plugins/presentations"
+     },
+     {
+      "id": "template-creator@openai-primary-runtime",
+      "name": "template-creator",
+      "marketplace": "openai-primary-runtime",
+      "installed": true,
+      "enabled": true,
+      "version": "26.819.11345",
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_USE",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "description": "Create or update reusable templates from reference content",
+      "marketplacePath": "/Users/lianb/.cache/codex-runtimes/codex-primary-runtime/plugins/openai-primary-runtime/plugins/template-creator"
+     }
+    ]
+   },
+   {
+    "name": "openai-bundled",
+    "kind": "local",
+    "path": "/Users/lianb/.codex/.tmp/bundled-marketplaces/openai-bundled/.agents/plugins/marketplace.json",
+    "interface": {
+     "displayName": "OpenAI Bundled"
+    },
+    "plugins": [
+     {
+      "id": "codex-app-tools@openai-bundled",
+      "name": "codex-app-tools",
+      "marketplace": "openai-bundled",
+      "installed": true,
+      "enabled": true,
+      "version": "0.1.0",
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "description": null,
+      "marketplacePath": "/Users/lianb/.codex/.tmp/bundled-marketplaces/openai-bundled/plugins/codex-app-tools"
+     },
+     {
+      "id": "sites@openai-bundled",
+      "name": "sites",
+      "marketplace": "openai-bundled",
+      "installed": true,
+      "enabled": true,
+      "version": "0.1.43",
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "description": "Build and deploy websites",
+      "marketplacePath": "/Users/lianb/.codex/.tmp/bundled-marketplaces/openai-bundled/plugins/sites"
+     },
+     {
+      "id": "browser@openai-bundled",
+      "name": "browser",
+      "marketplace": "openai-bundled",
+      "installed": true,
+      "enabled": true,
+      "version": "26.818.41509",
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "description": "Control the in-app browser",
+      "marketplacePath": "/Users/lianb/.codex/.tmp/bundled-marketplaces/openai-bundled/plugins/browser"
+     },
+     {
+      "id": "chrome@openai-bundled",
+      "name": "chrome",
+      "marketplace": "openai-bundled",
+      "installed": true,
+      "enabled": true,
+      "version": "26.818.41509",
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "description": "Control Chrome with ChatGPT",
+      "marketplacePath": "/Users/lianb/.codex/.tmp/bundled-marketplaces/openai-bundled/plugins/chrome"
+     },
+     {
+      "id": "computer-use@openai-bundled",
+      "name": "computer-use",
+      "marketplace": "openai-bundled",
+      "installed": true,
+      "enabled": true,
+      "version": "1.0.1000816",
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "description": "Control Mac apps from ChatGPT",
+      "marketplacePath": "/Users/lianb/.codex/.tmp/bundled-marketplaces/openai-bundled/plugins/computer-use"
+     },
+     {
+      "id": "messages@openai-bundled",
+      "name": "messages",
+      "marketplace": "openai-bundled",
+      "installed": false,
+      "enabled": false,
+      "version": "1.0.1000816",
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "description": "Read, search, and send with Messages on this Mac",
+      "marketplacePath": "/Users/lianb/.codex/.tmp/bundled-marketplaces/openai-bundled/plugins/messages"
+     },
+     {
+      "id": "record-and-replay@openai-bundled",
+      "name": "record-and-replay",
+      "marketplace": "openai-bundled",
+      "installed": false,
+      "enabled": false,
+      "version": "1.0.1000816",
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "description": "Record what I'm doing on my Mac and turn it into a Skill",
+      "marketplacePath": "/Users/lianb/.codex/.tmp/bundled-marketplaces/openai-bundled/plugins/record-and-replay"
+     },
+     {
+      "id": "latex@openai-bundled",
+      "name": "latex",
+      "marketplace": "openai-bundled",
+      "installed": false,
+      "enabled": false,
+      "version": "0.2.6",
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "description": "Compile LaTeX with TeX tools",
+      "marketplacePath": "/Users/lianb/.codex/.tmp/bundled-marketplaces/openai-bundled/plugins/latex"
+     },
+     {
+      "id": "visualize@openai-bundled",
+      "name": "visualize",
+      "marketplace": "openai-bundled",
+      "installed": true,
+      "enabled": true,
+      "version": "1.0.22",
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "description": "Turn ideas and data into interactive visuals",
+      "marketplacePath": "/Users/lianb/.codex/.tmp/bundled-marketplaces/openai-bundled/plugins/visualize"
+     }
+    ]
+   },
+   {
+    "name": "openai-curated-remote",
+    "kind": "remote",
+    "path": null,
+    "interface": {
+     "displayName": "OpenAI Curated Remote"
+    },
+    "plugins": [
+     {
+      "id": "gmail@openai-curated-remote",
+      "name": "gmail",
+      "marketplace": "openai-curated-remote",
+      "installed": false,
+      "enabled": false,
+      "version": "0.1.9",
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "description": "Read and manage Gmail",
+      "marketplacePath": null
+     },
+     {
+      "id": "github@openai-curated-remote",
+      "name": "github",
+      "marketplace": "openai-curated-remote",
+      "installed": true,
+      "enabled": true,
+      "version": "0.1.11-5f7cd798dc99",
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "description": "Triage PRs, issues, CI, and publish flows",
+      "marketplacePath": null
+     },
+     {
+      "id": "google-drive@openai-curated-remote",
+      "name": "google-drive",
+      "marketplace": "openai-curated-remote",
+      "installed": false,
+      "enabled": false,
+      "version": "0.1.11",
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "description": "Work across Drive, Docs, Sheets, and Slides",
+      "marketplacePath": null
+     },
+     {
+      "id": "google-calendar@openai-curated-remote",
+      "name": "google-calendar",
+      "marketplace": "openai-curated-remote",
+      "installed": false,
+      "enabled": false,
+      "version": "1.2.6",
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "description": "Manage Google Calendar events",
+      "marketplacePath": null
+     },
+     {
+      "id": "notion@openai-curated-remote",
+      "name": "notion",
+      "marketplace": "openai-curated-remote",
+      "installed": false,
+      "enabled": false,
+      "version": "0.1.7",
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "description": "Notion workflows for specs, research, meetings, and knowledge capture",
+      "marketplacePath": null
+     },
+     {
+      "id": "slack@openai-curated-remote",
+      "name": "slack",
+      "marketplace": "openai-curated-remote",
+      "installed": false,
+      "enabled": false,
+      "version": "0.1.7",
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "description": "Read and manage Slack",
+      "marketplacePath": null
+     },
+     {
+      "id": "outlook-email@openai-curated-remote",
+      "name": "outlook-email",
+      "marketplace": "openai-curated-remote",
+      "installed": false,
+      "enabled": false,
+      "version": "0.1.7",
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "description": "Triage Outlook inboxes",
+      "marketplacePath": null
+     },
+     {
+      "id": "canva@openai-curated-remote",
+      "name": "canva",
+      "marketplace": "openai-curated-remote",
+      "installed": true,
+      "enabled": true,
+      "version": "14.0.0",
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "description": "Create, review, edit designs",
+      "marketplacePath": null
+     },
+     {
+      "id": "outlook-calendar@openai-curated-remote",
+      "name": "outlook-calendar",
+      "marketplace": "openai-curated-remote",
+      "installed": false,
+      "enabled": false,
+      "version": "0.1.8",
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "description": "Manage Outlook schedules",
+      "marketplacePath": null
+     },
+     {
+      "id": "app-69f3c30d68288191bbd428a394a78407@openai-curated-remote",
+      "name": "app-69f3c30d68288191bbd428a394a78407",
+      "marketplace": "openai-curated-remote",
+      "installed": false,
+      "enabled": false,
+      "version": "1.0.0",
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "description": "Retrieve insights from Plaud",
+      "marketplacePath": null
+     },
+     {
+      "id": "granola@openai-curated-remote",
+      "name": "granola",
+      "marketplace": "openai-curated-remote",
+      "installed": false,
+      "enabled": false,
+      "version": "1.0.0",
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "description": "Add your meeting context",
+      "marketplacePath": null
+     },
+     {
+      "id": "shopify@openai-curated-remote",
+      "name": "shopify",
+      "marketplace": "openai-curated-remote",
+      "installed": false,
+      "enabled": false,
+      "version": "3.0.0",
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "description": "Build and manage your store",
+      "marketplacePath": null
+     },
+     {
+      "id": "atlassian-rovo@openai-curated-remote",
+      "name": "atlassian-rovo",
+      "marketplace": "openai-curated-remote",
+      "installed": false,
+      "enabled": false,
+      "version": "1.0.6",
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "description": "Manage Jira and Confluence",
+      "marketplacePath": null
+     },
+     {
+      "id": "fireflies@openai-curated-remote",
+      "name": "fireflies",
+      "marketplace": "openai-curated-remote",
+      "installed": false,
+      "enabled": false,
+      "version": "1.0.0",
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "description": "Search meeting transcripts",
+      "marketplacePath": null
+     },
+     {
+      "id": "supabase@openai-curated-remote",
+      "name": "supabase",
+      "marketplace": "openai-curated-remote",
+      "installed": false,
+      "enabled": false,
+      "version": "1.0.0",
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "description": "Manage and query databases",
+      "marketplacePath": null
+     }
+    ],
+    "pluginCount": 3073,
+    "pluginsTruncated": true
+   }
+  ],
+  "installed": [
+   {
+    "name": "openai-primary-runtime",
+    "plugins": [
+     {
+      "id": "documents@openai-primary-runtime",
+      "name": "documents",
+      "marketplace": "openai-primary-runtime",
+      "installed": true,
+      "enabled": true,
+      "version": "26.819.11345",
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_USE",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "description": "Create and edit documents",
+      "marketplacePath": "/Users/lianb/.cache/codex-runtimes/codex-primary-runtime/plugins/openai-primary-runtime/plugins/documents"
+     },
+     {
+      "id": "pdf@openai-primary-runtime",
+      "name": "pdf",
+      "marketplace": "openai-primary-runtime",
+      "installed": true,
+      "enabled": true,
+      "version": "26.819.11345",
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_USE",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "description": "Read, create, and verify PDFs",
+      "marketplacePath": "/Users/lianb/.cache/codex-runtimes/codex-primary-runtime/plugins/openai-primary-runtime/plugins/pdf"
+     },
+     {
+      "id": "spreadsheets@openai-primary-runtime",
+      "name": "spreadsheets",
+      "marketplace": "openai-primary-runtime",
+      "installed": true,
+      "enabled": true,
+      "version": "26.819.11345",
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_USE",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "description": "Create and edit spreadsheets",
+      "marketplacePath": "/Users/lianb/.cache/codex-runtimes/codex-primary-runtime/plugins/openai-primary-runtime/plugins/spreadsheets"
+     },
+     {
+      "id": "presentations@openai-primary-runtime",
+      "name": "presentations",
+      "marketplace": "openai-primary-runtime",
+      "installed": true,
+      "enabled": true,
+      "version": "26.819.11345",
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_USE",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "description": "Create and edit presentations",
+      "marketplacePath": "/Users/lianb/.cache/codex-runtimes/codex-primary-runtime/plugins/openai-primary-runtime/plugins/presentations"
+     },
+     {
+      "id": "template-creator@openai-primary-runtime",
+      "name": "template-creator",
+      "marketplace": "openai-primary-runtime",
+      "installed": true,
+      "enabled": true,
+      "version": "26.819.11345",
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_USE",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "description": "Create or update reusable templates from reference content",
+      "marketplacePath": "/Users/lianb/.cache/codex-runtimes/codex-primary-runtime/plugins/openai-primary-runtime/plugins/template-creator"
+     }
+    ]
+   },
+   {
+    "name": "openai-bundled",
+    "plugins": [
+     {
+      "id": "codex-app-tools@openai-bundled",
+      "name": "codex-app-tools",
+      "marketplace": "openai-bundled",
+      "installed": true,
+      "enabled": true,
+      "version": "0.1.0",
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "description": null,
+      "marketplacePath": "/Users/lianb/.codex/.tmp/bundled-marketplaces/openai-bundled/plugins/codex-app-tools"
+     },
+     {
+      "id": "sites@openai-bundled",
+      "name": "sites",
+      "marketplace": "openai-bundled",
+      "installed": true,
+      "enabled": true,
+      "version": "0.1.43",
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "description": "Build and deploy websites",
+      "marketplacePath": "/Users/lianb/.codex/.tmp/bundled-marketplaces/openai-bundled/plugins/sites"
+     },
+     {
+      "id": "browser@openai-bundled",
+      "name": "browser",
+      "marketplace": "openai-bundled",
+      "installed": true,
+      "enabled": true,
+      "version": "26.818.41509",
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "description": "Control the in-app browser",
+      "marketplacePath": "/Users/lianb/.codex/.tmp/bundled-marketplaces/openai-bundled/plugins/browser"
+     },
+     {
+      "id": "chrome@openai-bundled",
+      "name": "chrome",
+      "marketplace": "openai-bundled",
+      "installed": true,
+      "enabled": true,
+      "version": "26.818.41509",
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "description": "Control Chrome with ChatGPT",
+      "marketplacePath": "/Users/lianb/.codex/.tmp/bundled-marketplaces/openai-bundled/plugins/chrome"
+     },
+     {
+      "id": "computer-use@openai-bundled",
+      "name": "computer-use",
+      "marketplace": "openai-bundled",
+      "installed": true,
+      "enabled": true,
+      "version": "1.0.1000816",
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "description": "Control Mac apps from ChatGPT",
+      "marketplacePath": "/Users/lianb/.codex/.tmp/bundled-marketplaces/openai-bundled/plugins/computer-use"
+     },
+     {
+      "id": "visualize@openai-bundled",
+      "name": "visualize",
+      "marketplace": "openai-bundled",
+      "installed": true,
+      "enabled": true,
+      "version": "1.0.22",
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "description": "Turn ideas and data into interactive visuals",
+      "marketplacePath": "/Users/lianb/.codex/.tmp/bundled-marketplaces/openai-bundled/plugins/visualize"
+     }
+    ]
+   },
+   {
+    "name": "openai-curated-remote",
+    "plugins": [
+     {
+      "id": "canva@openai-curated-remote",
+      "name": "canva",
+      "marketplace": "openai-curated-remote",
+      "installed": true,
+      "enabled": true,
+      "version": "14.0.0",
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "description": "Create, review, edit designs",
+      "marketplacePath": null
+     },
+     {
+      "id": "creative-production@openai-curated-remote",
+      "name": "creative-production",
+      "marketplace": "openai-curated-remote",
+      "installed": true,
+      "enabled": true,
+      "version": "0.1.25",
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_USE",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "description": "Create marketing visuals from a brief or product image.",
+      "marketplacePath": null
+     },
+     {
+      "id": "openai-templates@openai-curated-remote",
+      "name": "openai-templates",
+      "marketplace": "openai-curated-remote",
+      "installed": true,
+      "enabled": true,
+      "version": "0.1.1",
+      "installPolicy": "INSTALLED_BY_DEFAULT",
+      "authPolicy": "ON_USE",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "description": "Default templates for documents, spreadsheets, and presentations",
+      "marketplacePath": null
+     },
+     {
+      "id": "figma@openai-curated-remote",
+      "name": "figma",
+      "marketplace": "openai-curated-remote",
+      "installed": true,
+      "enabled": true,
+      "version": "2.0.20",
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "description": "Figma design-to-code workflows",
+      "marketplacePath": null
+     },
+     {
+      "id": "github@openai-curated-remote",
+      "name": "github",
+      "marketplace": "openai-curated-remote",
+      "installed": true,
+      "enabled": true,
+      "version": "0.1.11-5f7cd798dc99",
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "description": "Triage PRs, issues, CI, and publish flows",
+      "marketplacePath": null
+     },
+     {
+      "id": "heygen@openai-curated-remote",
+      "name": "heygen",
+      "marketplace": "openai-curated-remote",
+      "installed": true,
+      "enabled": true,
+      "version": "3.0.0",
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "description": "Create AI videos",
+      "marketplacePath": null
+     },
+     {
+      "id": "openai-developers@openai-curated-remote",
+      "name": "openai-developers",
+      "marketplace": "openai-curated-remote",
+      "installed": true,
+      "enabled": true,
+      "version": "1.2.3",
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "description": "Develop AI apps, agents, and ChatGPT Apps with OpenAI best practices",
+      "marketplacePath": null
+     },
+     {
+      "id": "plugin-management@openai-curated-remote",
+      "name": "plugin-management",
+      "marketplace": "openai-curated-remote",
+      "installed": true,
+      "enabled": true,
+      "version": "0.1.0",
+      "installPolicy": "INSTALLED_BY_DEFAULT",
+      "authPolicy": "ON_USE",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "description": "Discover and manage plugins",
+      "marketplacePath": null
+     },
+     {
+      "id": "product-design@openai-curated-remote",
+      "name": "product-design",
+      "marketplace": "openai-curated-remote",
+      "installed": true,
+      "enabled": true,
+      "version": "0.1.52",
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_USE",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "description": "Explore and prototype ideas",
+      "marketplacePath": null
+     },
+     {
+      "id": "superpowers@openai-curated-remote",
+      "name": "superpowers",
+      "marketplace": "openai-curated-remote",
+      "installed": true,
+      "enabled": true,
+      "version": "6.3.0",
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL",
+      "availability": "AVAILABLE",
+      "mustShowInstallationInterstitial": false,
+      "description": "Plan, develop, and debug code",
+      "marketplacePath": null
+     }
+    ]
+   }
+  ],
+  "loadErrors": []
+ },
+ "mcp": {
+  "supported": true,
+  "configured": {
+   "node_repl": {
+    "command": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl",
+    "args": [],
+    "env": {
+     "NODE_REPL_INSTRUCTIONS_USE_CASE_COMPUTER_USE": "Control desktop apps on macOS through Computer Use.",
+     "NODE_REPL_NATIVE_PIPE_CONNECT_TIMEOUT_MS": "1000",
+     "NODE_REPL_TRUSTED_SERVICES": "{\"browser\":\"/Users/lianb/.codex/plugins/cache/openai-bundled/browser/26.818.41509/scripts/browser-service.mjs\",\"sky\":\"@oai/sky/service\"}",
+     "BROWSER_USE_AVAILABLE_BACKENDS": "chrome,iab",
+     "BROWSER_USE_CODEX_APP_BUILD_FLAVOR": "prod",
+     "NODE_REPL_INSTRUCTIONS_USE_CASE_BROWSER": "Control the in-app browser in conjunction with the Browser Plugin.",
+     "NODE_REPL_TRUSTED_CODE_PATHS": "/Users/lianb/.codex:/Applications/ChatGPT.app/Contents/Resources/cua_node/lib/node_modules",
+     "BROWSER_USE_CODEX_APP_VERSION": "26.818.41509",
+     "NODE_REPL_NODE_MODULE_DIRS": "/Applications/ChatGPT.app/Contents/Resources/cua_node/lib/node_modules",
+     "SKY_CUA_SERVICE_PATH": "/Users/lianb/.codex/computer-use/Codex Computer Use.app",
+     "NODE_REPL_INSTRUCTIONS_USE_CASE_CHROME": "Control the Chrome browser in conjunction with the Chrome Plugin. Prefer this method of controlling Chrome over alternatives (such as Computer Use) unless the user explicitly mentions an alternative.",
+     "NODE_REPL_NODE_PATH": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node",
+     "BROWSER_USE_TINYSKY_ENABLED": "0",
+     "CODEX_CLI_PATH": "/Applications/ChatGPT.app/Contents/Resources/codex",
+     "CODEX_HOME": "/Users/lianb/.codex"
+    },
+    "environment_id": "local",
+    "enabled": true,
+    "startup_timeout_sec": 120.0,
+    "tool_timeout_sec": null
+   },
+   "wmux": {
+    "command": "node",
+    "args": [
+     "/Users/lianb/.wmux/mcp/index.js"
+    ],
+    "environment_id": "local",
+    "enabled": true,
+    "tool_timeout_sec": null
+   },
+   "weknora": {
+    "command": "/opt/homebrew/bin/uv",
+    "args": [
+     "--directory",
+     "/Users/lianb/Documents/weknora/WeKnora-0.7.2/mcp-server",
+     "run",
+     "run_server.py"
+    ],
+    "env": {
+     "WEKNORA_API_KEY": "sk-QqyeMuPa4aA0ccraEy8VlCP-UQGcE7x52E_CUsf8qd0",
+     "WEKNORA_BASE_URL": "http://127.0.0.1:8080/api/v1"
+    },
+    "environment_id": "local",
+    "enabled": true,
+    "tool_timeout_sec": null
+   },
+   "kimi-cu": {
+    "command": "/Applications/KimiCU.app/Contents/MacOS/kimi-cu",
+    "args": [
+     "mcp",
+     "-s",
+     "user"
+    ],
+    "environment_id": "local",
+    "enabled": true,
+    "tool_timeout_sec": null
+   },
+   "computer-use": {
+    "command": "./Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient",
+    "args": [
+     "mcp"
+    ],
+    "cwd": ".",
+    "environment_id": "local",
+    "enabled": false,
+    "tool_timeout_sec": null
+   }
+  },
+  "runtime": {
+   "servers": [
+    {
+     "name": "codex_app",
+     "pluginId": "codex-app-tools@openai-bundled",
+     "serverInfo": null,
+     "authStatus": "unsupported",
+     "toolCount": 0,
+     "toolNames": []
+    },
+    {
+     "name": "codex_apps",
+     "pluginId": null,
+     "serverInfo": {
+      "name": "plugin-runtime",
+      "title": null,
+      "version": "0.1.0",
+      "description": null,
+      "icons": null,
+      "websiteUrl": null
+     },
+     "authStatus": "bearerToken",
+     "toolCount": 247,
+     "toolNames": [
+      "canva.autofill-design",
+      "canva.cancel-editing-transaction",
+      "canva.commit-editing-transaction",
+      "canva.copy-design",
+      "canva.create-design-from-brand-template",
+      "canva.create-design-from-candidate",
+      "canva.create-folder",
+      "canva.fetch",
+      "canva.generate-design",
+      "canva.get-assets",
+      "canva.get-brand-template-dataset",
+      "canva.get-design",
+      "canva.get-design-candidates",
+      "canva.get-design-content",
+      "canva.get-design-pages",
+      "canva.get-design-thumbnail",
+      "canva.get-design-tool-job",
+      "canva.get-presenter-notes",
+      "canva.image-to-design",
+      "canva.import-design-from-url",
+      "canva.list-brand-kits",
+      "canva.list-comments",
+      "canva.list-folder-items",
+      "canva.move-item-to-folder",
+      "canva.perform-editing-operations",
+      "canva.prepare-design-generation",
+      "canva.resize-design",
+      "canva.resolve-shortlink",
+      "canva.search",
+      "canva.search-brand-templates"
+     ]
+    },
+    {
+     "name": "computer-use",
+     "pluginId": null,
+     "serverInfo": null,
+     "authStatus": "unsupported",
+     "toolCount": 0,
+     "toolNames": []
+    },
+    {
+     "name": "creative_production_mcp",
+     "pluginId": "creative-production@openai-curated-remote",
+     "serverInfo": {
+      "name": "creative-production",
+      "title": null,
+      "version": "0.1.25",
+      "description": null,
+      "icons": null,
+      "websiteUrl": null
+     },
+     "authStatus": "unsupported",
+     "toolCount": 1,
+     "toolNames": [
+      "creative_production_board"
+     ]
+    },
+    {
+     "name": "kimi-cu",
+     "pluginId": null,
+     "serverInfo": {
+      "name": "kimi-cu",
+      "title": null,
+      "version": "0.5.8",
+      "description": null,
+      "icons": null,
+      "websiteUrl": null
+     },
+     "authStatus": "unsupported",
+     "toolCount": 10,
+     "toolNames": [
+      "click",
+      "drag",
+      "get_app_state",
+      "list_apps",
+      "perform_secondary_action",
+      "press_key",
+      "scroll",
+      "select_text",
+      "set_value",
+      "type_text"
+     ]
+    },
+    {
+     "name": "node_repl",
+     "pluginId": null,
+     "serverInfo": {
+      "name": "rmcp",
+      "title": null,
+      "version": "1.5.0",
+      "description": null,
+      "icons": null,
+      "websiteUrl": null
+     },
+     "authStatus": "unsupported",
+     "toolCount": 3,
+     "toolNames": [
+      "js",
+      "js_add_node_module_dir",
+      "js_reset"
+     ]
+    },
+    {
+     "name": "openai-api-key-local-confirmation",
+     "pluginId": "openai-developers@openai-curated-remote",
+     "serverInfo": {
+      "name": "OpenAI Developers MCP",
+      "title": null,
+      "version": "0.1.0",
+      "description": null,
+      "icons": null,
+      "websiteUrl": null
+     },
+     "authStatus": "unsupported",
+     "toolCount": 1,
+     "toolNames": [
+      "confirm_openai_api_key_local_destination"
+     ]
+    },
+    {
+     "name": "weknora",
+     "pluginId": null,
+     "serverInfo": {
+      "name": "weknora-server",
+      "title": null,
+      "version": "1.1.1",
+      "description": null,
+      "icons": null,
+      "websiteUrl": null
+     },
+     "authStatus": "unsupported",
+     "toolCount": 30,
+     "toolNames": [
+      "agent_chat",
+      "chat",
+      "create_knowledge_base",
+      "create_knowledge_from_file",
+      "create_knowledge_from_text",
+      "create_knowledge_from_url",
+      "create_model",
+      "create_session",
+      "create_tenant",
+      "delete_chunk",
+      "delete_knowledge",
+      "delete_knowledge_base",
+      "delete_session",
+      "get_agent",
+      "get_knowledge",
+      "get_knowledge_base",
+      "get_model",
+      "get_session",
+      "hybrid_search",
+      "list_agents",
+      "list_chunks",
+      "list_knowledge",
+      "list_knowledge_bases",
+      "list_models",
+      "list_sessions",
+      "list_shared_knowledge_bases",
+      "list_tenants",
+      "wiki_index_view",
+      "wiki_read_page",
+      "wiki_search"
+     ]
+    },
+    {
+     "name": "wmux",
+     "pluginId": null,
+     "serverInfo": {
+      "name": "wmux",
+      "title": null,
+      "version": "3.38.4",
+      "description": null,
+      "icons": null,
+      "websiteUrl": null
+     },
+     "authStatus": "unsupported",
+     "toolCount": 87,
+     "toolNames": [
+      "a2a_broadcast",
+      "a2a_discover",
+      "a2a_set_skills",
+      "a2a_task_cancel",
+      "a2a_task_query",
+      "a2a_task_send",
+      "a2a_task_update",
+      "a2a_whoami",
+      "browser_click",
+      "browser_close",
+      "browser_console",
+      "browser_cookies",
+      "browser_dialog",
+      "browser_download",
+      "browser_drag",
+      "browser_emulate",
+      "browser_evaluate",
+      "browser_extract_data",
+      "browser_extract_text",
+      "browser_file_upload",
+      "browser_fill",
+      "browser_highlight",
+      "browser_hover",
+      "browser_navigate",
+      "browser_navigate_back",
+      "browser_network",
+      "browser_open",
+      "browser_pdf",
+      "browser_press_key",
+      "browser_resize"
+     ]
+    }
+   ],
+   "nextCursor": null,
+   "threadBound": false
+  }
+ }
+}

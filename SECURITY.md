@@ -89,6 +89,32 @@ machine verification gate, and per-mission stop budgets.
   terminal missions never resurrect; evidence manifests are immutable after
   DONE.
 
+## Extension platform (nav 07)
+
+The extension page surfaces Codex-native plugins, marketplaces and MCP —
+**the workbench does not host, curate, or audit third-party plugins**, and
+makes no claim about their safety.
+
+- Installing a third-party plugin means trusting everything it ships:
+  Skills, Hooks (which can observe/alter execution), MCP servers, Apps,
+  App Templates and Scheduled Tasks — each can extend what the agent can
+  do on your machine. The install dialog shows these counts before you
+  confirm; plugins carrying hooks/MCP/scheduled tasks/apps always require
+  an explicit confirmation, and upstream-mandated interstitials are
+  honored, never bypassed.
+- **MCP configuration writes to `~/.codex/config.toml`** (via Codex's own
+  config RPCs, never by editing the file) and affects every Codex session
+  on the machine, including mission workers. MCP `env` values are stored
+  in **cleartext** in that file: the UI warns and steers to
+  environment-variable references (`bearer_token_env_var` style) instead
+  of storing raw tokens.
+- MCP *configured* state and *runtime* status are kept separate and the
+  runtime column only ever shows what Codex itself reports — the UI never
+  fabricates a ready/failed state.
+- These upstream plugin/marketplace RPCs are experimental and evolve:
+  capability is detected live per RPC; a missing capability degrades its
+  block, never fakes success.
+
 ## What is out of scope / known limits
 
 - No sandbox survives `danger-full-access`; treat agent output as
@@ -106,5 +132,8 @@ machine verification gate, and per-mission stop budgets.
 `tests/boujoy_preview_test.py` locks the preview contract (cwd confinement,
 CSP sandbox, absolute-path handling); `tests/provider_test.py` locks the
 never-echo / Keychain-only credential contract; `tests/worktree_test.py`
-locks git isolation. CI runs them on every push (see
-`.github/workflows/tests.yml`).
+locks git isolation; `tests/extensions_test.py` +
+`tests/extensions_gateway_test.py` lock the extension platform (MCP name/
+keyPath injection rejection, secret-warning metadata, runtime guard that
+never fakes success, postcondition verification). CI runs them on every
+push (see `.github/workflows/tests.yml`).
