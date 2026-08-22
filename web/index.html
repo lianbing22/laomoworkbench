@@ -39,6 +39,7 @@
         <button class="nav-cut" data-page="styles"><span class="nav-number">04</span><strong>风格</strong><small>输出声线</small></button>
         <button class="nav-cut" data-page="monitor"><span class="nav-number">05</span><strong>监控</strong><small>用量与轨迹</small></button>
         <button class="nav-cut" data-page="news"><span class="nav-number">06</span><strong>新闻</strong><small>AI 动态与工具</small></button>
+        <button class="nav-cut" data-page="extensions"><span class="nav-number">07</span><strong>扩展</strong><small>插件 · 市场源 · MCP</small></button>
       </nav>
 
       <div class="rail-footer">
@@ -72,6 +73,7 @@
             <button class="mobile-nav-item" data-page="styles">🎨 风格</button>
             <button class="mobile-nav-item" data-page="monitor">📊 监控</button>
             <button class="mobile-nav-item" data-page="news">📰 新闻</button>
+            <button class="mobile-nav-item" data-page="extensions">🧩 扩展</button>
             <button class="mobile-nav-item" id="mobileNavSettings">⚙ 设置</button>
             <button class="mobile-nav-item" id="mobileNavPair">📱 手机互联</button>
             <button class="mobile-nav-item" id="mobileNavNewSession">＋ 新会话</button>
@@ -291,8 +293,91 @@
           </div>
         </div>
       </section>
+
+      <section id="extensionsPage" class="page page-extensions" data-page-panel="extensions">
+        <div class="ext-hero">
+          <div><p class="section-kicker">EXTENSIONS / 07</p><h2>扩展</h2><p>插件、市场源与 MCP 全部使用 Codex 原生能力。老墨不托管、不审核第三方插件——安装即信任其 Skills / Hooks / MCP 等全部能力。</p></div>
+          <div class="ext-actions"><button id="extRefresh" class="mini-cut">↻ 刷新</button><span id="extUpdated" class="news-updated">—</span></div>
+        </div>
+        <div id="extUnavailable" class="ext-unavailable hidden">
+          <p id="extUnavailableMsg">扩展市场需要 Codex 运行时。</p>
+        </div>
+        <div id="extBody">
+          <div class="ext-tabs" role="tablist">
+            <button class="ext-tab active" data-ext-tab="plugins" role="tab">插件</button>
+            <button class="ext-tab" data-ext-tab="markets" role="tab">市场源</button>
+            <button class="ext-tab" data-ext-tab="mcp" role="tab">MCP</button>
+          </div>
+
+          <div id="extTabPlugins" class="ext-tabpanel">
+            <div class="ext-subhead"><h3>已安装</h3><span id="extInstalledCount" class="ext-count">0</span></div>
+            <div id="extInstalledList" class="ext-plugin-list"><p class="muted">读取中…</p></div>
+            <div class="ext-subhead"><h3>可安装</h3><span id="extAvailableCount" class="ext-count">0</span></div>
+            <div id="extAvailableList" class="ext-plugin-list"><p class="muted">读取中…</p></div>
+          </div>
+
+          <div id="extTabMarkets" class="ext-tabpanel hidden">
+            <div class="ext-subhead">
+              <h3>市场源</h3>
+              <div class="ext-market-add">
+                <input id="extMarketSource" type="text" placeholder="git URL 或本地路径" spellcheck="false">
+                <input id="extMarketRef" type="text" placeholder="名称（可选）" spellcheck="false">
+                <button id="extMarketAddBtn" class="mini-cut">添加市场源</button>
+              </div>
+            </div>
+            <div id="extMarketList" class="ext-market-list"><p class="muted">读取中…</p></div>
+          </div>
+
+          <div id="extTabMcp" class="ext-tabpanel hidden">
+            <div class="ext-subhead">
+              <h3>MCP 服务器</h3>
+              <button id="extMcpAddBtn" class="mini-cut">＋ 新建 MCP</button>
+            </div>
+            <p class="ext-note">MCP 配置写入 <code>~/.codex/config.toml</code>，影响所有 Codex 会话。运行状态来自 Codex 真实上报；未绑定时如实显示「不可用」。</p>
+            <div id="extMcpList" class="ext-mcp-list"><p class="muted">读取中…</p></div>
+          </div>
+        </div>
+      </section>
     </main>
   </div>
+
+  <dialog id="pluginDetailDialog" class="boujoy-dialog">
+    <form method="dialog">
+      <header><div><p class="section-kicker">PLUGIN</p><h2 id="pluginDetailName">插件</h2></div><button type="button" value="cancel" class="dialog-close" data-close-dialog="pluginDetailDialog" aria-label="关闭">×</button></header>
+      <div id="pluginDetailBody" class="ext-plugin-detail"></div>
+      <footer>
+        <button type="button" value="cancel" class="ghost-button" data-close-dialog="pluginDetailDialog">取消</button>
+        <button type="button" id="pluginConfirmBtn" class="primary-cut">确认安装</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <dialog id="mcpEditDialog" class="boujoy-dialog">
+    <form method="dialog" id="mcpEditForm">
+      <header><div><p class="section-kicker" id="mcpEditKicker">NEW MCP</p><h2 id="mcpEditTitle">新建 MCP</h2></div><button type="button" value="cancel" class="dialog-close" data-close-dialog="mcpEditDialog" aria-label="关闭">×</button></header>
+      <label>名称<input id="mcpName" required maxlength="64" pattern="[A-Za-z0-9_-]{1,64}" placeholder="my-server（字母/数字/_/-）"></label>
+      <label>Transport
+        <select id="mcpTransport">
+          <option value="stdio">STDIO（本地命令）</option>
+          <option value="http">HTTP（streamable URL）</option>
+        </select>
+      </label>
+      <div id="mcpStdioFields">
+        <label>Command<input id="mcpCommand" placeholder="/usr/local/bin/server" spellcheck="false"></label>
+        <label>Args（空格分隔，可选）<input id="mcpArgs" placeholder="--port 8080" spellcheck="false"></label>
+        <label>cwd（可选）<input id="mcpCwd" placeholder="/working/dir" spellcheck="false"></label>
+        <label>env（每行 KEY=VALUE，可选）<textarea id="mcpEnv" rows="3" placeholder="LOG_LEVEL=info"></textarea></label>
+        <label>启动超时秒数（可选）<input id="mcpStartupTimeout" type="number" min="1" placeholder="30"></label>
+      </div>
+      <div id="mcpHttpFields" class="hidden">
+        <label>URL<input id="mcpUrl" placeholder="https://example.com/mcp" spellcheck="false"></label>
+        <label>Bearer Token 环境变量名（推荐，可选）<input id="mcpBearer" placeholder="MY_SERVER_TOKEN" spellcheck="false"></label>
+      </div>
+      <p class="ext-secret-note">env 的值会<b>明文</b>写入 <code>~/.codex/config.toml</code>——不要直接保存 API Token / Password，引用环境变量名代替。</p>
+      <label class="check-row"><input id="mcpEnabled" type="checkbox" checked><span>启用</span></label>
+      <footer><button type="button" value="cancel" class="ghost-button" data-close-dialog="mcpEditDialog">取消</button><button type="submit" id="mcpSaveBtn" value="default" class="primary-cut">保存</button></footer>
+    </form>
+  </dialog>
 
   <div id="toastRegion" class="toast-region" aria-live="polite"></div>
 

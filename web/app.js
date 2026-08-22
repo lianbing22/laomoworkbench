@@ -91,6 +91,7 @@ const PAGE_META = {
   styles: ["VOICE / 04", "风格 输出声线"],
   monitor: ["GAUGE / 05", "运行监控"],
   news: ["FEED / 06", "AI 新闻与工具"],
+  extensions: ["MARKET / 07", "扩展"],
 };
 
 const KIND_META = {
@@ -822,6 +823,7 @@ function showPage(page) {
   if (page === "styles") loadRecords("style");
   if (page === "monitor") renderMonitor();
   if (page === "news") loadNews();
+  if (page === "extensions") loadExtensions();
   // The durable mission card lives on the agent page; re-sync it each visit so
   // state changed while the page was hidden (or in another client) shows up.
   if (page === "agent") loadMissions({ quiet: true });
@@ -3670,6 +3672,7 @@ const COMMANDS = [
   { name: "打开知识库", hint: "02", run: () => showPage("knowledge") },
   { name: "打开专家", hint: "03", run: () => showPage("experts") },
   { name: "打开风格", hint: "04", run: () => showPage("styles") },
+  { name: "打开扩展", hint: "07", run: () => showPage("extensions") },
   { name: "新建会话", hint: "⌘ N", run: createSession },
   { name: "选择新项目", hint: "⌘ O", run: pickProject },
   { name: "模型服务管理", hint: "Provider", run: openProviderDialog },
@@ -4322,3 +4325,374 @@ function renderAgentStrip() {
 })();
 
 init();
+
+// ============ 07 EXTENSIONS — Codex 原生插件 / 市场源 / MCP ============
+// Reads /api/extensions (aggregate) and drives the three tabs. Every mutation
+// has its own busy key, waits for the postcondition fetch, and only toasts
+// on the final confirmed result. Unsupported blocks render capability states,
+// never error floods.
+
+const ext = {
+  data: null,
+  loaded: false,
+  busy: new Set(),
+  pendingPlugin: null, // {pluginName, marketplacePath, remoteMarketplaceName}
+};
+
+function extBusyKey(kind, id) { return `${kind}:${id}`; }
+
+function extIsBusy(key) { return ext.busy.has(key); }
+
+function extWithBusy(key, button, work) {
+  if (ext.busy.has(key)) return;
+  ext.busy.add(key);
+  if (button) { button.disabled = true; button.dataset.label = button.textContent; button.textContent = "…"; }
+  work().catch(err => toast(err && err.message ? err.message : "操作失败", true))
+    .finally(() => {
+      ext.busy.delete(key);
+      if (button) { button.disabled = false; if (button.dataset.label) button.textContent = button.dataset.label; }
+    });
+}
+
+async function extApi(path, payload) {
+  const options = payload === undefined
+    ? { method: "GET" }
+    : { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) };
+  // installs/upgrades can take minutes against real marketplaces
+  const timeout = /install|upgrade|market-add/.test(path) ? 300000 : 30000;
+  const resp = await jsonFetch(`/api/extensions${path}`, options, timeout);
+  if (resp && resp.ok === false) {
+    const err = new Error(resp.error || "操作失败");
+    err.code = resp.code;
+    throw err;
+  }
+  return resp;
+}
+
+async function loadExtensions(force = false) {
+  if (ext.loaded && !force) return;
+  const box = $("#extUnavailable"), body = $("#extBody");
+  try {
+    const data = await extApi("");
+    ext.data = data;
+    ext.loaded = true;
+    $("#extUpdated").textContent = new Date().toLocaleTimeString();
+    const cap = data.capability || {};
+    if (!cap.supported) {
+      box.classList.remove("hidden");
+      body.classList.add("hidden");
+      $("#extUnavailableMsg").textContent = cap.message || "扩展市场需要 Codex 运行时。";
+      return;
+    }
+    box.classList.add("hidden");
+    body.classList.remove("hidden");
+    renderExtPlugins(data.plugins);
+    renderExtMarkets(data.plugins);
+    renderExtMcp(data.mcp);
+  } catch (err) {
+    box.classList.remove("hidden");
+    body.classList.add("hidden");
+    $("#extUnavailableMsg").textContent = `读取失败：${err.message || err}`;
+  }
+}
+
+function extCapRow(blockName, block, render) {
+  if (!block) return `<p class="muted">无数据</p>`;
+  if (block.supported === false) {
+    return `<p class="muted">该能力当前不可用${block.error ? `（${String(block.error).slice(0, 160)}）` : ""}</p>`;
+  }
+  return render(block);
+}
+
+function renderExtPlugins(pluginsBlock) {
+  const installedEl = $("#extInstalledList"), availableEl = $("#extAvailableList");
+  installedEl.innerHTML = extCapRow("plugins", pluginsBlock, () => {
+    const rows = [];
+    for (const mp of (pluginsBlock.installed || [])) {
+      for (const p of mp.plugins) rows.push({ ...p, marketplace: mp.name });
+    }
+    $("#extInstalledCount").textContent = rows.length;
+    if (!rows.length) return `<p class="muted">尚无已安装插件。</p>`;
+    return rows.map(p => `
+      <div class="ext-card" data-canonical-id="${p.id}">
+        <div class="ext-card-main">
+          <b>${escapeHtml(p.name)}</b><span class="ext-badge">${escapeHtml(p.marketplace)}</span>
+          <small>${escapeHtml(p.id)}${p.version ? ` · ${escapeHtml(p.version)}` : ""}</small>
+        </div>
+        <div class="ext-card-actions">
+          <button class="mini-cut" data-ext-detail="${escapeHtml(p.name)}" data-ext-mp="${escapeHtml(p.marketplacePath || "")}" data-ext-remote="${escapeHtml(!p.marketplacePath && p.marketplace ? p.marketplace : "")}">详情</button>
+          <button class="mini-cut" data-ext-uninstall="${escapeHtml(p.id)}">卸载</button>
+        </div>
+      </div>`).join("");
+  });
+  availableEl.innerHTML = extCapRow("plugins", pluginsBlock, () => {
+    const rows = [];
+    for (const mp of (pluginsBlock.marketplaces || [])) {
+      for (const p of mp.plugins) if (!p.installed) rows.push({ ...p, marketplace: mp.name });
+    }
+    $("#extAvailableCount").textContent = rows.length;
+    if (!rows.length) return `<p class="muted">市场源中没有可安装的插件。</p>`;
+    return rows.map(p => `
+      <div class="ext-card">
+        <div class="ext-card-main">
+          <b>${escapeHtml(p.name)}</b><span class="ext-badge">${escapeHtml(p.marketplace)}</span>
+          ${p.description ? `<small>${escapeHtml(p.description)}</small>` : ""}
+        </div>
+        <div class="ext-card-actions">
+          <button class="mini-cut" data-ext-detail="${escapeHtml(p.name)}" data-ext-mp="${escapeHtml(p.marketplacePath || "")}" data-ext-remote="${escapeHtml(!p.marketplacePath && p.marketplace ? p.marketplace : "")}">详情</button>
+          <button class="mini-cut" data-ext-install="${escapeHtml(p.name)}" data-ext-mp="${escapeHtml(p.marketplacePath || "")}" data-ext-remote="${escapeHtml(!p.marketplacePath && p.marketplace ? p.marketplace : "")}">安装</button>
+        </div>
+      </div>`).join("");
+  });
+}
+
+function renderExtMarkets(pluginsBlock) {
+  const el = $("#extMarketList");
+  el.innerHTML = extCapRow("markets", pluginsBlock, () => {
+    const mps = pluginsBlock.marketplaces || [];
+    if (!mps.length) return `<p class="muted">尚未添加任何市场源。</p>`;
+    return mps.map(mp => `
+      <div class="ext-card" data-market="${escapeHtml(mp.name)}">
+        <div class="ext-card-main">
+          <b>${escapeHtml(mp.name)}</b>
+          <span class="ext-badge ${mp.kind === "remote" ? "" : "on"}">${mp.kind === "remote" ? "远程目录" : "本地"}</span>
+          ${mp.plugins && mp.plugins.length ? `<small>${mp.plugins.length} 个插件${mp.pluginCount && mp.pluginCount > mp.plugins.length ? `（已截断，共 ${mp.pluginCount}）` : ""}</small>` : ""}
+        </div>
+        <div class="ext-card-actions">
+          <button class="mini-cut" data-ext-upgrade="${escapeHtml(mp.name)}">升级</button>
+          <button class="mini-cut" data-ext-market-remove="${escapeHtml(mp.name)}">移除</button>
+        </div>
+      </div>`).join("");
+  });
+}
+
+function mcpRuntimeInfo(name, mcpBlock) {
+  // runtime status is upstream's own words only — never synthesized
+  const rt = mcpBlock && mcpBlock.runtime;
+  if (!rt || rt.supported === false) return null;
+  const entry = (rt.servers || []).find(s => s.name === name);
+  if (!entry) return null;
+  return {
+    authStatus: entry.authStatus,
+    tools: Object.keys(entry.tools || {}).length,
+    serverInfo: entry.serverInfo ? `${entry.serverInfo.name || ""} ${entry.serverInfo.version || ""}`.trim() : "",
+  };
+}
+
+function renderExtMcp(mcpBlock) {
+  const el = $("#extMcpList");
+  el.innerHTML = extCapRow("mcp", mcpBlock, () => {
+    const configured = mcpBlock.configured || {};
+    const names = Object.keys(configured);
+    if (!names.length) return `<p class="muted">尚未配置任何 MCP 服务器。</p>`;
+    return names.map(name => {
+      const c = configured[name] || {};
+      const transport = c.url ? "HTTP" : "STDIO";
+      const rt = mcpRuntimeInfo(name, mcpBlock);
+      const authBadge = rt ? `<span class="ext-badge ${rt.authStatus === "bearerToken" || rt.authStatus === "oAuth" ? "on" : ""}">${escapeHtml(rt.authStatus)}</span>` : "";
+      return `
+      <div class="ext-card" data-mcp="${escapeHtml(name)}">
+        <div class="ext-card-main">
+          <b>${escapeHtml(name)}</b>
+          <span class="ext-mcp-transport">${transport}</span>
+          ${c.enabled === false ? `<span class="ext-badge warn">已停用</span>` : ""}
+          ${authBadge}
+          ${rt ? `<span class="ext-badge on">${rt.tools} 工具</span>` : `<span class="ext-badge">运行状态不可用</span>`}
+          <small>${escapeHtml(c.url || [c.command, ...(c.args || [])].filter(Boolean).join(" "))}</small>
+        </div>
+        <div class="ext-card-actions">
+          <button class="mini-cut" data-ext-mcp-edit="${escapeHtml(name)}">编辑</button>
+          <button class="mini-cut" data-ext-mcp-delete="${escapeHtml(name)}">删除</button>
+        </div>
+      </div>`;
+    }).join("");
+  });
+}
+
+// -- plugin detail / install confirmation (risk preview) --------------------
+
+async function openPluginDetail(pluginName, marketplacePath, remoteMarketplaceName) {
+  try {
+    const detail = await extApi("/plugins/detail", { pluginName, marketplacePath: marketplacePath || null, remoteMarketplaceName: remoteMarketplaceName || null });
+    ext.pendingPlugin = { pluginName, marketplacePath: marketplacePath || null, remoteMarketplaceName: remoteMarketplaceName || null };
+    const p = detail.plugin;
+    const counts = [
+      ["Skills", p.skills], ["Hooks", p.hooks], ["MCP Servers", p.mcpServers.length],
+      ["Apps", p.apps], ["App Templates", p.appTemplates], ["Scheduled Tasks", p.scheduledTasks],
+    ];
+    $("#pluginDetailName").textContent = p.name;
+    $("#pluginDetailBody").innerHTML = `
+      <p><b>${escapeHtml(p.canonicalId || p.name)}</b> · 来源 ${escapeHtml(p.marketplaceName || "—")}</p>
+      ${p.description ? `<p>${escapeHtml(p.description)}</p>` : ""}
+      <table>${counts.map(([label, n]) => `<tr><td>${label}</td><td>${typeof n === "number" ? n : escapeHtml(n)}</td></tr>`).join("")}</table>
+      ${p.mcpServers.length ? `<p class="ext-badge">MCP：${p.mcpServers.map(escapeHtml).join("、")}</p>` : ""}
+      <p><small>installPolicy ${escapeHtml(p.installPolicy || "—")} · authPolicy ${escapeHtml(p.authPolicy || "—")} · ${escapeHtml(p.availability || "")}</small></p>
+      ${detail.requiresConfirmation ? `<div class="ext-risk">该插件会扩展 Codex 运行能力${p.hooks ? "（含 Hook，可拦截/改变执行流）" : ""}${p.mcpServers.length ? "（含 MCP 服务器）" : ""}。安装第三方插件即信任其全部代码，请确认来源可信。</div>` : ""}
+      <p><small>老墨不审核第三方插件；插件由其市场源直接提供。</small></p>`;
+    $("#pluginConfirmBtn").textContent = detail.requiresConfirmation ? "确认安装" : "安装";
+    $("#pluginDetailDialog").showModal();
+  } catch (err) {
+    toast(`插件详情读取失败：${err.message || err}`, true);
+  }
+}
+
+async function confirmPluginInstall(button) {
+  const target = ext.pendingPlugin;
+  if (!target) return;
+  $("#pluginDetailDialog").close();
+  extWithBusy(extBusyKey("plugin", target.pluginName), button, async () => {
+    await extApi("/plugin-install", {
+      pluginName: target.pluginName,
+      marketplacePath: target.marketplacePath,
+      remoteMarketplaceName: target.remoteMarketplaceName,
+    });
+    toast(`已安装 ${target.pluginName}`);
+    await loadExtensions(true);
+  });
+}
+
+// -- MCP editor --------------------------------------------------------------
+
+function openMcpEditor(name) {
+  const c = name && ext.data && ext.data.mcp && ext.data.mcp.configured
+    ? ext.data.mcp.configured[name] : null;
+  $("#mcpEditKicker").textContent = c ? "EDIT MCP" : "NEW MCP";
+  $("#mcpEditTitle").textContent = c ? `编辑 ${name}` : "新建 MCP";
+  $("#mcpName").value = c ? name : "";
+  $("#mcpName").disabled = !!c; // name is the keyPath — editing means delete+recreate
+  const isHttp = c && !!c.url;
+  $("#mcpTransport").value = isHttp ? "http" : "stdio";
+  $("#mcpStdioFields").classList.toggle("hidden", isHttp);
+  $("#mcpHttpFields").classList.toggle("hidden", !isHttp);
+  $("#mcpCommand").value = (c && c.command) || "";
+  $("#mcpArgs").value = c && c.args ? c.args.join(" ") : "";
+  $("#mcpCwd").value = (c && c.cwd) || "";
+  $("#mcpEnv").value = c && c.env ? Object.entries(c.env).map(([k, v]) => `${k}=${v}`).join("\n") : "";
+  $("#mcpStartupTimeout").value = (c && c.startup_timeout_sec) || "";
+  $("#mcpUrl").value = (c && c.url) || "";
+  $("#mcpBearer").value = (c && c.bearer_token_env_var) || "";
+  $("#mcpEnabled").checked = c ? c.enabled !== false : true;
+  $("#mcpEditDialog").showModal();
+}
+
+function parseMcpEnvLines(text) {
+  const env = {};
+  for (const line of String(text || "").split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const eq = trimmed.indexOf("=");
+    if (eq <= 0) throw new Error(`env 行格式应为 KEY=VALUE：${trimmed.slice(0, 40)}`);
+    env[trimmed.slice(0, eq).trim()] = trimmed.slice(eq + 1).trim();
+  }
+  return env;
+}
+
+function submitMcpSave(event) {
+  event.preventDefault();
+  const transport = $("#mcpTransport").value;
+  const entry = {
+    name: $("#mcpName").value.trim(),
+    transport,
+    enabled: $("#mcpEnabled").checked,
+  };
+  if (transport === "stdio") {
+    entry.command = $("#mcpCommand").value.trim();
+    if ($("#mcpArgs").value.trim()) entry.args = $("#mcpArgs").value.trim().split(/\s+/);
+    if ($("#mcpCwd").value.trim()) entry.cwd = $("#mcpCwd").value.trim();
+    const envText = $("#mcpEnv").value;
+    try { const env = parseMcpEnvLines(envText); if (Object.keys(env).length) entry.env = env; }
+    catch (err) { toast(err.message, true); return; }
+    if ($("#mcpStartupTimeout").value) entry.startupTimeoutSec = parseInt($("#mcpStartupTimeout").value, 10);
+  } else {
+    entry.url = $("#mcpUrl").value.trim();
+    if ($("#mcpBearer").value.trim()) entry.bearerTokenEnvVar = $("#mcpBearer").value.trim();
+  }
+  const key = extBusyKey("mcp", entry.name);
+  const button = $("#mcpSaveBtn");
+  if (ext.busy.has(key)) return;
+  $("#mcpEditDialog").close();
+  extWithBusy(key, button, async () => {
+    const result = await extApi("/mcp-save", { entry });
+    for (const w of (result.warnings || [])) toast(w.message, true);
+    toast(`已保存 MCP ${entry.name}`);
+    await loadExtensions(true);
+  });
+}
+
+// -- page wiring -------------------------------------------------------------
+
+(function initExtensionsPage() {
+  $$(".ext-tab").forEach(tab => tab.addEventListener("click", () => {
+    $$(".ext-tab").forEach(t => t.classList.toggle("active", t === tab));
+    $$(".ext-tabpanel").forEach(p => p.classList.toggle("hidden", p.id !== `extTab${tab.dataset.extTab === "plugins" ? "Plugins" : tab.dataset.extTab === "markets" ? "Markets" : "Mcp"}`));
+  }));
+  $("#extRefresh").addEventListener("click", () => loadExtensions(true));
+  $("#extBody").addEventListener("click", event => {
+    const detail = event.target.closest("[data-ext-detail]");
+    if (detail) return openPluginDetail(detail.dataset.extDetail, detail.dataset.extMp, detail.dataset.extRemote);
+    const install = event.target.closest("[data-ext-install]");
+    if (install) return openPluginDetail(install.dataset.extInstall, install.dataset.extMp, install.dataset.extRemote);
+    const uninstall = event.target.closest("[data-ext-uninstall]");
+    if (uninstall) {
+      const canonicalId = uninstall.dataset.extUninstall;
+      if (!window.confirm(`卸载插件 ${canonicalId}？`)) return;
+      return extWithBusy(extBusyKey("plugin", canonicalId), uninstall, async () => {
+        await extApi("/plugin-uninstall", { canonicalId });
+        toast(`已卸载 ${canonicalId}`);
+        await loadExtensions(true);
+      });
+    }
+    const upgrade = event.target.closest("[data-ext-upgrade]");
+    if (upgrade) {
+      const name = upgrade.dataset.extUpgrade;
+      return extWithBusy(extBusyKey("market", name), upgrade, async () => {
+        const r = await extApi("/market-upgrade", { marketplaceName: name });
+        toast(r.upgradedRoots && r.upgradedRoots.length ? `已升级 ${name}` : `${name} 已是最新`);
+        await loadExtensions(true);
+      });
+    }
+    const remove = event.target.closest("[data-ext-market-remove]");
+    if (remove) {
+      const name = remove.dataset.extMarketRemove;
+      if (!window.confirm(`移除市场源 ${name}？已安装的插件不会被删除。`)) return;
+      return extWithBusy(extBusyKey("market", name), remove, async () => {
+        await extApi("/market-remove", { marketplaceName: name });
+        toast(`已移除市场源 ${name}`);
+        await loadExtensions(true);
+      });
+    }
+    const mcpEdit = event.target.closest("[data-ext-mcp-edit]");
+    if (mcpEdit) return openMcpEditor(mcpEdit.dataset.extMcpEdit);
+    const mcpDelete = event.target.closest("[data-ext-mcp-delete]");
+    if (mcpDelete) {
+      const name = mcpDelete.dataset.extMcpDelete;
+      if (!window.confirm(`删除 MCP 配置 ${name}？（写入 ~/.codex/config.toml 的条目将被移除）`)) return;
+      return extWithBusy(extBusyKey("mcp", name), mcpDelete, async () => {
+        await extApi("/mcp-delete", { name });
+        toast(`已删除 MCP ${name}`);
+        await loadExtensions(true);
+      });
+    }
+  });
+  $("#extMarketAddBtn").addEventListener("click", () => {
+    const source = $("#extMarketSource").value.trim();
+    if (!source) return toast("请填写市场源地址", true);
+    extWithBusy(extBusyKey("market-add", source), $("#extMarketAddBtn"), async () => {
+      const r = await extApi("/market-add", { source, refName: $("#extMarketRef").value.trim() || null });
+      toast(r.alreadyAdded ? `市场源 ${r.added} 已存在` : `已添加市场源 ${r.added}`);
+      $("#extMarketSource").value = ""; $("#extMarketRef").value = "";
+      await loadExtensions(true);
+    });
+  });
+  $("#extMcpAddBtn").addEventListener("click", () => openMcpEditor(null));
+  $("#mcpTransport").addEventListener("change", () => {
+    const isHttp = $("#mcpTransport").value === "http";
+    $("#mcpStdioFields").classList.toggle("hidden", isHttp);
+    $("#mcpHttpFields").classList.toggle("hidden", !isHttp);
+  });
+  $("#mcpEditForm").addEventListener("submit", submitMcpSave);
+  $("#pluginConfirmBtn").addEventListener("click", event => {
+    event.preventDefault();
+    confirmPluginInstall(event.currentTarget);
+  });
+})();

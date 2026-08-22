@@ -2064,3 +2064,45 @@ html[data-theme="light"] .traj-turn:nth-child(even) {
 }
 html[data-theme="light"] .traj-turn::before { background: rgba(48,72,216,.3); }
 html[data-theme="light"] .traj-head i { border-color: var(--ui-ink); box-shadow: 1px 1px 0 rgba(48,72,216,.24); }
+
+/* ============ 07 EXTENSIONS（插件 / 市场源 / MCP）============ */
+.page-extensions { max-width: 1060px; }
+.ext-hero { display: flex; justify-content: space-between; align-items: flex-end; gap: 1rem; margin-bottom: 1.1rem; flex-wrap: wrap; }
+.ext-hero h2 { font-size: 1.7rem; margin: .2rem 0 .4rem; }
+.ext-hero p { max-width: 62ch; color: var(--ui-ink-soft); line-height: 1.55; }
+.ext-actions { display: flex; align-items: center; gap: .6rem; }
+.ext-unavailable { border: 3px solid var(--ink); box-shadow: var(--shadow); background: var(--ui-surface); padding: 1.4rem 1.6rem; margin-bottom: 1.2rem; }
+.ext-unavailable p { line-height: 1.6; }
+.ext-tabs { display: flex; gap: .4rem; margin-bottom: 1rem; border-bottom: 3px solid var(--ink); padding-bottom: 0; }
+.ext-tab { font: inherit; font-weight: 800; letter-spacing: .04em; padding: .55rem 1.1rem .5rem; border: 3px solid var(--ink); border-bottom: none; background: var(--ui-surface); cursor: pointer; position: relative; top: 3px; opacity: .72; }
+.ext-tab.active { opacity: 1; background: var(--ink); color: var(--paper); }
+html[data-theme="light"] .ext-tab.active { background: var(--ink); color: var(--paper-2); }
+.ext-subhead { display: flex; align-items: center; gap: .7rem; margin: 1.2rem 0 .6rem; }
+.ext-subhead h3 { font-size: 1.02rem; letter-spacing: .04em; }
+.ext-count { font-size: .78rem; border: 2px solid var(--ink); padding: .05rem .5rem; font-weight: 800; }
+.ext-plugin-list, .ext-market-list, .ext-mcp-list { display: grid; gap: .55rem; }
+.ext-card { border: 3px solid var(--ink); box-shadow: 4px 4px 0 var(--ink); background: var(--ui-surface); padding: .7rem .9rem; display: flex; justify-content: space-between; align-items: center; gap: .8rem; flex-wrap: wrap; }
+.ext-card .ext-card-main { min-width: 0; flex: 1 1 260px; }
+.ext-card-main b { display: inline-block; margin-right: .5rem; }
+.ext-card-main small { color: var(--ui-ink-soft); display: block; margin-top: .15rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 60ch; }
+.ext-badges { display: flex; gap: .3rem; flex-wrap: wrap; margin-top: .3rem; }
+.ext-badge { font-size: .68rem; font-weight: 800; border: 2px solid var(--ink); padding: 0 .4rem; letter-spacing: .03em; }
+.ext-badge.on { background: var(--acid); color: var(--ink); }
+.ext-badge.warn { background: #ffd23e; color: var(--ink); }
+.ext-card-actions { display: flex; gap: .4rem; align-items: center; }
+.ext-card-actions .mini-cut[disabled] { opacity: .5; cursor: wait; }
+.ext-market-add { display: flex; gap: .4rem; flex-wrap: wrap; flex: 1 1 auto; justify-content: flex-end; }
+.ext-market-add input { font: inherit; font-size: .85rem; padding: .35rem .55rem; border: 2px solid var(--ink); background: var(--paper-2); min-width: 10ch; }
+#extMarketSource { flex: 2 1 220px; }
+.ext-note, .ext-secret-note { font-size: .8rem; color: var(--ui-ink-soft); line-height: 1.5; margin: .2rem 0 .6rem; }
+.ext-secret-note b { color: #c9381c; }
+.ext-note code, .ext-secret-note code { border: 1px solid var(--ink); padding: 0 .3rem; font-size: .95em; }
+.ext-plugin-detail p { line-height: 1.55; margin: .3rem 0; }
+.ext-plugin-detail table { border-collapse: collapse; margin: .6rem 0; }
+.ext-plugin-detail td { border: 2px solid var(--ink); padding: .25rem .7rem; font-size: .9rem; }
+.ext-plugin-detail td:first-child { font-weight: 800; }
+.ext-risk { border: 3px solid #c9381c; padding: .6rem .8rem; margin: .7rem 0; font-size: .88rem; line-height: 1.5; }
+.ext-mcp-transport { font-size: .7rem; font-weight: 800; border: 2px solid var(--ink); padding: 0 .4rem; }
+#pluginDetailDialog .ext-plugin-detail { max-width: 62ch; }
+#mcpEditDialog label { display: block; margin: .55rem 0; font-size: .85rem; font-weight: 700; }
+#mcpEditDialog input, #mcpEditDialog select, #mcpEditDialog textarea { display: block; width: 100%; margin-top: .25rem; font: inherit; padding: .4rem .55rem; border: 2px solid var(--ink); background: var(--paper-2); }
