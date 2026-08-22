@@ -15,6 +15,8 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import tempfile
+import types
 import sys
 import unittest
 
@@ -304,6 +306,11 @@ class TestApprovalFlow(unittest.TestCase):
         self.assertEqual(result["answers"], ["选项A"])
 
 
+
+def make_adapter(**kwargs):
+    root = tempfile.mkdtemp(prefix="laomo-adapter-state-")
+    return CodexRuntimeAdapter(default_cwd="/tmp", state_root=root, **kwargs)
+
 class TestAdapterStatics(unittest.TestCase):
     def test_content_to_input(self):
         content = [
@@ -316,7 +323,7 @@ class TestAdapterStatics(unittest.TestCase):
         self.assertEqual(items[1], {"type": "text", "text": "看看图"})
 
     def test_unknown_rpc_stubbed(self):
-        adapter = CodexRuntimeAdapter(default_cwd="/tmp")
+        adapter = make_adapter()
         r = adapter.rpc("clean", "subagent.list", {})
         self.assertTrue(r["result"]["ok"])          # safe stub, no crash
         self.assertFalse(r["result"]["value"]["supported"])
@@ -326,15 +333,147 @@ class TestAdapterStatics(unittest.TestCase):
         self.assertTrue(r["result"]["ok"])
 
     def test_workspace_cwd_roundtrip(self):
-        adapter = CodexRuntimeAdapter(default_cwd="/tmp")
+        adapter = make_adapter()
         r = adapter.rpc("clean", "workspace.create", {"path": "/Users"})
         self.assertTrue(r["result"]["ok"])
         self.assertEqual(adapter.workspace_cwd(), "/Users")
         items = adapter.rpc("clean", "workspace.list", {})["result"]["value"]["items"]
-        self.assertEqual(items[0]["path"], "/Users")
+        # multi-project registry: the default (/tmp) stays, /Users is added
+        self.assertEqual([item["path"] for item in items], ["/tmp", "/Users"])
+        # create is idempotent per path (pickProject retries safely)
+        adapter.rpc("clean", "workspace.create", {"path": "/Users"})
+        items = adapter.rpc("clean", "workspace.list", {})["result"]["value"]["items"]
+        self.assertEqual(len(items), 2)
+
+    def test_workspace_registry_manage(self):
+        adapter = make_adapter()
+        adapter.rpc("clean", "workspace.create", {"path": "/Users"})
+        items = adapter.rpc("clean", "workspace.list", {})["result"]["value"]["items"]
+        second = items[1]
+        r = adapter.rpc("clean", "workspace.rename", {"workspaceId": second["id"], "title": "主目录"})
+        self.assertTrue(r["result"]["ok"])
+        r = adapter.rpc("clean", "workspace.insertBefore",
+                        {"workspaceId": second["id"], "beforeWorkspaceId": items[0]["id"]})
+        self.assertTrue(r["result"]["ok"])
+        ordered = adapter.rpc("clean", "workspace.list", {})["result"]["value"]["items"]
+        self.assertEqual(ordered[0]["title"], "主目录")
+        r = adapter.rpc("clean", "workspace.delete", {"workspaceId": items[0]["id"]})
+        self.assertTrue(r["result"]["ok"])
+        remaining = adapter.rpc("clean", "workspace.list", {})["result"]["value"]["items"]
+        self.assertEqual([item["path"] for item in remaining], ["/Users"])
+        # the last workspace is protected
+        r = adapter.rpc("clean", "workspace.delete", {"workspaceId": remaining[0]["id"]})
+        self.assertFalse(r["result"]["ok"])
+        # deleting the active project falls back to the first remaining one
+        adapter.rpc("clean", "workspace.create", {"path": "/tmp"})
+        r = adapter.rpc("clean", "workspace.delete", {"workspaceId": remaining[0]["id"]})
+        self.assertTrue(r["result"]["ok"])
+        self.assertEqual(adapter.workspace_cwd(), "/tmp")
+
+    def test_workspace_state_persists_across_restart(self):
+        root = tempfile.mkdtemp(prefix="laomo-adapter-state-")
+        first = CodexRuntimeAdapter(default_cwd="/tmp", state_root=root)
+        first.rpc("clean", "workspace.create", {"path": "/Users"})
+        second = CodexRuntimeAdapter(default_cwd="/tmp", state_root=root)
+        items = second.rpc("clean", "workspace.list", {})["result"]["value"]["items"]
+        self.assertEqual([item["path"] for item in items], ["/tmp", "/Users"])
+
+    def test_settings_namespaces_update_and_conflict(self):
+        adapter = make_adapter()
+        described = adapter.rpc("clean", "settings.describe", {})["result"]["value"]
+        ns = next(item for item in described["namespaces"] if item["ns"] == "ui-conversation")
+        r = adapter.rpc("clean", "settings.update",
+                        {"ns": "ui-conversation", "patch": {"busyEnter": "steer"},
+                         "expectedRevision": ns["revision"]})
+        self.assertTrue(r["result"]["ok"])
+        self.assertEqual(r["result"]["value"]["data"]["busyEnter"], "steer")
+        self.assertEqual(r["result"]["value"]["revision"], ns["revision"] + 1)
+        # stale revision is rejected instead of silently overwriting
+        r = adapter.rpc("clean", "settings.update",
+                        {"ns": "ui-conversation", "patch": {"busyEnter": "queue"},
+                         "expectedRevision": ns["revision"]})
+        self.assertFalse(r["result"]["ok"])
+        # persistence across restart keeps the value
+        same_root = adapter._state.root
+        reloaded = CodexRuntimeAdapter(default_cwd="/tmp", state_root=same_root)
+        ns2 = next(item for item in reloaded.rpc("clean", "settings.describe", {})["result"]["value"]["namespaces"]
+                   if item["ns"] == "ui-conversation")
+        self.assertEqual(ns2["data"]["busyEnter"], "steer")
+
+    def test_agent_presets_select_copy_remove(self):
+        adapter = make_adapter()
+        listed = adapter.rpc("clean", "agentPreset.list", {})["result"]["value"]["presets"]
+        ids = {item["id"] for item in listed}
+        self.assertTrue({"standard", "concise", "planner"} <= ids)
+        r = adapter.rpc("clean", "agentPreset.select", {"sessionId": "s1", "agentPreset": "concise"})
+        self.assertTrue(r["result"]["ok"])
+        self.assertEqual(adapter.registry.get("s1")["agentPreset"], "concise")
+        read = adapter.rpc("clean", "agentPreset.read", {"agentPreset": "concise"})["result"]["value"]
+        self.assertIn("简洁", read["content"])
+        r = adapter.rpc("clean", "agentPreset.copy",
+                        {"from": "concise", "agentPreset": "concise-2", "name": "简洁2"})
+        self.assertTrue(r["result"]["ok"])
+        r = adapter.rpc("clean", "agentPreset.copy",
+                        {"from": "concise", "agentPreset": "bad id!", "name": "x"})
+        self.assertFalse(r["result"]["ok"])
+        r = adapter.rpc("clean", "agentPreset.remove", {"agentPreset": "concise-2"})
+        self.assertTrue(r["result"]["ok"])
+        r = adapter.rpc("clean", "agentPreset.remove", {"agentPreset": "standard"})
+        self.assertFalse(r["result"]["ok"])  # builtins are protected
+        r = adapter.rpc("clean", "agentPreset.openDocument", {"agentPreset": "standard"})
+        self.assertFalse(r["result"]["ok"])  # honest unsupported
+
+    def test_subagent_honest_unsupported(self):
+        adapter = make_adapter()
+        r = adapter.rpc("clean", "subagent.list", {})
+        self.assertTrue(r["result"]["ok"])  # panel renders empty
+        r = adapter.rpc("clean", "subagent.prompt", {"parentSessionId": "s", "childSessionId": "c"})
+        self.assertFalse(r["result"]["ok"])  # no fake 已发送 toast
+
+    def test_credentials_against_store(self):
+        class FakeStore:
+            def __init__(self): self.values = {}
+            def has(self, ref): return ref in self.values
+            def set(self, ref, value): self.values[ref] = value
+            def delete(self, ref): self.values.pop(ref, None)
+            def storage_description(self): return "测试存储"
+        store = FakeStore()
+        adapter = make_adapter(providers=types.SimpleNamespace(credentials=store))
+        described = adapter.rpc("clean", "credentials.describe",
+                                {"refs": ["DEEPSEEK_API_KEY"]})["result"]["value"]
+        self.assertFalse(described["credentials"]["DEEPSEEK_API_KEY"]["configured"])
+        adapter.rpc("clean", "credentials.set", {"ref": "DEEPSEEK_API_KEY", "value": "sk-x"})
+        described = adapter.rpc("clean", "credentials.describe",
+                                {"refs": ["DEEPSEEK_API_KEY"]})["result"]["value"]
+        self.assertTrue(described["credentials"]["DEEPSEEK_API_KEY"]["configured"])
+        adapter.rpc("clean", "credentials.unset", {"ref": "DEEPSEEK_API_KEY"})
+        described = adapter.rpc("clean", "credentials.describe",
+                                {"refs": ["DEEPSEEK_API_KEY"]})["result"]["value"]
+        self.assertFalse(described["credentials"]["DEEPSEEK_API_KEY"]["configured"])
+
+    def test_host_open_path_validates(self):
+        adapter = make_adapter()
+        r = adapter.rpc("clean", "host.openPath", {"path": "/definitely/not/here"})
+        self.assertFalse(r["result"]["ok"])
+        from unittest import mock
+        with mock.patch.object(codex_adapter.subprocess, "Popen"):
+            r = adapter.rpc("clean", "host.openPath", {"path": "/tmp"})
+        self.assertTrue(r["result"]["ok"])
+
+    def test_workspace_grouping_of_sessions(self):
+        adapter = make_adapter()
+        adapter.rpc("clean", "workspace.create", {"path": "/Users"})
+        adapter.registry.ensure("t-in-users", cwd="/Users")
+        adapter.registry.ensure("t-in-tmp", cwd="/tmp")
+        self.assertEqual(adapter._workspace_id_for("/Users"),
+                         adapter._workspace_id_for("/Users"))
+        listing = adapter.rpc("clean", "workspace.list", {})["result"]["value"]["items"]
+        by_path = {item["path"]: item for item in listing}
+        self.assertIn("t-in-users", by_path["/Users"]["sessionIds"])
+        self.assertIn("t-in-tmp", by_path["/tmp"]["sessionIds"])
 
     def test_select_model_stored(self):
-        adapter = CodexRuntimeAdapter(default_cwd="/tmp")
+        adapter = make_adapter()
         adapter.rpc("clean", "session.selectModel", {"sessionId": "s1", "model": "gpt-5.5", "reasoningEffort": "high"})
         m, e = adapter._session_model_overrides("s1")
         self.assertEqual((m, e), ("gpt-5.5", "high"))
@@ -342,7 +481,7 @@ class TestAdapterStatics(unittest.TestCase):
     def test_full_auto_permission_never_asks_inside_sandbox(self):
         # 全自动 = the mission runtime's contract for interactive use: the
         # workspace sandbox stays on, approvals are off so nothing stalls.
-        adapter = CodexRuntimeAdapter(default_cwd="/tmp")
+        adapter = make_adapter()
         adapter.rpc("clean", "commands/execute",
                     {"agentId": "s1", "line": "/permission full-auto"})
         params = adapter._sandbox_params("s1")
@@ -356,7 +495,7 @@ class TestAdapterStatics(unittest.TestCase):
         # no handler. Dispatch must reach the native-picker handler; user
         # cancel is the silent path, a picked path feeds workspace.create.
         from unittest import mock
-        adapter = CodexRuntimeAdapter(default_cwd="/tmp")
+        adapter = make_adapter()
         completed = subprocess.CompletedProcess(args=[], returncode=0,
                                                  stdout="/Users/lianb/Downloads/bh/\n")
         with mock.patch.object(codex_adapter.subprocess, "run", return_value=completed):
@@ -370,7 +509,7 @@ class TestAdapterStatics(unittest.TestCase):
         self.assertIn("cancel", str(r["result"]["error"]))
 
     def test_permission_levels_approval_matrix(self):
-        adapter = CodexRuntimeAdapter(default_cwd="/tmp")
+        adapter = make_adapter()
         for level, sandbox, approval in (
             # read-only still asks: a blocked command escalates via approval
             ("read-only", {"type": "readOnly"}, "on-request"),

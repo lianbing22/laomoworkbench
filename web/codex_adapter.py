@@ -541,6 +541,147 @@ class HistoryFolder:
         return str(summary or "")
 
 
+# --- Workbench host state (multi-project workspaces / settings / presets) ----
+
+def _host_state_root() -> str:
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~/AppData/Local")
+        return os.path.join(base, "Boujoy", "BoujoyHarness")
+    return os.path.expanduser("~/Library/Application Support/Boujoy/BoujoyHarness")
+
+
+class HostState:
+    """DSH-host surfaces the codex runtime must carry itself: a multi-project
+    workspace registry (rename/reorder/delete), writable settings namespaces
+    (busyEnter etc.), and user-defined agent presets. One JSON file under the
+    product state dir; the gateway is a single process, so an in-process lock
+    plus atomic replace is enough."""
+
+    def __init__(self, root: str | None = None) -> None:
+        self.root = root or _host_state_root()
+        self.path = os.path.join(self.root, "host-state.json")
+        self._lock = threading.Lock()
+        self._data: dict[str, Any] = {"workspaces": [], "settings": {}, "presets": {}}
+        try:
+            os.makedirs(self.root, exist_ok=True)
+            with open(self.path, encoding="utf-8") as fh:
+                loaded = json.load(fh)
+            if isinstance(loaded, dict):
+                for key, fallback in self._data.items():
+                    value = loaded.get(key)
+                    if isinstance(value, type(fallback)):
+                        self._data[key] = value
+        except (OSError, ValueError):
+            pass
+
+    def _save_locked(self) -> None:
+        temporary = self.path + ".tmp"
+        with open(temporary, "w", encoding="utf-8") as fh:
+            json.dump(self._data, fh, ensure_ascii=False, indent=1)
+        os.replace(temporary, self.path)
+
+    # -- workspaces --
+    def workspaces(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [dict(ws) for ws in self._data["workspaces"]]
+
+    def workspace(self, workspace_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            for ws in self._data["workspaces"]:
+                if ws.get("id") == workspace_id:
+                    return dict(ws)
+        return None
+
+    def add_workspace(self, path: str, workspace_id: str | None = None) -> dict[str, Any]:
+        with self._lock:
+            for ws in self._data["workspaces"]:
+                if ws.get("path") == path:
+                    return dict(ws)
+            ws = {"id": workspace_id or f"ws-{uuid.uuid4().hex[:8]}",
+                  "title": os.path.basename(path.rstrip("/")) or path,
+                  "path": path, "order": len(self._data["workspaces"])}
+            self._data["workspaces"].append(ws)
+            self._save_locked()
+            return dict(ws)
+
+    def mutate_workspace(self, workspace_id: str, title: str | None = None) -> dict[str, Any] | None:
+        with self._lock:
+            for ws in self._data["workspaces"]:
+                if ws.get("id") == workspace_id:
+                    if title is not None:
+                        ws["title"] = title
+                    self._save_locked()
+                    return dict(ws)
+        return None
+
+    def delete_workspace(self, workspace_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            remaining = [ws for ws in self._data["workspaces"] if ws.get("id") != workspace_id]
+            if len(remaining) == len(self._data["workspaces"]):
+                return None
+            removed = next(ws for ws in self._data["workspaces"] if ws.get("id") == workspace_id)
+            self._data["workspaces"] = remaining
+            for index, ws in enumerate(remaining):
+                ws["order"] = index
+            self._save_locked()
+            return dict(removed)
+
+    def reorder_workspace(self, workspace_id: str, before_workspace_id: str | None) -> bool:
+        with self._lock:
+            items = self._data["workspaces"]
+            subject = next((ws for ws in items if ws.get("id") == workspace_id), None)
+            if subject is None:
+                return False
+            items.remove(subject)
+            index = len(items)
+            if before_workspace_id:
+                for position, ws in enumerate(items):
+                    if ws.get("id") == before_workspace_id:
+                        index = position
+                        break
+            items.insert(index, subject)
+            for position, ws in enumerate(items):
+                ws["order"] = position
+            self._save_locked()
+            return True
+
+    # -- settings --
+    def settings_namespaces(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [{"ns": ns, "revision": value.get("revision", 0),
+                     "data": dict(value.get("data", {}))}
+                    for ns, value in self._data["settings"].items()]
+
+    def settings_update(self, ns: str, patch: dict[str, Any],
+                        expected_revision: int | None) -> dict[str, Any] | None:
+        with self._lock:
+            value = self._data["settings"].setdefault(ns, {"revision": 0, "data": {}})
+            if expected_revision is not None and int(expected_revision) != int(value.get("revision", 0)):
+                return None
+            value["data"].update(patch or {})
+            value["revision"] = int(value.get("revision", 0)) + 1
+            self._save_locked()
+            return {"ns": ns, "revision": value["revision"], "data": dict(value["data"])}
+
+    # -- presets --
+    def custom_presets(self) -> dict[str, Any]:
+        with self._lock:
+            return {pid: dict(doc) for pid, doc in self._data["presets"].items()}
+
+    def put_preset(self, preset_id: str, doc: dict[str, Any]) -> None:
+        with self._lock:
+            self._data["presets"][preset_id] = doc
+            self._save_locked()
+
+    def delete_preset(self, preset_id: str) -> bool:
+        with self._lock:
+            if preset_id not in self._data["presets"]:
+                return False
+            del self._data["presets"][preset_id]
+            self._save_locked()
+            return True
+
+
 # --- SessionRegistry ---------------------------------------------------------
 
 
@@ -554,7 +695,8 @@ class SessionRegistry:
             s = self._sessions.get(thread_id)
             if s is None:
                 s = {"running": False, "turnId": "", "cwd": cwd, "title": title, "model": None, "effort": None,
-                     "permission": None, "providerId": None, "updated": int(time.time() * 1000)}
+                     "permission": None, "providerId": None, "agentPreset": "standard",
+                     "updated": int(time.time() * 1000)}
                 self._sessions[thread_id] = s
             else:
                 if cwd:
@@ -572,6 +714,12 @@ class SessionRegistry:
         s = self.ensure(thread_id)
         with self._lock:
             s["running"] = running
+            s["updated"] = int(time.time() * 1000)
+
+    def set_agent_preset(self, thread_id: str, preset_id: str) -> None:
+        s = self.ensure(thread_id)
+        with self._lock:
+            s["agentPreset"] = preset_id
             s["updated"] = int(time.time() * 1000)
 
     def set_usage(self, thread_id: str, usage: dict[str, Any], pressure: dict[str, Any]) -> None:
@@ -906,7 +1054,8 @@ class CodexRuntimeAdapter:
 
     def __init__(self, bin_path: str | None = None, default_cwd: str | None = None,
                  debug_log: Callable[[str], None] | None = None,
-                 providers: Any = None) -> None:
+                 providers: Any = None,
+                 state_root: str | None = None) -> None:
         self.bin_path = bin_path or shutil.which("codex") or os.path.expanduser("~/.local/bin/codex")
         self.default_cwd = default_cwd or os.getcwd()
         self._debug_sink = debug_log or (lambda m: None)
@@ -914,6 +1063,11 @@ class CodexRuntimeAdapter:
         self.translator = EventTranslator()
         self.registry = SessionRegistry()
         self.folder = HistoryFolder()
+        # DSH-host parity surfaces (multi-project registry, settings, presets).
+        # Tests inject state_root; production persists under the product dir.
+        self._state = HostState(state_root)
+        if not self._state.workspaces():
+            self._state.add_workspace(self.default_cwd, workspace_id="laomo-clean")
         self.process: CodexProcess | None = None
         self._proc_lock = threading.Lock()
         self._subscribers: list[Callable[[dict[str, Any]], None]] = []
@@ -1156,9 +1310,9 @@ class CodexRuntimeAdapter:
                 "title": t.get("name") or t.get("preview", "")[:40] or "未命名会话",
                 "running": bool(reg.get("running")),
                 "blank": False,
-                "workspaceId": "laomo-clean",
+                "workspaceId": self._workspace_id_for(reg.get("cwd") or t.get("cwd")),
                 "updatedAt": t.get("updatedAt") or t.get("recencyAt") or 0,
-                "agentPreset": "standard",
+                "agentPreset": reg.get("agentPreset") or "standard",
                 "projection": {"permissions": self._permission_view(tid)},
             })
         return ok_value({"sessions": items, "items": items})
@@ -1456,6 +1610,11 @@ class CodexRuntimeAdapter:
         if not input_items:
             return err_value("empty prompt content")
         reg = self.registry.ensure(sid)
+        # Non-standard agent presets prepend their standing instruction to
+        # every turn (transparent: the text rides with the user message).
+        preset = self._preset_document(str(reg.get("agentPreset") or "standard"))
+        if preset and preset.get("id") != "standard" and preset.get("content"):
+            input_items = [{"type": "text", "text": str(preset["content"])}] + input_items
         if reg.get("running"):
             # Schema: steer requires expectedTurnId (active turn precondition).
             params = {"threadId": sid, "input": input_items,
@@ -1631,11 +1790,28 @@ class CodexRuntimeAdapter:
         return ok_value({"selected": True})
 
     # workspace.*
+    def _workspace_id_for(self, cwd: str | None) -> str:
+        """Group a session under the workspace whose path matches its cwd;
+        unknown cwd lands in the first (default) workspace."""
+        for ws in self._state.workspaces():
+            if cwd and ws.get("path") == cwd:
+                return str(ws["id"])
+        workspaces = self._state.workspaces()
+        return str(workspaces[0]["id"]) if workspaces else "laomo-clean"
+
     def _rpc_workspace_list(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
-        cwd = self.workspace_cwd()
-        name = os.path.basename(cwd.rstrip("/")) or cwd
-        return ok_value({"items": [{"workspaceId": "laomo-clean", "id": "laomo-clean",
-                                    "title": name, "path": cwd, "archivedSessionIds": []}]})
+        items = []
+        with self.registry._lock:
+            sessions_by_cwd: dict[str, list[str]] = {}
+            for tid, reg in self.registry._sessions.items():
+                sessions_by_cwd.setdefault(str(reg.get("cwd") or ""), []).append(tid)
+        for ws in self._state.workspaces():
+            items.append({"workspaceId": ws["id"], "id": ws["id"],
+                          "title": ws.get("title") or ws.get("path"),
+                          "path": ws.get("path"),
+                          "sessionIds": sessions_by_cwd.get(str(ws.get("path")), []),
+                          "archivedSessionIds": []})
+        return ok_value({"items": items})
 
     def _rpc_workspace_create(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
         path = str(body.get("path", "")).strip()
@@ -1645,8 +1821,40 @@ class CodexRuntimeAdapter:
         if not os.path.isdir(path):
             return err_value(f"not a directory: {path}")
         self.set_workspace_cwd(path)
-        name = os.path.basename(path.rstrip("/")) or path
-        return ok_value({"workspaceId": "laomo-clean", "id": "laomo-clean", "title": name, "path": path})
+        ws = self._state.add_workspace(path)
+        return ok_value({"workspaceId": ws["id"], "id": ws["id"],
+                         "title": ws.get("title"), "path": path})
+
+    def _rpc_workspace_rename(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
+        workspace_id = str(body.get("workspaceId", ""))
+        title = str(body.get("title", "")).strip()
+        if not title:
+            return err_value("title required")
+        ws = self._state.mutate_workspace(workspace_id, title=title)
+        if ws is None:
+            return err_value("workspace not found")
+        return ok_value({"workspaceId": workspace_id, "title": title})
+
+    def _rpc_workspace_delete(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
+        workspace_id = str(body.get("workspaceId", ""))
+        ws = self._state.workspace(workspace_id)
+        if ws is None:
+            return err_value("workspace not found")
+        if len(self._state.workspaces()) <= 1:
+            return err_value("至少保留一个项目")
+        self._state.delete_workspace(workspace_id)
+        # deleting the active project falls back to the first remaining one
+        if ws.get("path") and ws["path"] == self.workspace_cwd():
+            fallback = self._state.workspaces()[0]
+            self.set_workspace_cwd(str(fallback["path"]))
+        return ok_value({"deleted": workspace_id})
+
+    def _rpc_workspace_insertBefore(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
+        workspace_id = str(body.get("workspaceId", ""))
+        before = body.get("beforeWorkspaceId")
+        if not self._state.reorder_workspace(workspace_id, str(before) if before else None):
+            return err_value("workspace not found")
+        return ok_value({"reordered": workspace_id})
 
     def _rpc_workspace_archiveSession(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
         try:
@@ -1829,6 +2037,195 @@ class CodexRuntimeAdapter:
 
     def _generic_empty_ok(self, body: dict[str, Any]) -> dict[str, Any]:
         return ok_value({"items": [], "supported": False})
+
+    # host.openPath -> reveal in Finder (native-host parity)
+    def _rpc_host_openPath(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
+        if sys.platform != "darwin":
+            return err_value("host.openPath 仅支持 macOS")
+        path = os.path.abspath(os.path.expanduser(str(body.get("path", ""))))
+        if not os.path.exists(path):
+            return err_value(f"路径不存在: {path}")
+        subprocess.Popen(["open", "-R", path])
+        return ok_value({"opened": path})
+
+    # settings.* -> writable namespaces (busyEnter …). The old stub silently
+    # dropped the update while the UI toasted 已更新.
+    def _rpc_settings_describe(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
+        namespaces = self._state.settings_namespaces()
+        if not any(ns["ns"] == "ui-conversation" for ns in namespaces):
+            namespaces.insert(0, {"ns": "ui-conversation", "revision": 0, "data": {}})
+        return ok_value({"namespaces": namespaces, "path": self._state.path})
+
+    def _rpc_settings_update(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
+        ns = str(body.get("ns", ""))
+        patch = body.get("patch")
+        if ns != "ui-conversation" or not isinstance(patch, dict):
+            return err_value("仅支持 ui-conversation 命名空间")
+        expected = body.get("expectedRevision")
+        result = self._state.settings_update(ns, patch,
+                                             None if expected is None else int(expected))
+        if result is None:
+            return err_value("设置版本冲突，请刷新页面后重试", "revision-conflict")
+        return ok_value(result)
+
+    def _rpc_settings_openDocument(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
+        if sys.platform != "darwin" or not os.path.exists(self._state.path):
+            return err_value("设置文件尚未生成，先修改一次设置")
+        subprocess.Popen(["open", "-R", self._state.path])
+        return ok_value({"opened": self._state.path})
+
+    # credentials.* -> the provider CredentialStore (macOS Keychain)
+    def _credential_store(self):
+        return getattr(self.providers, "credentials", None) if self.providers else None
+
+    def _rpc_credentials_describe(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
+        store = self._credential_store()
+        out: dict[str, Any] = {}
+        for ref in body.get("refs") or []:
+            ref = str(ref)
+            if store is None:
+                out[ref] = {"configured": False, "source": "运行时未启用凭证库"}
+            else:
+                out[ref] = {"configured": store.has(ref), "source": store.storage_description()}
+        return ok_value({"credentials": out})
+
+    def _rpc_credentials_set(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
+        store = self._credential_store()
+        if store is None:
+            return err_value("运行时未启用凭证库")
+        ref = str(body.get("ref", "")).strip()
+        if not ref:
+            return err_value("ref required")
+        try:
+            store.set(ref, str(body.get("value", "")))
+        except Exception as exc:  # ProviderError surfaces its own message
+            return err_value(str(exc))
+        return ok_value({"ref": ref, "configured": True})
+
+    def _rpc_credentials_unset(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
+        store = self._credential_store()
+        if store is None:
+            return err_value("运行时未启用凭证库")
+        ref = str(body.get("ref", "")).strip()
+        store.delete(ref)
+        return ok_value({"ref": ref, "configured": False})
+
+    # llm.* -> provider profiles + the codex model catalogue
+    def _rpc_llm_providers(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
+        if self.providers is None:
+            items = [{"provider": "chatgpt", "displayName": "ChatGPT / Codex（内置）", "active": True}]
+            return ok_value({"items": items, "providers": items, "activeProviderId": "chatgpt"})
+        listed = self.providers.public_list()
+        active = listed.get("activeProviderId") or "chatgpt"
+        items = []
+        for profile in listed.get("providers", []):
+            items.append({"provider": profile.get("id"),
+                          "displayName": profile.get("name") or profile.get("id"),
+                          "active": profile.get("id") == active,
+                          "builtin": profile.get("type") == "chatgpt",
+                          "secretConfigured": bool(profile.get("secretConfigured"))})
+        return ok_value({"items": items, "providers": items, "activeProviderId": active,
+                         "secretStorage": listed.get("secretStorage")})
+
+    def _rpc_llm_models(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
+        # Same catalogue session.models serves (provider-aware groups).
+        return self._rpc_session_models({})
+
+    def _rpc_llm_discoverModels(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
+        # For codex, model/list IS the discovery: no API-key probing needed.
+        catalogue = self._rpc_session_models({})
+        value = catalogue.get("result", {}).get("value") or {}
+        models = [model for group in value.get("groups", []) for model in group.get("models", [])]
+        return ok_value({"models": models, "source": "codex model/list"})
+
+    # agentPreset.* — builtin + user presets; non-standard presets prepend a
+    # standing instruction to every prompt (transparent, like the work modes).
+    BUILTIN_PRESETS = [
+        {"id": "standard", "name": "标准模式", "trust": "builtin", "isDefault": True,
+         "description": "均衡的默认执行风格（无附加指令）。",
+         "content": "（标准模式：不附加额外指令。）"},
+        {"id": "concise", "name": "简洁执行", "trust": "builtin",
+         "description": "少解释、多交付，先给结果。",
+         "content": "【执行风格】回复保持简洁：先给结果与关键改动，再给最少必要的说明；不重复已知背景。"},
+        {"id": "planner", "name": "计划先行", "trust": "builtin",
+         "description": "先给出分步计划，确认后再执行。",
+         "content": "【执行风格】对任何实质性改动：先给出分步计划（要动什么、怎么验证），等我确认后再执行。"},
+    ]
+
+    def _preset_catalogue(self) -> list[dict[str, Any]]:
+        items = [dict(p) for p in self.BUILTIN_PRESETS]
+        for pid, doc in sorted(self._state.custom_presets().items()):
+            items.append({"id": pid, "name": doc.get("name") or pid, "trust": "user",
+                          "description": doc.get("description") or "自定义预设",
+                          "content": doc.get("content", "")})
+        return items
+
+    def _preset_document(self, preset_id: str) -> dict[str, Any] | None:
+        for preset in self._preset_catalogue():
+            if preset["id"] == preset_id:
+                return preset
+        return None
+
+    def _rpc_agentPreset_list(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
+        return ok_value({"presets": self._preset_catalogue()})
+
+    def _rpc_agentPreset_select(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
+        sid = str(body.get("sessionId", ""))
+        preset_id = str(body.get("agentPreset", ""))
+        if not sid:
+            return err_value("sessionId required")
+        if self._preset_document(preset_id) is None:
+            return err_value(f"未知预设: {preset_id}")
+        self.registry.set_agent_preset(sid, preset_id)
+        self._emit(self.translator.session_projection(sid, "agentPreset", preset_id))
+        return ok_value({"sessionId": sid, "agentPreset": preset_id})
+
+    def _rpc_agentPreset_read(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
+        preset = self._preset_document(str(body.get("agentPreset", "")))
+        if preset is None:
+            return err_value("未知预设")
+        return ok_value({"name": preset["name"], "content": preset.get("content", ""),
+                         "trust": preset.get("trust", "builtin")})
+
+    def _rpc_agentPreset_copy(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
+        source = self._preset_document(str(body.get("from", "")))
+        if source is None:
+            return err_value("来源预设不存在")
+        preset_id = str(body.get("agentPreset", "")).strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,63}", preset_id):
+            return err_value("预设 ID 只能是英文、数字或连字符")
+        if any(p["id"] == preset_id for p in self._preset_catalogue()):
+            return err_value(f"预设 ID 已存在: {preset_id}")
+        doc = {"name": str(body.get("name") or preset_id),
+               "description": f"复制自 {source['name']}", "content": source.get("content", "")}
+        self._state.put_preset(preset_id, doc)
+        return ok_value({"agentPreset": preset_id, "name": doc["name"]})
+
+    def _rpc_agentPreset_remove(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
+        preset_id = str(body.get("agentPreset", ""))
+        if not self._state.delete_preset(preset_id):
+            return err_value("只能删除自定义预设")
+        return ok_value({"removed": preset_id})
+
+    def _rpc_agentPreset_openDocument(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
+        return err_value("codex 运行时没有原生文档窗口，请用「查看」阅读预设内容")
+
+    # subagent.* — codex has no subagent runtime; be honest instead of the
+    # old stub that made 已发送给子代理 toast on a no-op.
+    def _rpc_subagent_list(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
+        return ok_value({"items": [], "supported": False})
+
+    def _rpc_subagent_history(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
+        return ok_value({"events": [], "supported": False})
+
+    def _rpc_subagent_prompt(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
+        return err_value("codex 运行时暂不支持子代理")
+
+    def _rpc_subagent_interrupt(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
+        return err_value("codex 运行时暂不支持子代理")
+
+    def _rpc_skill_list(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
+        return ok_value({"skills": [], "supported": False})
 
     def _rpc_generic(self, endpoint: str, body: dict[str, Any]) -> dict[str, Any]:
         self._debug_log(f"stubbed rpc: {endpoint}")
