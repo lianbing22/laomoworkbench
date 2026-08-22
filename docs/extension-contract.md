@@ -98,22 +98,35 @@ keyPath=`mcp_servers.<name>`，**禁止**自己编辑 TOML 文本。实测两种
 上游返回成功但状态未变 → `ok=false, code=POSTCONDITION_FAILED`，UI 文案
 "Codex 接受了请求，但插件状态未发生预期变化。" 绝不提前 toast 成功。
 
-- install → 重 `plugin/installed`，canonical id 出现且 `installed=true`
-- uninstall → 重 `plugin/installed`，id 消失（或 upstream 定义的等价终态）
+**强 postcondition（WRITE→REFETCH→VERIFY）**：
+
+- install → 重 `plugin/installed`（**同 workspace cwds scope**），canonical id 出现且 `installed=true`
+- uninstall → 重 `plugin/installed`（**同 workspace cwds scope**），id 消失（或 upstream 定义的等价终态）
 - market add → 重 `plugin/list`，marketplaceName 出现
 - market remove → 重 `plugin/list`，marketplaceName 消失
-- market upgrade → `upgradedRoots` 非空且 `errors` 为空
 - mcp save/delete → reload 后 `config/read` 复核
+
+**Upstream-result validation（非强 postcondition，诚实分级）**：
+
+- market upgrade → 校验 upstream 自己的结果（`errors` 为空，或
+  `upgradedRoots` 非空）。"已是最新" 没有可复核的稳定权威字段，所以
+  不做 refetch-verify——这是与 install/uninstall/add/remove 的**有意
+  区别**，不是遗漏。
 
 ## Workspace scope
 
 `plugin/list`/`plugin/installed` 必须传 active workspace cwd（`cwds`）。
 ExtensionService 从 RuntimeManager 获取当前 workspace cwd，不自行维护第二份。
+**mutation postcondition 同样 workspace-aware**：install/uninstall 的复核
+扫描带与 inventory 相同的 cwds——只用 home scope 会漏掉 project/workspace
+scoped 插件（误报 POSTCONDITION_FAILED）或看到同源陈旧记录（误判成功）。
 
 ## 不支持/降级语义
 
-- 单块 RPC 失败 → 该块 `{"supported": false, "error": "..."}`，其余块照常
-  （绝不让整个聚合 500）
+- 单块 RPC 失败（capability 缺失**或**普通 upstream error）→ 该块
+  `{"supported": false, "error": "..."}`（空 payload），其余块照常
+  （绝不让整个聚合 500）。`supported=true + error` 是暧昧语义，不使用
+  ——块的 `supported` 就是对"这块能不能用"的唯一回答
 - clean runtime ≠ codex → 网关层 `CODEX_RUNTIME_REQUIRED`
 - 上游 evolve（experimental RPC）：capability detect（探测方法是否存在/
   错误形状），不用版本号猜测；README 写"推荐 Codex ≥ 0.149.0-alpha.4.1"

@@ -153,9 +153,14 @@ class CodexPluginClient:
         }
 
     # -- mutations (postcondition-verified) ----------------------------------
+    # Postcondition scans are workspace-aware: they re-read plugin/installed
+    # with the SAME cwds scope the inventory used. A home-scope-only scan
+    # would miss project/workspace-scoped plugins (false
+    # POSTCONDITION_FAILED) or see stale same-source rows.
 
     def install(self, plugin_name: str, marketplace_path: str | None = None,
-                remote_marketplace_name: str | None = None) -> dict[str, Any]:
+                remote_marketplace_name: str | None = None,
+                cwd: str | None = None) -> dict[str, Any]:
         if bool(marketplace_path) == bool(remote_marketplace_name):
             raise ExtensionError(
                 "install 需要 marketplacePath 或 remoteMarketplaceName 恰好一个",
@@ -167,20 +172,20 @@ class CodexPluginClient:
         if remote_marketplace_name:
             params["remoteMarketplaceName"] = remote_marketplace_name
         result = self._rpc("plugin/install", params, timeout=120.0)
-        # postcondition: the canonical plugin shows up installed
+        # postcondition: the canonical plugin shows up installed (same cwd scope)
         state = self._find_installed(plugin_name, marketplace_path,
-                                     remote_marketplace_name)
+                                     remote_marketplace_name, cwd)
         if state is None:
             raise PostconditionFailed(
                 f"Codex 接受了请求，但插件 {plugin_name} 未出现在已安装列表。")
         return {"installResult": result or {}, "installed": state}
 
-    def uninstall(self, canonical_id: str) -> dict[str, Any]:
+    def uninstall(self, canonical_id: str, cwd: str | None = None) -> dict[str, Any]:
         """canonical_id is PluginSummary.id (name@marketplace), NOT a display
         name — uninstall targets exactly one canonical plugin."""
         name = canonical_id.split("@", 1)[0]
         self._rpc("plugin/uninstall", {"pluginId": canonical_id}, timeout=60.0)
-        if self._find_installed_by_id(canonical_id) is not None:
+        if self._find_installed_by_id(canonical_id, cwd) is not None:
             raise PostconditionFailed(
                 f"Codex 接受了请求，但插件 {canonical_id} 仍在已安装列表。")
         return {"uninstalled": canonical_id, "name": name}
@@ -194,9 +199,10 @@ class CodexPluginClient:
         return rows
 
     def _find_installed(self, plugin_name: str, marketplace_path: str | None,
-                        remote_marketplace_name: str | None) -> dict[str, Any] | None:
+                        remote_marketplace_name: str | None,
+                        cwd: str | None = None) -> dict[str, Any] | None:
         target_mp = remote_marketplace_name or self._mp_name_from_path(marketplace_path)
-        for summary in self._installed_scan():
+        for summary in self._installed_scan(cwd):
             if summary.get("name") == plugin_name:
                 mp = str(summary.get("id", "")).split("@", 1)
                 summary_mp = mp[1] if len(mp) > 1 else None
@@ -211,8 +217,9 @@ class CodexPluginClient:
                     return self._plugin_view(enriched)
         return None
 
-    def _find_installed_by_id(self, canonical_id: str) -> dict[str, Any] | None:
-        for summary in self._installed_scan():
+    def _find_installed_by_id(self, canonical_id: str,
+                              cwd: str | None = None) -> dict[str, Any] | None:
+        for summary in self._installed_scan(cwd):
             if str(summary.get("id") or "") == canonical_id:
                 return summary
         return None
@@ -256,6 +263,12 @@ class CodexPluginClient:
         return {"removed": marketplace_name}
 
     def market_upgrade(self, marketplace_name: str | None = None) -> dict[str, Any]:
+        """NOTE — contract honesty (P2.0.1): unlike install/uninstall/add/remove,
+        upgrade is UPSTREAM-RESULT VALIDATION, not a strong refetch
+        postcondition. "Up to date" has no stable authoritative field to
+        re-verify against, so we validate the upstream's own result (errors
+        empty, or upgradedRoots non-empty) instead of WRITE->REFETCH->VERIFY.
+        docs/extension-contract.md states this distinction explicitly."""
         params: dict[str, Any] = {}
         if marketplace_name:
             params["marketplaceName"] = marketplace_name
@@ -264,7 +277,6 @@ class CodexPluginClient:
         if errors and not result.get("upgradedRoots"):
             raise ExtensionError(
                 "升级失败：" + "; ".join(str(e) for e in errors[:3]), "upgrade-failed")
-        # postcondition: something was upgraded or explicitly reported clean
         return {"upgradedRoots": result.get("upgradedRoots") or [],
                 "selected": result.get("selectedMarketplaces") or [],
                 "errors": errors}

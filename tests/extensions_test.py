@@ -479,5 +479,116 @@ class TestMcpValidationSecurity(unittest.TestCase):
         self.assertEqual(rt["servers"], [])  # whatever upstream said, verbatim
 
 
+class TestP201Hardening(unittest.TestCase):
+    """P2.0.1 regressions: overview() ExtensionError degradation must not
+    raise (the block(True, supported=True, ...) TypeError) and plugin
+    mutation postconditions must be workspace-scoped."""
+
+    def test_plugins_upstream_error_degrades_without_typeerror(self):
+        # plugin/list fails with a NON-capability error (RPC error that is not
+        # unknown-variant) -> ExtensionError -> plugins block goes down with
+        # supported=false; mcp block keeps working; overview never raises.
+        def broken_list(_):
+            raise RuntimeError("codex rpc error: plugin/list: connection reset by peer")
+        t = FakeTransport({
+            "plugin/list": broken_list,
+            "plugin/installed": plugin_list_response([]),
+            "config/read": {"config": {"mcp_servers": {}}},
+            "mcpServerStatus/list": {"data": [], "nextCursor": None},
+        })
+        out = ExtensionService(t).overview("/tmp/ws")  # must not raise
+        self.assertTrue(out["ok"])
+        self.assertFalse(out["plugins"]["supported"])
+        self.assertIn("upstream-error", str(out["plugins"].get("error")))
+        self.assertEqual(out["plugins"].get("marketplaces"), [])
+        self.assertTrue(out["mcp"]["supported"])  # partial degradation holds
+
+    def test_mcp_upstream_error_degrades_without_typeerror(self):
+        def broken_read(_):
+            raise RuntimeError("codex rpc error: config/read: i/o timeout")
+        t = FakeTransport({
+            "plugin/list": plugin_list_response([]),
+            "plugin/installed": plugin_list_response([]),
+            "config/read": broken_read,
+            "mcpServerStatus/list": {"data": [], "nextCursor": None},
+        })
+        out = ExtensionService(t).overview("/tmp/ws")
+        self.assertTrue(out["plugins"]["supported"])
+        self.assertFalse(out["mcp"]["supported"])
+
+    def _workspace_scoped_transport(self):
+        """The plugin only shows up in plugin/installed when the call carries
+        the workspace cwds — exactly the workspace-scoped marketplace case
+        where a home-scope postcondition scan would misjudge."""
+        state = {"installed": False}
+        seen = {"scan_cwds": None}
+
+        def installed(params):
+            seen["scan_cwds"] = (params or {}).get("cwds")
+            if state["installed"] and (params or {}).get("cwds"):
+                return plugin_list_response([
+                    marketplace("ws-mp", [summary("tool@ws-mp", "tool", "ws-mp",
+                                                  installed=True)])])
+            return plugin_list_response([])
+        t = FakeTransport({
+            "plugin/list": lambda p: plugin_list_response(
+                [marketplace("ws-mp", [summary("tool@ws-mp", "tool", "ws-mp")])]),
+            "plugin/installed": installed,
+            "plugin/install": lambda p: (state.__setitem__("installed", True),
+                                         {"appsNeedingAuth": [], "authPolicy": "ON_USE"})[1],
+            "plugin/uninstall": lambda p: (state.__setitem__("installed", False),
+                                           {})[1],
+        })
+        return t, seen
+
+    def test_install_postcondition_scans_workspace_scope(self):
+        t, seen = self._workspace_scoped_transport()
+        out = ExtensionService(t).plugin_install(
+            "tool", marketplace_path="/fake/ws-mp/marketplace.json",
+            cwd="/Users/demo/proj")
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["installed"]["id"], "tool@ws-mp")
+        # the postcondition re-read carried the workspace scope
+        self.assertEqual(seen["scan_cwds"], ["/Users/demo/proj"])
+
+    def test_install_postcondition_fails_without_cwd_visibility(self):
+        t, _ = self._workspace_scoped_transport()
+        # no cwd -> postcondition scans home scope -> workspace-only plugin is
+        # invisible -> honest POSTCONDITION_FAILED (not a false success)
+        with self.assertRaises(PostconditionFailed):
+            ExtensionService(t).plugin_install(
+                "tool", marketplace_path="/fake/ws-mp/marketplace.json")
+
+    def test_uninstall_postcondition_scans_workspace_scope(self):
+        t, seen = self._workspace_scoped_transport()
+        t.handlers["plugin/installed"]  # noqa: B018 — clarity only
+        # seed installed state visible only with cwd
+        def seed(_):
+            pass
+        state_installed = {"on": True}
+
+        def installed(params):
+            seen["scan_cwds"] = (params or {}).get("cwds")
+            if state_installed["on"] and (params or {}).get("cwds"):
+                return plugin_list_response([
+                    marketplace("ws-mp", [summary("tool@ws-mp", "tool", "ws-mp",
+                                                  installed=True)])])
+            return plugin_list_response([])
+        t.handlers["plugin/installed"] = installed
+        t.handlers["plugin/uninstall"] = lambda p: (state_installed.__setitem__("on", False), {})[1]
+        out = ExtensionService(t).plugin_uninstall("tool@ws-mp",
+                                                   cwd="/Users/demo/proj")
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["uninstalled"], "tool@ws-mp")
+        self.assertEqual(seen["scan_cwds"], ["/Users/demo/proj"])
+
+    def test_service_passes_cwd_through_to_client(self):
+        t, seen = self._workspace_scoped_transport()
+        ExtensionService(t).plugin_install("tool",
+                                           marketplace_path="/fake/ws-mp/marketplace.json",
+                                           cwd="/ws/x")
+        self.assertEqual(seen["scan_cwds"], ["/ws/x"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -50,8 +50,12 @@ class ExtensionService:
         except CapabilityUnavailable as exc:
             out["plugins"] = unsupported_block(exc)
         except ExtensionError as exc:
-            out["plugins"] = block(True, supported=True,
-                                   error=f"{exc.code}: {exc.message}",
+            # A non-capability upstream error means this block is DOWN (empty
+            # payload + error), not "supported with an error" — supported=true
+            # plus error is ambiguous UI semantics. (P2.0.1: this handler
+            # itself once raised TypeError via block(True, supported=True, ...)
+            # and sank the whole GET — locked by regression test.)
+            out["plugins"] = block(False, error=f"{exc.code}: {exc.message}",
                                    marketplaces=[], installed=[], loadErrors=[])
         # mcp block: configured + runtime status are separate layers
         try:
@@ -105,17 +109,19 @@ class ExtensionService:
     # -- plugin mutations ----------------------------------------------------
 
     def plugin_install(self, plugin_name: str, marketplace_path: str | None = None,
-                       remote_marketplace_name: str | None = None) -> dict[str, Any]:
+                       remote_marketplace_name: str | None = None,
+                       cwd: str | None = None) -> dict[str, Any]:
         self._require()
         return {"ok": True, **self._plugins.install(
-            plugin_name, marketplace_path, remote_marketplace_name)}
+            plugin_name, marketplace_path, remote_marketplace_name, cwd)}
 
-    def plugin_uninstall(self, canonical_id: str) -> dict[str, Any]:
+    def plugin_uninstall(self, canonical_id: str,
+                         cwd: str | None = None) -> dict[str, Any]:
         self._require()
         if not canonical_id or "@" not in str(canonical_id):
             raise ExtensionError(
                 "uninstall 需要 canonical id（name@marketplace）", "invalid-argument")
-        return {"ok": True, **self._plugins.uninstall(str(canonical_id))}
+        return {"ok": True, **self._plugins.uninstall(str(canonical_id), cwd)}
 
     # -- marketplace mutations -------------------------------------------------
 

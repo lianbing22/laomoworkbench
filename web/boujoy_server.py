@@ -1979,6 +1979,11 @@ class BoujoyHandler(BaseHTTPRequestHandler):
             try:
                 payload = json.loads(body or b"{}")
                 svc = _extensions_svc()
+                # Mutations re-verify against the same workspace scope the
+                # inventory reads (plugin/installed cwds) — home-scope-only
+                # postconditions would misjudge workspace-scoped plugins.
+                adapter = RUNTIMES.adapter_for("clean")
+                ws_cwd = adapter.workspace_cwd() if adapter else None
                 if action == "plugins/detail":
                     result = svc.plugin_detail(
                         str(payload.get("pluginName") or ""),
@@ -1988,9 +1993,11 @@ class BoujoyHandler(BaseHTTPRequestHandler):
                     result = svc.plugin_install(
                         str(payload.get("pluginName") or ""),
                         marketplace_path=payload.get("marketplacePath"),
-                        remote_marketplace_name=payload.get("remoteMarketplaceName"))
+                        remote_marketplace_name=payload.get("remoteMarketplaceName"),
+                        cwd=ws_cwd)
                 elif action == "plugin-uninstall":
-                    result = svc.plugin_uninstall(str(payload.get("canonicalId") or ""))
+                    result = svc.plugin_uninstall(str(payload.get("canonicalId") or ""),
+                                                  cwd=ws_cwd)
                 elif action == "market-add":
                     result = svc.market_add(str(payload.get("source") or ""),
                                             payload.get("refName"))
