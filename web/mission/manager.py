@@ -1470,6 +1470,17 @@ class MissionManager:
         # Background job lifecycle is owned by the Control Plane: a cancelled
         # mission must take its managed jobs down (grace terminate then kill).
         self.terminate_mission_jobs(mission_id, store, mark="cancelled")
+        # Real codex turns too (Gate F): unit threads block inside run_turn
+        # for up to the turn timeout — without a directed interrupt the
+        # cancelled mission's turns keep working to natural completion and
+        # write files after the user saw "已取消". Single-active-mission
+        # invariant makes the adapter-wide sweep exact.
+        interrupt_fn = getattr(self.adapter, "interrupt_active_turns", None)
+        if callable(interrupt_fn):
+            try:
+                interrupt_fn(max_wait=10.0)
+            except Exception as exc:  # cancellation must never wedge on this
+                store.event("cancelled", f"turn interrupt error: {str(exc)[:160]}")
         state.pop("waitingJobId", None)
         self._save_state_state(store, state, "cancelled")
         store.event("cancelled", None)
@@ -1477,6 +1488,17 @@ class MissionManager:
         # 否则 list().activeId 仍会报告一个即将退场的 runner。
         if runner is not None and runner.is_alive():
             runner.join(timeout=5.0)
+        # Gate F race: an in-flight turn unwinding at its safe point writes
+        # its phase transition AFTER the cancelled save above (its snapshot
+        # predates it) — the terminal state can be transiently rolled back
+        # to evaluating/running and then nothing re-writes it. With every
+        # unit thread gone, re-assert cancelled as the authoritative final
+        # state (idempotent).
+        disk = store.load_state()
+        if disk.get("state") != "cancelled":
+            state.pop("waitingJobId", None)
+            self._save_state_state(store, {**state, **disk}, "cancelled")
+            store.event("cancelled", "re-asserted after unit drain")
         return {"ok": True, "mission": self._summary(store)}
 
     def terminate_mission_jobs(self, mission_id: str, store: MissionStore,

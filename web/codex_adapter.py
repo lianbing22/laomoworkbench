@@ -923,6 +923,12 @@ class CodexRuntimeAdapter:
         self._workspace_lock = threading.Lock()
         self._ws_counter = 0
         self._pending_restart = False  # provider env changed; restart when idle
+        # active mission turns (run_turn registrations): the Control Plane
+        # can direct a real `turn/interrupt(threadId, turnId)` at them on
+        # cancel — Gate F proved that without this, a cancelled mission's
+        # codex turns keep working to natural completion ("zombie writes").
+        self._turns_lock = threading.Lock()
+        self._active_turns: dict[str, dict] = {}  # threadId -> registration
 
     # -- infra --
     def _debug_log(self, msg: str) -> None:
@@ -1207,20 +1213,34 @@ class CodexRuntimeAdapter:
                 reason = (event.get("data") or {}).get("reason") or {}
                 if reason.get("kind") == "error":
                     capture["error"] = str((reason.get("error") or {}).get("message") or "turn failed")[:300]
+                elif reason.get("interrupted"):
+                    capture["error"] = "turn interrupted（控制平面取消）"
                 done.set()
 
         unsubscribe = self.subscribe(on_frame)
+        real_turn_id = ""
         try:
-            proc.rpc.request("turn/start", params, timeout=30)
+            res = proc.rpc.request("turn/start", params, timeout=30) or {}
+            real_turn_id = str(res.get("turnId")
+                               or (res.get("turn") or {}).get("id") or "")
+            with self._turns_lock:
+                self._active_turns[tid] = {"threadId": tid,
+                                           "turnId": real_turn_id,
+                                           "done": done,
+                                           "startedAt": time.time()}
             if not done.wait(timeout):
                 capture["error"] = f"turn 超时（{timeout}s）"
                 try:
-                    proc.rpc.request("turn/interrupt", {"threadId": tid, "turnId": ""}, timeout=10)
+                    proc.rpc.request("turn/interrupt",
+                                     {"threadId": tid, "turnId": real_turn_id},
+                                     timeout=10)
                 except (TimeoutError, RuntimeError):
                     pass
         except RuntimeError as exc:
             capture["error"] = str(exc)[:300]
         finally:
+            with self._turns_lock:
+                self._active_turns.pop(tid, None)
             unsubscribe()
             try:
                 proc.rpc.request("thread/delete", {"threadId": tid}, timeout=10)
@@ -1229,6 +1249,50 @@ class CodexRuntimeAdapter:
         return {"ok": capture["error"] is None,
                 "text": "\n".join(t for t in capture["texts"] if t),
                 "error": capture["error"], "usage": capture["usage"]}
+
+    def interrupt_active_turns(self, max_wait: float = 10.0) -> list[dict]:
+        """Directed cancellation for the Control Plane (mission cancel): send
+        a REAL `turn/interrupt(threadId, turnId)` to every turn this adapter
+        currently holds active, then bounded-wait for their completion.
+        Gate 0 proved codex honors real-turnId interrupts and isolates them;
+        Gate F proved that without this call a cancelled mission's turns
+        keep running to natural completion and write files post-cancel.
+        Returns per-turn outcomes ({"threadId", "turnId", "stopped"})."""
+        outcomes: list[dict] = []
+        try:
+            proc = self._ensure_process()
+        except AdapterUnavailable:
+            return outcomes
+        with self._turns_lock:
+            active = list(self._active_turns.values())
+        for rec in active:
+            sent = False
+            # the real turnId: the registration carries it when the
+            # turn/start response did; otherwise the translator's registry
+            # (fed by turn/started notifications) is the authoritative source
+            turn_id = rec["turnId"]
+            if not turn_id:
+                reg = self.registry.get(rec["threadId"]) or {}
+                turn_id = reg.get("turnId") or ""
+            rec["turnId"] = turn_id
+            try:
+                proc.rpc.request("turn/interrupt",
+                                 {"threadId": rec["threadId"],
+                                  "turnId": turn_id}, timeout=10)
+                sent = True
+            except (TimeoutError, RuntimeError):
+                pass
+            self._debug_log(f"interrupt turn {rec['turnId'][:8]} "
+                            f"(thread {rec['threadId'][:8]}): sent={sent}")
+            outcomes.append({"threadId": rec["threadId"],
+                             "turnId": rec["turnId"], "sent": sent})
+        deadline = time.monotonic() + max_wait
+        for rec in active:
+            remaining = max(0.0, deadline - time.monotonic())
+            rec["done"].wait(remaining)
+        for out, rec in zip(outcomes, active):
+            out["stopped"] = rec["done"].is_set()
+        return outcomes
 
     def test_provider(self, managers: Any, provider_id: str) -> dict[str, Any]:
         """Real E2E provider validation: register, ephemeral thread, minimal

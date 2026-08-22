@@ -1605,6 +1605,49 @@ class TestParallelWorkUnits(MissionLoopTest):
         self.assertEqual(len(records), frozen, "cancel 后不得再有 worker 完成")
 
 
+class TestCancelInterruptPropagation(MissionLoopTest):
+    """Gate F hardening: cancel() must reach the runtime adapter's directed
+    turn-interrupt (real codex turns), not just persist a state."""
+
+    def test_40_cancel_directs_runtime_interrupt_and_stops_work(self):
+        calls = {"interrupt": 0, "worker_started": False,
+                 "stalled": threading.Event()}
+
+        class InterruptableAdapter(FakeAdapter):
+            def interrupt_active_turns(self, max_wait=10.0):
+                calls["interrupt"] += 1
+                calls["stalled"].set()   # the real impl also unblocks turns
+                return []
+
+        adapter = InterruptableAdapter()
+
+        def slow(prompt):
+            calls["worker_started"] = True
+            calls["stalled"].wait(timeout=30)  # blocks inside run_turn
+            return handoff_text()
+
+        adapter.script("planner", plan_block(sample_units(1)))
+        adapter.script("worker", slow)
+        adapter.set_default("evaluator", verdict_block("PASS", ["ok"]))
+        mgr = MissionManager(adapter, self.root)
+        mid = mission_id_of(mgr.create("obj", acceptance_criteria=["a"]))
+        self.track(mid, mgr=mgr)
+        mgr.start(mid)
+        self.assertTrue(self.wait_until(
+            lambda: calls["worker_started"], timeout=15),
+            "worker turn 应已进入运行")
+        mgr.cancel(mid)
+        self.assertEqual(calls["interrupt"], 1,
+                         "cancel 必须调用 runtime 的定向 turn-interrupt")
+        self.assertTrue(self.wait_state(mgr, mid, ["cancelled"], timeout=10),
+                        "cancel 后应及时进入 cancelled")
+        # cancel 返回后不得再有工作推进
+        frozen = len(adapter.calls)
+        time.sleep(1.0)
+        self.assertEqual(len(adapter.calls), frozen,
+                         "cancel 后不得再发生任何模型 turn")
+
+
 if __name__ == "__main__":
     if MISSION_IMPORT_ERROR is not None:
         print("NOTE: web/mission.py 无法导入（%r）— 全部用例跳过，待主线合入后验证"

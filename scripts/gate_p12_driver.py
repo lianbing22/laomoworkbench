@@ -1287,6 +1287,313 @@ def gate_e(ev: Evidence, scratch: Path) -> dict:
     return result
 
 
+CANCEL_A = (
+    "本轮内依次单独执行 10 次 shell 命令 sleep 5，每一次都必须等待它结束；"
+    "不要输出任何任务标记块。全部结束后才创建 late-a.txt，"
+    "内容恰好为一行：LATE-A。除此以外不要创建或修改任何文件，"
+    "不要执行 git 命令。")
+CANCEL_B = (
+    "本轮内依次单独执行 10 次 shell 命令 sleep 5，每一次都必须等待它结束；"
+    "不要输出任何任务标记块。全部结束后才创建 late-b.txt，"
+    "内容恰好为一行：LATE-B。除此以外不要创建或修改任何文件，"
+    "不要执行 git 命令。")
+CANCEL_C = (
+    "第一轮不要自己等待长命令，直接在回复末尾输出 LAOMO_JOB 标记块结束本轮，"
+    "内容为：command=\"sleep 60; echo LATE-JOB > late-job.txt\"，"
+    "reason=\"取消门禁长任务\"，expectedSeconds=90。不要写 cwd 字段。"
+    "唤醒后创建 late-c.txt。全程不要执行 git 命令。")
+
+
+class RpcTap:
+    """Record every outbound JSON-RPC request (class-level wrap of
+    RpcClient.request — installed before any process spawns). Distinguishes
+    'the harness never sent turn/interrupt' from 'it sent and codex ignored'
+    when a cancel fails."""
+
+    def __init__(self, ev: Evidence) -> None:
+        self.ev = ev
+        self.calls: list[dict] = []
+        import codex_adapter as ca
+        original = ca.RpcClient.request
+
+        def wrapped(self, method, params=None, timeout=60.0):
+            rec = {"ts": round(time.time(), 3), "method": method,
+                   "threadId": (params or {}).get("threadId"),
+                   "turnId": (params or {}).get("turnId")}
+            self_calls = RpcTap._active
+            if self_calls is not None:
+                self_calls.append(rec)
+                try:
+                    with (ev.root / "rpc.ndjson").open("a", encoding="utf-8") as fh:
+                        fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                except OSError:
+                    pass
+            return original(self, method, params, timeout)
+
+        ca.RpcClient.request = wrapped  # plain function => binds as a method
+        RpcTap._original = original
+        RpcTap._active = self.calls
+
+    def interrupts(self) -> list[dict]:
+        return [c for c in self.calls if c["method"] == "turn/interrupt"]
+
+    def close(self) -> None:
+        import codex_adapter as ca
+        ca.RpcClient.request = RpcTap._original
+        RpcTap._active = None
+
+
+def gate_f(ev: Evidence, scratch: Path) -> dict:
+    ev.log("Gate F — Cancel / Interrupt (expect first-run FAIL evidence)")
+    # install the RPC tap at class level BEFORE any process exists
+    rpc_tap = RpcTap(ev)
+    repo = scratch / "fixture-f" / "repo"
+    base_sha = init_fixture(repo)
+    before = porcelain(repo)
+
+    adapter = CodexRuntimeAdapter(bin_path=GATE_BIN, default_cwd=str(repo),
+                                  debug_log=ev.log)
+    tap = TurnTap(ev, adapter)
+    ptap = PromptTap(ev, adapter)
+    mgr = MissionManager(adapter, repo)
+    checks: dict[str, bool] = {}
+    detail: dict = {}
+    try:
+        created = mgr.create(
+            "三个单元：A/B 长轮内工作，C 挂后台长任务",
+            cwd=str(repo),
+            acceptance_criteria=["仅在单元完成时产出各自文件"],
+            options={"maxParallelWorkers": 3})
+        mid = created["mission"]["id"]
+        runs = repo / ".laomo" / "runs" / mid
+
+        def unit(uid, index, title, desc):
+            return {"id": uid, "index": index, "title": title,
+                    "description": desc,
+                    "acceptance": [title + " 产物存在"],
+                    "dependencies": [], "state": "pending", "status": "pending",
+                    "attempt": 0, "repairCount": 0, "conflictCount": 0,
+                    "conflict": None,
+                    "worktree": {"path": None, "branch": None,
+                                 "baseSha": None, "headSha": None},
+                    "jobId": None, "delta": None, "repairDirective": None,
+                    "lastVerdict": None,
+                    "worker": {"startedAt": None, "finishedAt": None},
+                    "integration": None}
+        store = mgr.store_for(mid)
+        store.save_plan({"version": 2, "replans": 0, "gitIntegration": True,
+                         "units": [unit("a", 0, "单元A", CANCEL_A),
+                                   unit("b", 1, "单元B", CANCEL_B),
+                                   unit("c", 2, "单元C", CANCEL_C)]})
+        store.save_state({"state": "running", "cycles": 0, "currentUnit": 0,
+                          "noProgress": 0, "progressSignature": "",
+                          "tokensUsed": 0, "wallElapsedMs": 0,
+                          "agentActiveMs": 0, "waitingMs": 0, "pausedMs": 0,
+                          "phaseStartedAt": 0})
+        mgr.start(mid)
+
+        def plan_states():
+            try:
+                pl = json.loads((runs / "plan.json").read_text("utf-8"))
+                return {u["index"]: u["state"] for u in pl["units"]}
+            except Exception:
+                return {}
+
+        def job_record():
+            for jf in sorted((runs / "jobs").glob("*.json")):
+                return json.loads(jf.read_text("utf-8"))
+            return {}
+
+        def pid_alive(pid):
+            try:
+                os.kill(pid, 0)
+                return True
+            except OSError:
+                return False
+
+        # -- wait for the strongest cancel scene: A/B turns ACTIVE +
+        #    C WAITING + C job alive
+        deadline = time.monotonic() + 150
+        cancel_at = None
+        while time.monotonic() < deadline:
+            t0 = tap.unit_turns("/u0")
+            t1 = tap.unit_turns("/u1")
+            a_active = bool(t0) and t0[0].get("endedAt") is None
+            b_active = bool(t1) and t1[0].get("endedAt") is None
+            states = plan_states()
+            job = job_record()
+            job_alive = bool(job.get("pid") and job.get("status") == "running"
+                             and pid_alive(job["pid"]))
+            if a_active and b_active and states.get(2) == "waiting" and job_alive:
+                cancel_at = time.time()
+                detail["precondition"] = {
+                    "aActive": a_active, "bActive": b_active,
+                    "cState": states.get(2),
+                    "jobPid": job.get("pid"), "jobAlive": job_alive}
+                break
+            time.sleep(0.2)
+        checks["precondition-two-active-turns"] = cancel_at is not None
+        checks["precondition-job-alive"] = cancel_at is not None
+        if cancel_at is None:
+            ev.log("precondition never met — aborting gate")
+            result = {"gate": "F", "checks": checks, "detail": detail,
+                      "verdict": "FAIL"}
+            ev.write("summary.json", result)
+            return result
+        ev.log(f"cancel scene reached (job pid={detail['precondition']['jobPid']})")
+
+        def snapshot_events():
+            if not (runs / "events.ndjson").is_file():
+                return []
+            return [json.loads(l) for l in
+                    (runs / "events.ndjson").read_text("utf-8").splitlines()
+                    if l.strip()]
+
+        def fs_snapshot():
+            out = {}
+            for path in sorted(repo.rglob("*")):
+                rel = str(path.relative_to(repo))
+                if ".laomo" in rel:
+                    continue
+                if path.is_file():
+                    try:
+                        out[rel] = path.stat().st_mtime
+                    except OSError:
+                        pass
+            return out
+
+        ev_before = snapshot_events()
+        fs_before = fs_snapshot()
+        rpc_before = len(rpc_tap.calls)
+        t0 = tap.unit_turns("/u0")
+        t1 = tap.unit_turns("/u1")
+        tap_counts_before = (len(tap.unit_turns("/u0")),
+                             len(tap.unit_turns("/u1")),
+                             len(tap.unit_turns("/u2")))
+        cancel_called = time.time()
+        mgr.cancel(mid)
+        cancel_returned = time.time()
+        detail["cancelLatencySec"] = round(cancel_returned - cancel_called, 3)
+        ev.log(f"cancel() returned in {detail['cancelLatencySec']}s")
+
+        # -- observe 10s strict window, then (if turns survive) an extended
+        #    evidence window to catch zombie writes
+        time.sleep(10.0)
+        ev_after = snapshot_events()
+        fs_after_10 = fs_snapshot()
+
+        def count(evts, etype):
+            return sum(1 for e in evts if e["type"] == etype)
+
+        checks["cancel-state-durable"] = (
+            json.loads((runs / "state.json").read_text("utf-8"))
+            .get("state") == "cancelled")
+        checks["no-post-cancel-progress"] = (
+            count(ev_after, "dispatch") == count(ev_before, "dispatch")
+            and count(ev_after, "integration") == count(ev_before, "integration")
+            and count(ev_after, "verification") == count(ev_before, "verification"))
+        late_files = ["late-a.txt", "late-b.txt", "late-job.txt", "late-c.txt"]
+
+        def late_existing():
+            found = [f for f in late_files
+                     if any(p.name == f for p in repo.rglob(f))]
+            return found
+
+        checks["no-dead-writes"] = (not late_existing()
+                                    and fs_after_10 == fs_before)
+
+        # interrupts actually sent with REAL turn ids?
+        sent = rpc_tap.interrupts()
+        a_turn = t0[0] if t0 else {}
+        b_turn = t1[0] if t1 else {}
+        checks["interrupt-a-sent"] = any(
+            i.get("threadId") == a_turn.get("threadId")
+            and i.get("turnId") not in (None, "")
+            for i in sent)
+        checks["interrupt-b-sent"] = any(
+            i.get("threadId") == b_turn.get("threadId")
+            and i.get("turnId") not in (None, "")
+            for i in sent)
+        detail["interrupts"] = sent
+
+        # turns' final status (wait up to 15s for interrupt to land)
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            t0 = tap.unit_turns("/u0")
+            t1 = tap.unit_turns("/u1")
+            if t0 and t1 and t0[0].get("endedAt") and t1[0].get("endedAt"):
+                break
+            time.sleep(0.2)
+        t0 = tap.unit_turns("/u0")
+        t1 = tap.unit_turns("/u1")
+        a_final = t0[0] if t0 else {}
+        b_final = t1[0] if t1 else {}
+        checks["turn-a-interrupted"] = a_final.get("status") == "interrupted"
+        checks["turn-b-interrupted"] = b_final.get("status") == "interrupted"
+        checks["interrupt-bounded"] = bool(
+            a_final.get("endedAt") and b_final.get("endedAt")
+            and max(a_final["endedAt"], b_final["endedAt"]) - cancel_at <= 10.0)
+        detail["finalTurns"] = {"A": a_final, "B": b_final}
+
+        # job terminated + process dead
+        job = job_record()
+        checks["job-terminated"] = (job.get("status") == "cancelled"
+                                    and job.get("exitKind") == "terminated")
+        checks["job-process-dead"] = bool(
+            job.get("pid") and not pid_alive(job["pid"]))
+        detail["jobAfter"] = {k: job.get(k) for k in
+                              ("status", "exitKind", "exitCode", "pid")}
+
+        # four layers of liveness
+        with mgr._lock:
+            pool = mgr._unit_threads.get(mid) or {}
+            live_units = sum(1 for t in pool.values() if t.is_alive())
+            runner = mgr._runners.get(mid)
+            runner_alive = bool(runner and runner.is_alive())
+        checks["unit-threads-zero"] = live_units == 0
+        checks["mission-runner-zero"] = not runner_alive
+        detail["liveness"] = {"unitThreads": live_units,
+                              "runnerAlive": runner_alive}
+
+        # extended zombie-evidence window if A/B turns still alive
+        if not (a_final.get("endedAt") and b_final.get("endedAt")):
+            ev.log("TURNS STILL ACTIVE after cancel — extended evidence window")
+            zombie_deadline = time.monotonic() + 90
+            while time.monotonic() < zombie_deadline:
+                t0 = tap.unit_turns("/u0")
+                t1 = tap.unit_turns("/u1")
+                if t0[0].get("endedAt") and t1[0].get("endedAt"):
+                    break
+                time.sleep(1.0)
+            t0 = tap.unit_turns("/u0")
+            t1 = tap.unit_turns("/u1")
+            detail["zombieEvidence"] = {
+                "aEndedAt": t0[0].get("endedAt"),
+                "aStatus": t0[0].get("status"),
+                "bEndedAt": t1[0].get("endedAt"),
+                "bStatus": t1[0].get("status"),
+                "lateFilesAtEnd": late_existing(),
+                "note": "cancel 返回后真实 codex turn 继续运行直至自然结束",
+            }
+            ev.log(f"zombie window: {detail['zombieEvidence']}")
+
+        checks["source-isolation"] = (
+            git(repo, "rev-parse", "HEAD") == base_sha
+            and porcelain(repo) == before)
+    finally:
+        rpc_tap.close()
+        adapter.shutdown()
+
+    verdict = all(checks.values())
+    result = {"gate": "F", "checks": checks, "detail": detail,
+              "verdict": "PASS" if verdict else "FAIL"}
+    ev.write("summary.json", result)
+    ev.log(f"Gate F verdict: {result['verdict']} checks={checks}")
+    return result
+
+
+# ---------------------------------------------------------------- registry
+
 # ---------------------------------------------------------------- registry
 
 # ---------------------------------------------------------------- registry
@@ -1306,6 +1613,7 @@ GATES = {
     "C": lambda ev, scratch: gate_c(ev, scratch),
     "D": lambda ev, scratch: gate_d(ev, scratch),
     "E": lambda ev, scratch: gate_e(ev, scratch),
+    "F": lambda ev, scratch: gate_f(ev, scratch),
 }
 
 
