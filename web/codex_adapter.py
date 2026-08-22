@@ -1096,6 +1096,24 @@ class CodexRuntimeAdapter:
         with self._workspace_lock:
             self._workspace_cwd = path
 
+    # -- low-level codex transport (for ExtensionService) --------------------
+    def codex_request(self, method: str, params: dict[str, Any] | None = None,
+                      timeout: float = 60.0) -> Any:
+        """Raw JSON-RPC call into the live codex app-server. The ONLY surface
+        extension/host services may use to reach codex — they must not spawn
+        their own app-server or reach into RpcClient/CodexProcess internals.
+        Raises TimeoutError/RuntimeError on transport errors (codex error
+        responses surface as RuntimeError with the message embedded)."""
+        proc = self._ensure_process()
+        return proc.rpc.request(method, params, timeout=timeout)
+
+    def codex_available(self) -> bool:
+        try:
+            self._ensure_process()
+            return True
+        except (AdapterUnavailable, OSError):
+            return False
+
     # -- rpc surface ----------------------------------------------------------
     def rpc(self, mode: str, endpoint: str, body: dict[str, Any] | None, rpc_id: str = "") -> dict[str, Any]:
         """Translate a DSH-shaped HTTP RPC. rpc_id carries the frontend
