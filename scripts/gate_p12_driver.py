@@ -1592,6 +1592,364 @@ def gate_f(ev: Evidence, scratch: Path) -> dict:
     return result
 
 
+G_A = ("创建 a.txt，内容恰好为一行：REAL-G-A。"
+       "除此以外不要创建或修改任何文件，不要执行 git 命令。")
+G_B = ("第一步：创建 progress-b.txt，内容恰好为一行：B-PRE-CRASH（若已存在"
+       "且内容相同则不要重建）。第二步：依次单独执行 8 次 shell 命令 sleep 5，"
+       "每次必须等待结束，不要输出任何任务标记块。第三步：创建 b.txt，"
+       "内容恰好为一行：B-RECOVERED。除此以外不要修改任何文件，"
+       "不要执行 git 命令。")
+G_C = ("第一步：创建 progress-c.txt，内容恰好为一行：C-PRE-CRASH（若已存在"
+       "且内容相同则不要重建）。第二步：依次单独执行 8 次 shell 命令 sleep 5，"
+       "每次必须等待结束，不要输出任何任务标记块。第三步：创建 c.txt，"
+       "内容恰好为一行：C-RECOVERED。除此以外不要修改任何文件，"
+       "不要执行 git 命令。")
+
+
+def g_plan(store, mid):
+    def unit(uid, index, title, desc, deps=None):
+        return {"id": uid, "index": index, "title": title,
+                "description": desc, "acceptance": [title + " 产物正确"],
+                "dependencies": deps or [], "state": "pending",
+                "status": "pending", "attempt": 0, "repairCount": 0,
+                "conflictCount": 0, "conflict": None,
+                "worktree": {"path": None, "branch": None,
+                             "baseSha": None, "headSha": None},
+                "jobId": None, "delta": None, "repairDirective": None,
+                "lastVerdict": None,
+                "worker": {"startedAt": None, "finishedAt": None},
+                "integration": None}
+    store.save_plan({"version": 2, "replans": 0, "gitIntegration": True,
+                     "units": [unit("a", 0, "单元A", G_A),
+                               unit("b", 1, "单元B", G_B, deps=["a"]),
+                               unit("c", 2, "单元C", G_C, deps=["a"])]})
+    store.save_state({"state": "running", "cycles": 0, "currentUnit": 0,
+                      "noProgress": 0, "progressSignature": "",
+                      "tokensUsed": 0, "wallElapsedMs": 0,
+                      "agentActiveMs": 0, "waitingMs": 0, "pausedMs": 0,
+                      "phaseStartedAt": 0})
+
+
+def child_g_phase1(scratch: Path) -> int:
+    """The REAL gateway process #1: holds MissionManager + app-server #1.
+    Publishes the crash scene, then idles until the supervisor SIGKILLs it
+    (no cancel/shutdown path — that would not be a crash)."""
+    repo = scratch / "fixture-g" / "repo"
+    gdir = scratch / ".laomo" / "gates" / "p12" / "G"
+    ev = Evidence(gdir / "phase1")
+    adapter = CodexRuntimeAdapter(bin_path=GATE_BIN, default_cwd=str(repo),
+                                  debug_log=ev.log)
+    tap = TurnTap(ev, adapter)
+    ptap = PromptTap(ev, adapter)
+    mgr = MissionManager(adapter, repo)
+    created = mgr.create("A 先完成；B/C 依赖 A 并行长工作",
+                         cwd=str(repo),
+                         acceptance_criteria=["三个产物文件内容正确"],
+                         options={"maxParallelWorkers": 2},
+                         verification={
+                             "requiredFiles": ["a.txt", "b.txt", "c.txt"],
+                             "commands": ["grep -q REAL-G-A a.txt",
+                                          "grep -q B-RECOVERED b.txt",
+                                          "grep -q C-RECOVERED c.txt"]})
+    mid = created["mission"]["id"]
+    g_plan(mgr.store_for(mid), mid)
+    proc = adapter._ensure_process()
+    (gdir / "phase1-pids.json").write_text(json.dumps({
+        "gatewayPid": os.getpid(),
+        "appServerPid": proc.proc.pid if proc.proc else None,
+    }), "utf-8")
+    runs = repo / ".laomo" / "runs" / mid
+    mgr.start(mid)
+
+    deadline = time.monotonic() + 420
+    while time.monotonic() < deadline:
+        try:
+            plan = json.loads((runs / "plan.json").read_text("utf-8"))
+            states = {u["index"]: u["state"] for u in plan["units"]}
+            wts = {u["index"]: (u.get("worktree") or {}).get("path")
+                   for u in plan["units"]}
+        except Exception:
+            time.sleep(0.3)
+            continue
+        t1 = tap.unit_turns("/u1")
+        t2 = tap.unit_turns("/u2")
+        b_active = bool(t1) and t1[0].get("endedAt") is None
+        c_active = bool(t2) and t2[0].get("endedAt") is None
+        pb = Path(str(wts.get(1))) / "progress-b.txt" if wts.get(1) else None
+        pc = Path(str(wts.get(2))) / "progress-c.txt" if wts.get(2) else None
+        ok = (states.get(0) == "integrated" and b_active and c_active
+              and pb is not None and pb.is_file()
+              and pc is not None and pc.is_file()
+              and not (Path(str(wts.get(1))) / "b.txt").is_file()
+              and not (Path(str(wts.get(2))) / "c.txt").is_file())
+        if ok:
+            (gdir / "crash-scene.json").write_text(json.dumps({
+                "mid": mid,
+                "gatewayPid": os.getpid(),
+                "appServerPid": proc.proc.pid if proc.proc else None,
+                "sceneAt": time.time(),
+                "aState": states.get(0),
+                "bTurn": t1[0], "cTurn": t2[0],
+                "bWorktree": wts.get(1), "cWorktree": wts.get(2),
+            }, ensure_ascii=False), "utf-8")
+            ev.log("crash scene published — waiting for SIGKILL")
+            while True:  # no graceful exit path: only SIGKILL ends phase1
+                time.sleep(1.0)
+        time.sleep(0.3)
+    ev.log("phase1 timed out before crash scene")
+    return 1
+
+
+def child_g_phase2(scratch: Path, mid: str) -> int:
+    """The REAL gateway process #2: fresh adapter/app-server, recover()."""
+    repo = scratch / ".laomo" / "gates" / "p12" / "G" / ".." / ".." / ".." \
+        / "fixture-g" / "repo"
+    repo = scratch / "fixture-g" / "repo"
+    gdir = scratch / ".laomo" / "gates" / "p12" / "G"
+    ev = Evidence(gdir / "phase2")
+    adapter = CodexRuntimeAdapter(bin_path=GATE_BIN, default_cwd=str(repo),
+                                  debug_log=ev.log)
+    tap = TurnTap(ev, adapter)
+    ptap = PromptTap(ev, adapter)
+    mgr = MissionManager(adapter, repo)
+    recover_at = time.time()
+    resumed = mgr.recover()
+    proc = adapter._ensure_process()
+    runs = repo / ".laomo" / "runs" / mid
+    # sample the durable worktrees right after recover (pre-continuation)
+    preserved = {}
+    try:
+        plan = json.loads((runs / "plan.json").read_text("utf-8"))
+        for u in plan["units"]:
+            wt = (u.get("worktree") or {}).get("path")
+            if wt:
+                for name in ("progress-b.txt", "progress-c.txt"):
+                    f = Path(wt) / name
+                    if f.is_file():
+                        preserved[name] = f.read_text("utf-8").strip()
+    except Exception:
+        pass
+    deadline = time.monotonic() + MISSION_TIMEOUT
+    state = {}
+    while time.monotonic() < deadline:
+        state = mgr.status(mid)["mission"]
+        if state.get("state") in ("done", "failed", "blocked", "cancelled"):
+            break
+        time.sleep(POLL)
+    t1 = tap.unit_turns("/u1")
+    t2 = tap.unit_turns("/u2")
+    result = {
+        "recoverAt": recover_at,
+        "resumed": resumed,
+        "appServerPid": proc.proc.pid if proc.proc else None,
+        "gatewayPid": os.getpid(),
+        "finalState": state.get("state"),
+        "stopReason": state.get("stopReason"),
+        "bFirstTurn": t1[0] if t1 else None,
+        "cFirstTurn": t2[0] if t2 else None,
+        "bWorkerCwds": [c["cwd"] for c in ptap.in_cwd("/u1")
+                        if not c["read_only"]],
+        "cWorkerCwds": [c["cwd"] for c in ptap.in_cwd("/u2")
+                        if not c["read_only"]],
+        "aWorkerTurnsPhase2": len([c for c in ptap.in_cwd("/u0")
+                                   if not c["read_only"]]),
+        "preservedAtRecover": preserved,
+    }
+    (gdir / "phase2-result.json").write_text(
+        json.dumps(result, ensure_ascii=False, indent=1), "utf-8")
+    ev.log(f"phase2 final: {state.get('state')}")
+    adapter.shutdown()
+    return 0
+
+
+def gate_g(ev: Evidence, scratch: Path) -> dict:
+    import signal
+    ev.log("Gate G — Gateway Hard Crash / Recover (supervisor + 2 real gateways)")
+    repo = scratch / "fixture-g" / "repo"
+    base_sha = init_fixture(repo)
+    before = porcelain(repo)
+    gdir = ev.root
+    checks: dict[str, bool] = {}
+    detail: dict = {}
+    try:
+        # -- phase 1: real gateway holding the mission
+        p1 = subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__),
+             "--gate-g-child", "phase1", str(scratch)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        scene_path = gdir / "crash-scene.json"
+        deadline = time.monotonic() + 480
+        while time.monotonic() < deadline and not scene_path.is_file():
+            if p1.poll() is not None:
+                break
+            time.sleep(0.5)
+        assert scene_path.is_file(), "phase1 never published the crash scene"
+        scene = json.loads(scene_path.read_text("utf-8"))
+        mid = scene["mid"]
+        ev.log(f"crash scene ready (gateway={scene['gatewayPid']} "
+               f"appserver={scene['appServerPid']})")
+        checks["precondition-a-integrated"] = scene.get("aState") == "integrated"
+        checks["precondition-two-active-turns"] = bool(
+            scene["bTurn"].get("startedAt") and not scene["bTurn"].get("endedAt")
+            and scene["cTurn"].get("startedAt")
+            and not scene["cTurn"].get("endedAt"))
+        wt_b, wt_c = Path(scene["bWorktree"]), Path(scene["cWorktree"])
+        checks["precondition-partial-work-durable"] = (
+            (wt_b / "progress-b.txt").read_text("utf-8").strip() == "B-PRE-CRASH"
+            and (wt_c / "progress-c.txt").read_text("utf-8").strip()
+            == "C-PRE-CRASH")
+
+        # crash-gap filesystem baseline
+        def snap_fs():
+            out = {}
+            for path in sorted(repo.rglob("*")):
+                rel = str(path.relative_to(repo))
+                if path.is_file():
+                    try:
+                        out[rel] = round(path.stat().st_mtime, 3)
+                    except OSError:
+                        pass
+            return out
+        fs_pre = snap_fs()
+
+        # -- THE KILL: no cancel, no shutdown, no job termination
+        os.kill(p1.pid, signal.SIGKILL)
+        p1.wait()
+        kill_ts = time.time()
+        ev.log(f"SIGKILL sent to gateway #1 ({p1.pid})")
+
+        time.sleep(5.0)  # crash gap: no control plane exists
+        checks["gateway-sigkill-real"] = p1.returncode == -signal.SIGKILL
+        app_pid = scene.get("appServerPid")
+        app_dead = True
+        if app_pid:
+            try:
+                os.kill(app_pid, 0)
+                app_dead = False
+            except OSError:
+                app_dead = True
+        checks["old-appserver-dead"] = app_dead
+        if not app_dead:
+            ev.log(f"PRODUCT ISSUE: app-server {app_pid} still alive after "
+                   f"gateway SIGKILL (evidence kept, not killing it)")
+        fs_post = snap_fs()
+        late = [n for n in ("b.txt", "c.txt")
+                if (wt_b / n).is_file() or (wt_c / n).is_file()]
+        checks["crash-gap-no-zombie-writes"] = (
+            not late and fs_post == fs_pre)
+        detail["crashGap"] = {"lateFiles": late,
+                              "appServerDead": app_dead}
+
+        # -- honest durable state
+        runs = repo / ".laomo" / "runs" / mid
+        try:
+            mj = json.loads((runs / "mission.json").read_text("utf-8"))
+            sj = json.loads((runs / "state.json").read_text("utf-8"))
+            pj = json.loads((runs / "plan.json").read_text("utf-8"))
+            json_ok = True
+        except Exception:
+            mj = sj = pj = {}
+            json_ok = False
+        states = {u["index"]: u["state"] for u in pj.get("units", [])}
+        checks["state-files-valid"] = json_ok
+        checks["state-honest-after-crash"] = (
+            sj.get("state") == "running" and states.get(0) == "integrated"
+            and states.get(1) == "running" and states.get(2) == "running")
+        detail["postCrash"] = {"mission": sj.get("state"),
+                               "units": states,
+                               "aIntegratedSha": None}
+
+        # -- phase 2: a genuinely NEW control plane, recover()
+        p2 = subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__),
+             "--gate-g-child", "phase2", str(scratch), mid],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        result_path = gdir / "phase2-result.json"
+        deadline = time.monotonic() + 900
+        while time.monotonic() < deadline and not result_path.is_file():
+            if p2.poll() is not None:
+                break
+            time.sleep(0.5)
+        assert result_path.is_file(), "phase2 never produced a result"
+        res = json.loads(result_path.read_text("utf-8"))
+        checks["recover-found-mission"] = mid in (res.get("resumed") or [])
+        checks["new-control-plane"] = res.get("gatewayPid") != scene["gatewayPid"]
+        checks["new-appserver"] = (res.get("appServerPid")
+                                   != scene.get("appServerPid"))
+        checks["mission-done"] = res.get("finalState") == "done"
+
+        # A never replayed
+        events = [json.loads(l) for l in
+                  (runs / "events.ndjson").read_text("utf-8").splitlines()
+                  if l.strip()]
+        a_dispatches = sum(1 for e in events if e["type"] == "dispatch"
+                           and isinstance(e.get("detail"), dict)
+                           and e["detail"].get("unit") == 0)
+        a_integrations = sum(1 for e in events if e["type"] == "integration"
+                             and isinstance(e.get("detail"), dict)
+                             and e["detail"].get("unit") == 0
+                             and e["detail"].get("phase") == "integrated")
+        checks["a-not-replayed"] = (a_dispatches == 1 and a_integrations == 1
+                                    and res.get("aWorkerTurnsPhase2") == 0)
+        detail["aReplay"] = {"dispatches": a_dispatches,
+                             "integrations": a_integrations,
+                             "phase2WorkerTurns": res.get("aWorkerTurnsPhase2")}
+
+        # B/C: brand-new ephemeral contexts on the SAME durable worktrees
+        b_new = res.get("bFirstTurn") or {}
+        c_new = res.get("cFirstTurn") or {}
+        checks["b-new-turn"] = bool(
+            b_new.get("threadId") and scene["bTurn"].get("threadId")
+            and b_new["threadId"] != scene["bTurn"]["threadId"])
+        checks["c-new-turn"] = bool(
+            c_new.get("threadId") and scene["cTurn"].get("threadId")
+            and c_new["threadId"] != scene["cTurn"]["threadId"])
+        b_cwds = res.get("bWorkerCwds") or []
+        c_cwds = res.get("cWorkerCwds") or []
+        checks["same-durable-worktrees"] = bool(
+            b_cwds and c_cwds and b_cwds[0] == scene["bWorktree"]
+            and c_cwds[0] == scene["cWorktree"])
+        preserved = res.get("preservedAtRecover") or {}
+        checks["partial-work-preserved"] = (
+            preserved.get("progress-b.txt") == "B-PRE-CRASH"
+            and preserved.get("progress-c.txt") == "C-PRE-CRASH")
+
+        plan_final = json.loads((runs / "plan.json").read_text("utf-8"))
+        checks["all-units-integrated"] = (
+            [u["state"] for u in plan_final["units"]] == ["integrated"] * 3)
+
+        integ_branch = f"laomo/{mid}/integration"
+        def show(f):
+            try:
+                return git(repo, "show", f"{integ_branch}:{f}")
+            except AssertionError:
+                return ""
+        checks["source-isolation"] = (
+            git(repo, "rev-parse", "HEAD") == base_sha
+            and porcelain(repo) == before
+            and "REAL-G-A" in show("a.txt")
+            and "B-RECOVERED" in show("b.txt")
+            and "C-RECOVERED" in show("c.txt"))
+
+        # recovery latency (factual, no SLA)
+        if b_new.get("startedAt") and res.get("recoverAt"):
+            detail["recoveryLatencySec"] = round(
+                b_new["startedAt"] - res["recoverAt"], 3)
+        detail["phase2"] = res
+        detail["scene"] = scene
+    finally:
+        pass
+
+    verdict = all(checks.values())
+    result = {"gate": "G", "checks": checks, "detail": detail,
+              "verdict": "PASS" if verdict else "FAIL"}
+    ev.write("summary.json", result)
+    ev.log(f"Gate G verdict: {result['verdict']} checks={checks}")
+    return result
+
+
+# ---------------------------------------------------------------- registry
+
 # ---------------------------------------------------------------- registry
 
 # ---------------------------------------------------------------- registry
@@ -1614,6 +1972,7 @@ GATES = {
     "D": lambda ev, scratch: gate_d(ev, scratch),
     "E": lambda ev, scratch: gate_e(ev, scratch),
     "F": lambda ev, scratch: gate_f(ev, scratch),
+    "G": lambda ev, scratch: gate_g(ev, scratch),
 }
 
 
@@ -1625,6 +1984,14 @@ def report(results: list[dict]) -> None:
 
 
 def main() -> int:
+    if len(sys.argv) >= 4 and sys.argv[1] == "--gate-g-child":
+        phase = sys.argv[2]
+        scratch = Path(sys.argv[3]).resolve()
+        if phase == "phase1":
+            return child_g_phase1(scratch)
+        if phase == "phase2" and len(sys.argv) >= 5:
+            return child_g_phase2(scratch, sys.argv[4])
+        return 2
     if len(sys.argv) < 2 or sys.argv[1] not in (*GATES, "all"):
         print(__doc__)
         return 2
