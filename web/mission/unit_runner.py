@@ -49,7 +49,7 @@ class UnitRunner:
     worker turns), LIMIT (repair cap exceeded — the scheduler fails the
     mission), STOP (paused/stopped/terminal), IDLE (unit state does not
     belong to this runner), CRASH (exception). run_unit() blocks on nothing
-    except this unit's job wake and the mission wake_event.
+    except this unit's own job wake and the mission wake Condition.
     """
 
     PASS = "PASS"
@@ -281,8 +281,10 @@ class UnitRunner:
 
     def _unit_wait_job(self, unit: dict[str, Any]) -> bool:
         """Wait for THIS unit's background job. Event-driven: the job watcher
-        sets the mission wake_event; the payload is consumed only when its
-        jobId matches (parallel units each wake their own)."""
+        mails a wake into the per-jobId mailbox; each unit only pops its own
+        slot, so parallel units never steal each other's wake. The payload
+        stays queued until its own thread takes it — a sibling's wake cannot
+        mask it (that is what the old single-slot wake_event could do)."""
         job_id = unit.get("jobId")
         while not self.runner._control.is_set():
             woken = self.runner.take_wake(job_id)
@@ -305,7 +307,10 @@ class UnitRunner:
             if reason:
                 self.runner._transition(state, "failed", stopReason=reason)
                 return False
-            self.runner.wake_event.wait(timeout=0.5)
+            # Condition.wait: only wakes on notify_all (a sibling's job
+            # finishing) or the timeout — no stuck set() => busy-poll.
+            with self.runner._wake_condition:
+                self.runner._wake_condition.wait(timeout=0.5)
         if self.runner._control.is_set():
             return False
         woken = woken or {}

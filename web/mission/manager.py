@@ -39,9 +39,10 @@ class MissionRunner(threading.Thread):
         self.mission_id = mission_id
         self.store = manager.store_for(mission_id)
         self.policy = manager.policy_for(mission_id)
-        self.wake_event = threading.Event()
-        self.wake_payload: dict[str, Any] | None = None
-        self._wake_lock = threading.Lock()
+        # parallel wake mailbox: one slot per jobId, so a wake for unit A can
+        # never be overwritten by a wake for unit B
+        self._wake_payloads: dict[str, dict[str, Any]] = {}
+        self._wake_condition = threading.Condition()
         self._control = threading.Event()  # set => stop loop (cancel/fail)
         self._last_progress_sig: str | None = None
         # per-unit worker threads report back through this queue; the
@@ -56,23 +57,21 @@ class MissionRunner(threading.Thread):
     # -- thread plumbing --
     def request_stop(self) -> None:
         self._control.set()
-        self.wake_event.set()
+        with self._wake_condition:
+            self._wake_condition.notify_all()
 
     def wake(self, payload: dict[str, Any]) -> None:
-        with self._wake_lock:
-            self.wake_payload = payload
-        self.wake_event.set()
+        """Mail the wake to the slot of its job. A wake for unit B can never
+        overwrite the still-undelivered wake for unit A."""
+        with self._wake_condition:
+            self._wake_payloads[str(payload.get("jobId") or "")] = payload
+            self._wake_condition.notify_all()
 
-    def take_wake(self, job_id: str) -> dict[str, Any] | None:
-        """Pop the pending wake IF it belongs to the given job. Parallel
-        units each wait on their own job; a wake addressed to another unit
-        stays queued for its own thread."""
-        with self._wake_lock:
-            payload = self.wake_payload
-            if payload is None or payload.get("jobId") != job_id:
-                return None
-            self.wake_payload = None
-        return payload
+    def take_wake(self, job_id: str | None) -> dict[str, Any] | None:
+        """Pop the pending wake for THIS job only. Parallel units each wait
+        on their own job; a wake addressed to a sibling stays queued for it."""
+        with self._wake_condition:
+            return self._wake_payloads.pop(str(job_id or ""), None)
 
     # -- state helpers --
     def _state(self) -> dict[str, Any]:

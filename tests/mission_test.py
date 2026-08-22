@@ -1372,6 +1372,117 @@ class TestParallelWorkUnits(MissionLoopTest):
         self.assertEqual(len([u for u in plan["units"] if u.get("state") == "passed"]),
                          n, "全部单元应通过")
 
+    # -- M4.1 parallel wait/wake mailbox --
+
+    def _waiting_units(self, mid, count, timeout=30):
+        """Wait until `count` units are concurrently WAITING (each with a job)."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            plan_path = self.mdir(mid) / "plan.json"
+            if plan_path.is_file():
+                try:
+                    plan = self.read_json(plan_path)
+                except Exception:
+                    plan = None
+                if plan:
+                    waiting = [u for u in plan["units"]
+                               if u.get("state") == "waiting" and u.get("jobId")]
+                    if len(waiting) >= count:
+                        return plan
+            time.sleep(POLL_INTERVAL)
+        return None
+
+    def test_34_two_jobs_wake_independently(self):
+        """M4.1: two parallel WAITING units, each with its own background job,
+        both jobs finish near-simultaneously, both wakes are consumed by their
+        OWN unit (no single-slot overwrite), both continue to the evaluator,
+        mission reaches DONE."""
+        self.adapter.script("planner", plan_block(sample_units(2)))
+        self.adapter.script("worker", job_block("sleep 2", reason="作业A"))
+        self.adapter.script("worker", job_block("sleep 2", reason="作业B"))
+        mid = self.create_mission(options={"maxParallelWorkers": 2})
+        self.mgr.start(mid)
+        plan = self._waiting_units(mid, 2)
+        self.assertIsNotNone(plan, "两个单元必须同时处于 WAITING（各持 jobId）")
+        job_ids = {u["jobId"] for u in plan["units"]}
+        self.assertEqual(len(job_ids), 2, "两个单元必须各持独立 jobId")
+        self.assertTrue(self.wait_state(self.mgr, mid, ["done"], timeout=60),
+                        "两作业近同时结束后应 done，实际: %s" % self.state_vals(self.mgr, mid))
+        # 每个作业都必须 completed（两个 watcher 都如实持久化后才 wake）
+        jobs = [self.read_json(p) for p in self.sub_files(mid, "jobs", "*.json")]
+        self.assertEqual(len(jobs), 2)
+        for j in jobs:
+            self.assertEqual(j.get("status"), "completed", "job %s 未 completed" % j.get("jobId"))
+            self.assertEqual(j.get("exitCode"), 0)
+        # 每个单元都消费了自己的 wake（事件里两个 jobId 各自一份）
+        wakes = {}
+        for e in self._events(mid):
+            if e["type"] == "wake" and isinstance(e.get("detail"), dict):
+                wakes.setdefault(e["detail"].get("jobId"), []).append(e)
+        for jid in job_ids:
+            self.assertIn(jid, wakes, "job %s 的 wake 必须被其单元消费" % jid)
+            self.assertEqual(wakes[jid][0]["detail"].get("exitKind"), "exited")
+        plan = self.read_json(self.mdir(mid) / "plan.json")
+        for u in plan["units"]:
+            self.assertEqual(u.get("state"), "passed", "两个单元都应 PASS 并集入")
+        self.assertFalse(self.reason_has(self.mgr, mid, "no-progress", "stop"),
+                         "近同时双 wake 不得触发任何 stopReason")
+
+    def test_35_no_spin_after_sibling_wake(self):
+        """M4.1: A finishes first, B still waits several seconds. B must NOT
+        busy-poll the disk (the old never-cleared set() wake_event made
+        wait(timeout=0.5) return immediately); B only wakes when its own job
+        completes, e.g. ~2 load_job checks per second."""
+        from mission import MissionStore
+        self.adapter.script("planner", plan_block(sample_units(2)))
+        self.adapter.script("worker", job_block("sleep 1", reason="作业A先结束"))
+        self.adapter.script("worker", job_block("sleep 6", reason="作业B后结束"))
+        mid = self.create_mission(options={"maxParallelWorkers": 2})
+        self.mgr.start(mid)
+        plan = self._waiting_units(mid, 2)
+        self.assertIsNotNone(plan, "两个单元必须同时处于 WAITING")
+        job_paths = {u["jobId"]: self.mdir(mid) / "jobs" / f"{u['jobId']}.json"
+                     for u in plan["units"]}
+        # 两个 job_block 脚本按 FIFO 被最先执行的 worker 轮次取走，无法假定
+        # 哪个 job 属于哪个 index —— 以「谁先完成」识别兄弟 wake
+        def first_done():
+            return next((jid for jid, p in job_paths.items()
+                         if self.read_json(p).get("status") in ("completed", "failed")), None)
+        a_job = None
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            a_job = first_done()
+            if a_job:
+                break
+            time.sleep(POLL_INTERVAL)
+        self.assertTrue(a_job, "A 作业应先结束（触发兄弟 wake）")
+        b_job = next(jid for jid in job_paths if jid != a_job)
+        self.assertNotEqual(self.read_json(job_paths[b_job]).get("status"), "completed",
+                            "B 作业在 A 结束时必须仍在运行（留出测量窗）")
+        # A 的 wake 已经发出；在 B 的作业结束前测量 B 的磁盘检查频率
+        orig = MissionStore.load_job
+        counted = {"n": 0}
+        def counting(store, job_id):
+            if str(job_id or "") == b_job:
+                counted["n"] += 1
+            return orig(store, job_id)
+        MissionStore.load_job = counting
+        try:
+            time.sleep(2.0)
+            n = counted["n"]
+        finally:
+            MissionStore.load_job = orig
+        self.assertGreaterEqual(n, 1, "B 等待期间必须仍在检查磁盘（保证存活）")
+        self.assertLessEqual(n, 100,
+                             "兄弟 wake 后 B 不得忙轮询磁盘（2 秒内 load_job %d 次）" % n)
+        self.assertTrue(self.wait_state(self.mgr, mid, ["done"], timeout=60),
+                        "B 最终被自己的 job 唤醒后应 done，实际: %s" % self.state_vals(self.mgr, mid))
+        plan = self.read_json(self.mdir(mid) / "plan.json")
+        for u in plan["units"]:
+            self.assertEqual(u.get("state"), "passed")
+        self.assertFalse(self.reason_has(self.mgr, mid, "no-progress", "stop"),
+                         "兄弟 wake 不得被误判为 no-progress")
+
 
 if __name__ == "__main__":
     if MISSION_IMPORT_ERROR is not None:
