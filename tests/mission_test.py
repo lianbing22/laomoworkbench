@@ -1016,7 +1016,10 @@ class TestNoProgressPersist(MissionLoopTest):
 
         self.adapter.hook = hook
         self.mgr.start(mid)
-        self.assertTrue(self.wait_until(lambda: frozen.is_set(), timeout=30,
+        # 60s: reaching the 3rd evaluator turn takes 2 full repair cycles;
+        # loaded CI runners need far longer than a laptop (flake seen on a
+        # shared macos runner's 3.12 leg with the old 30s timeout)
+        self.assertTrue(self.wait_until(lambda: frozen.is_set(), timeout=60,
                                         desc="第 3 次 evaluation 被冻结"))
         st = self.read_json(self.mdir(mid) / "state.json")
         no_before = int(st.get("noProgress") or 0)
