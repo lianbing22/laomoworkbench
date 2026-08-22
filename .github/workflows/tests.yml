@@ -8,9 +8,12 @@ on:
 jobs:
   pytest:
     # The workbench runtime itself is stdlib-only; pytest is the sole dev
-    # dependency. Real-Codex gates (Gate 0/A-J, Usability) need a logged-in
-    # codex CLI and are NOT run here — they stay manual/local certification.
-    runs-on: ubuntu-latest
+    # dependency. The suite asserts macOS platform facts (Keychain `security`
+    # CLI, zsh in the machine gate, /Users fixtures) — the product is
+    # macOS-first, so the matrix runs on macOS runners. Real-Codex gates
+    # (Gate 0/A-J, Usability) need a logged-in codex CLI and are NOT run
+    # here — they stay manual/local certification.
+    runs-on: macos-latest
     strategy:
       fail-fast: false
       matrix:
