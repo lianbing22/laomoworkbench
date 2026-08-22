@@ -92,6 +92,7 @@ class TurnTap:
         self.ev = ev
         self.lock = threading.Lock()
         self.threads: dict[str, dict] = {}   # threadId -> {cwd, turns: {...}}
+        self.commands: dict[str, list[str]] = {}  # threadId -> shell commands
         original = adapter._on_notification
 
         def wrapped(note: dict) -> None:
@@ -108,6 +109,13 @@ class TurnTap:
         params = note.get("params") or {}
         tid = str(params.get("threadId") or "")
         rec = {"ts": round(time.time(), 3), "method": method, "threadId": tid}
+        if method == "item/started":
+            item = params.get("item") or {}
+            if item.get("type") == "commandExecution":
+                cmd = str(item.get("command") or "")[:200]
+                rec["cmd"] = cmd
+                with self.lock:
+                    self.commands.setdefault(tid, []).append(cmd)
         if method == "thread/started":
             thread = params.get("thread") or {}
             tid = str(thread.get("id") or tid)
@@ -148,6 +156,37 @@ class TurnTap:
                                     "cwd": t["cwd"], **turn})
             out.sort(key=lambda x: x.get("startedAt") or 0)
             return out
+
+
+class PromptTap:
+    """Record every REAL run_turn invocation (prompt / cwd / read_only /
+    result) on the adapter INSTANCE — driver-side evidence, no harness
+    change. Captured prompts prove which role template each turn used."""
+
+    def __init__(self, ev: Evidence, adapter: CodexRuntimeAdapter) -> None:
+        self.ev = ev
+        self.calls: list[dict] = []
+        original = adapter.run_turn
+
+        def wrapped(*, prompt, **kwargs):
+            started = time.time()
+            result = original(prompt=prompt, **kwargs)
+            self.calls.append({
+                "ts": round(started, 3),
+                "endedAt": round(time.time(), 3),
+                "cwd": kwargs.get("cwd"),
+                "read_only": bool(kwargs.get("read_only")),
+                "prompt": (prompt or "")[:600],
+                "ok": result.get("ok"),
+                "text": (result.get("text") or "")[:300],
+            })
+            return result
+
+        adapter.run_turn = wrapped
+
+    def in_cwd(self, cwd_suffix: str) -> list[dict]:
+        return [c for c in self.calls
+                if c["cwd"] and str(c["cwd"]).endswith(cwd_suffix)]
 
 
 def overlap(a: dict, b: dict) -> float | None:
@@ -545,6 +584,255 @@ def gate_b(ev: Evidence, scratch: Path) -> dict:
     ev.log(f"Gate B verdict: {result['verdict']} checks={checks}")
     return result
 
+CONFLICT_UNIT_DESC_A = (
+    "把工作目录中的 shared.txt 全文替换为恰好一行：REAL-CODEX-A。"
+    "除此以外不要创建或修改任何文件，不要执行 git 命令。")
+CONFLICT_UNIT_DESC_B = (
+    "把工作目录中的 shared.txt 全文替换为恰好一行：REAL-CODEX-B。"
+    "除此以外不要创建或修改任何文件，不要执行 git 命令。")
+
+
+def init_conflict_fixture(repo: Path) -> str:
+    repo.mkdir(parents=True, exist_ok=True)
+    git(repo, "init", "-q")
+    git(repo, "config", "user.email", "gate@local")
+    git(repo, "config", "user.name", "gate")
+    (repo / "README.md").write_text("gate fixture\n", "utf-8")
+    (repo / "shared.txt").write_text("BASE\n", "utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "base")
+    return git(repo, "rev-parse", "HEAD")
+
+
+GIT_MUTATION = re.compile(
+    r"\bgit\s+(add|commit|merge|rebase|reset|checkout|cherry-pick|stash)\b")
+
+
+def gate_c(ev: Evidence, scratch: Path) -> dict:
+    ev.log("Gate C — Conflict Resolver (real codex, real content conflict)")
+    repo = scratch / "fixture-c" / "repo"
+    base_sha = init_conflict_fixture(repo)
+    before = porcelain(repo)
+
+    adapter = CodexRuntimeAdapter(bin_path=GATE_BIN, default_cwd=str(repo),
+                                  debug_log=ev.log)
+    tap = TurnTap(ev, adapter)
+    ptap = PromptTap(ev, adapter)
+    mgr = MissionManager(adapter, repo)
+    checks: dict[str, bool] = {}
+    detail: dict = {}
+    try:
+        created = mgr.create(
+            "两个并行单元各自改写 shared.txt，冲突由系统自动解决，"
+            "最终两侧意图都保留在集成分支",
+            cwd=str(repo),
+            acceptance_criteria=["shared.txt 同时包含 REAL-CODEX-A 与 REAL-CODEX-B"],
+            options={"maxParallelWorkers": 2},
+            verification={"requiredFiles": ["shared.txt"],
+                          "commands": ["grep -q REAL-CODEX-A shared.txt",
+                                       "grep -q REAL-CODEX-B shared.txt"]})
+        mid = created["mission"]["id"]
+
+        def unit(uid, index, title, desc, acceptance):
+            return {"id": uid, "index": index, "title": title,
+                    "description": desc, "acceptance": acceptance,
+                    "dependencies": [], "state": "pending", "status": "pending",
+                    "attempt": 0, "repairCount": 0, "conflictCount": 0,
+                    "conflict": None,
+                    "worktree": {"path": None, "branch": None,
+                                 "baseSha": None, "headSha": None},
+                    "jobId": None, "delta": None, "repairDirective": None,
+                    "lastVerdict": None,
+                    "worker": {"startedAt": None, "finishedAt": None},
+                    "integration": None}
+        store = mgr.store_for(mid)
+        store.save_plan({"version": 2, "replans": 0, "gitIntegration": True,
+                         "units": [
+                             unit("a", 0, "改写A", CONFLICT_UNIT_DESC_A,
+                                  ["shared.txt 内容包含 REAL-CODEX-A"]),
+                             unit("b", 1, "改写B", CONFLICT_UNIT_DESC_B,
+                                  ["shared.txt 内容包含 REAL-CODEX-B"]),
+                         ]})
+        store.save_state({"state": "running", "cycles": 0, "currentUnit": 0,
+                          "noProgress": 0, "progressSignature": "",
+                          "tokensUsed": 0, "wallElapsedMs": 0,
+                          "agentActiveMs": 0, "waitingMs": 0, "pausedMs": 0,
+                          "phaseStartedAt": 0})
+        mgr.start(mid)
+
+        deadline = time.monotonic() + MISSION_TIMEOUT
+        state = {}
+        while time.monotonic() < deadline:
+            state = mgr.status(mid)["mission"]
+            if state.get("state") in ("done", "failed", "blocked", "cancelled"):
+                break
+            time.sleep(POLL)
+        ev.log(f"mission terminal: {state.get('state')} "
+               f"(stopReason={state.get('stopReason')})")
+
+        runs = repo / ".laomo" / "runs" / mid
+        plan = json.loads((runs / "plan.json").read_text("utf-8"))
+        events = [json.loads(l) for l in
+                  (runs / "events.ndjson").read_text("utf-8").splitlines()
+                  if l.strip()]
+        dispatch_ts = {e["detail"]["unit"]: e["ts"] for e in events
+                       if e["type"] == "dispatch"
+                       and isinstance(e.get("detail"), dict)}
+        integ_events = [e for e in events if e["type"] == "integration"
+                        and isinstance(e.get("detail"), dict)]
+        resolve_ev = next((e for e in integ_events
+                           if e["detail"].get("phase") == "conflict-resolve"), None)
+        integrated_ts = {e["detail"]["unit"]: e["ts"] for e in integ_events
+                         if e["detail"].get("phase") == "integrated"}
+        verification_ts = next(
+            (e["ts"] for e in events if e["type"] == "transition"
+             and isinstance(e.get("detail"), dict)
+             and e["detail"].get("state") == "verification"), None)
+
+        checks["mission-done"] = state.get("state") == "done"
+        checks["units-integrated"] = (
+            [u["state"] for u in plan["units"]] == ["integrated"] * 2)
+        detail["mission"] = {"id": mid, "state": state.get("state"),
+                             "stopReason": state.get("stopReason")}
+
+        # dynamic winner/conflict identification — real race decides
+        conflict_idx = None
+        if resolve_ev is not None:
+            conflict_idx = resolve_ev["detail"].get("unit")
+        winner_idx = 1 - conflict_idx if conflict_idx is not None else None
+        checks["real-git-conflict"] = conflict_idx is not None
+        detail["conflictUnit"] = conflict_idx
+        detail["winnerUnit"] = winner_idx
+        detail["resolveEventTs"] = resolve_ev["ts"] if resolve_ev else None
+        detail["dispatchTs"] = dispatch_ts
+        detail["integratedTs"] = integrated_ts
+
+        cu = plan["units"][conflict_idx] if conflict_idx is not None else {}
+        conflict_rec = cu.get("conflict") or {}
+        checks["conflict-evidence"] = bool(
+            conflict_rec.get("integrationHead")
+            and conflict_rec.get("unitHead")
+            and conflict_rec.get("mergeBase")
+            and conflict_rec.get("files"))
+        detail["conflictRecord"] = {
+            k: conflict_rec.get(k) for k in
+            ("integrationHead", "unitHead", "mergeBase", "files", "attempt")}
+        files = [f.get("path") for f in conflict_rec.get("files") or []]
+        detail["conflictFiles"] = files
+
+        # 1. initial real worker overlap (u0 x u1 first turns)
+        t0 = tap.unit_turns("/u0")
+        t1 = tap.unit_turns("/u1")
+        best = -1.0
+        for ta in t0:
+            for tb in t1:
+                ov = overlap(ta, tb)
+                if ov is not None and ov > best:
+                    best = ov
+        checks["real-worker-overlap"] = best > 1.0
+        detail["initialOverlapSec"] = best
+
+        # 4/5/6. resolver turn: real prompt, unit cwd, no git mutations
+        cu_path = (cu.get("worktree") or {}).get("path")
+        resolver_call = None
+        if cu_path and resolve_ev is not None:
+            window_end = integrated_ts.get(conflict_idx, float("inf")) / 1000.0
+            for c in ptap.in_cwd("/u%d" % conflict_idx):
+                if resolve_ev["ts"] / 1000.0 <= c["ts"] <= window_end \
+                        and "Conflict Resolver" in c["prompt"]:
+                    resolver_call = c
+                    break
+        checks["resolver-cwd-is-unit"] = bool(
+            resolver_call and resolver_call["cwd"] == cu_path
+            and str(cu_path).endswith(f"/u{conflict_idx}"))
+        checks["resolver-prompt-real"] = bool(
+            resolver_call and "Conflict Resolver" in resolver_call["prompt"]
+            and "禁止执行" in resolver_call["prompt"])
+        # the resolver's thread (matching turn window) ran no git mutations
+        resolver_cmds: list[str] = []
+        if resolver_call is not None:
+            with tap.lock:
+                for tid, t in tap.threads.items():
+                    if not t.get("cwd") or not str(t["cwd"]).endswith(
+                            f"/u{conflict_idx}"):
+                        continue
+                    for turn in t["turns"].values():
+                        if resolver_call["ts"] <= (turn.get("startedAt") or 0) \
+                                <= resolver_call["endedAt"]:
+                            resolver_cmds.extend(tap.commands.get(tid, []))
+        git_mutations = [c for c in resolver_cmds if GIT_MUTATION.search(c)]
+        checks["resolver-no-git"] = resolver_call is not None \
+            and not git_mutations
+        detail["resolver"] = {
+            "cwd": resolver_call["cwd"] if resolver_call else None,
+            "promptHead": (resolver_call["prompt"][:120]
+                           if resolver_call else None),
+            "commands": resolver_cmds[:20],
+            "gitMutations": git_mutations,
+        }
+        # resolver thread/turn ids for the report
+        if resolver_call is not None:
+            with tap.lock:
+                for tid, t in tap.threads.items():
+                    if t.get("cwd") == resolver_call["cwd"]:
+                        for turn_id, turn in t["turns"].items():
+                            if resolver_call["ts"] <= (turn.get("startedAt") or 0) \
+                                    <= resolver_call["endedAt"]:
+                                detail["resolver"]["threadId"] = tid
+                                detail["resolver"]["turnId"] = turn_id
+
+        # 7. conflict unit evaluated at least twice (initial + post-resolve)
+        evals = [c for c in ptap.in_cwd(f"/u{conflict_idx}")
+                 if c["read_only"]]
+        checks["reevaluated"] = len(evals) >= 2
+        detail["conflictUnitEvaluators"] = len(evals)
+
+        # 8. BOTH intents on the integration branch at the moment the
+        # conflict unit's (second) integration completed — before the
+        # machine gate even starts
+        integ_branch = f"laomo/{mid}/integration"
+        shared = git(repo, "show", f"{integ_branch}:shared.txt")
+        (ev.root / "pre-verification-shared.txt").write_text(shared, "utf-8")
+        ci_integrated_ts = integrated_ts.get(conflict_idx)
+        checks["both-intents-before-machine-gate"] = bool(
+            "REAL-CODEX-A" in shared and "REAL-CODEX-B" in shared
+            and ci_integrated_ts is not None
+            and verification_ts is not None
+            and resolve_ev["ts"] < ci_integrated_ts < verification_ts)
+        detail["preVerificationShared"] = shared.strip()
+        detail["verificationTs"] = verification_ts
+
+        # 9. no MERGE_HEAD residue anywhere
+        integ_dir = repo / ".laomo" / "worktrees" / mid / "integration"
+        checks["conflict-cleaned"] = not subprocess.run(
+            ["git", "-C", str(integ_dir), "rev-parse", "-q", "--verify",
+             "MERGE_HEAD"], capture_output=True).returncode == 0
+        detail["unitWorktreesCleaned"] = all(
+            not (repo / ".laomo" / "worktrees" / mid / f"u{i}").is_dir()
+            for i in range(2))
+
+        # 10. source isolation
+        checks["source-isolation"] = (
+            git(repo, "rev-parse", "HEAD") == base_sha
+            and porcelain(repo) == before)
+
+        detail["conflictCount"] = cu.get("conflictCount")
+        detail["repairCount"] = cu.get("repairCount")
+        checks["budgets-honest"] = (cu.get("conflictCount") == 1
+                                    and cu.get("repairCount") == 0)
+    finally:
+        adapter.shutdown()
+
+    verdict = all(checks.values())
+    result = {"gate": "C", "checks": checks, "detail": detail,
+              "verdict": "PASS" if verdict else "FAIL"}
+    ev.write("summary.json", result)
+    ev.log(f"Gate C verdict: {result['verdict']} checks={checks}")
+    return result
+
+
+# ---------------------------------------------------------------- registry
+
 # ---------------------------------------------------------------- registry
 
 
@@ -555,6 +843,7 @@ def gate_ev(scratch: Path, name: str) -> Evidence:
 GATES = {
     "A": lambda ev, scratch: gate_a(ev, scratch),
     "B": lambda ev, scratch: gate_b(ev, scratch),
+    "C": lambda ev, scratch: gate_c(ev, scratch),
 }
 
 
