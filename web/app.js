@@ -279,13 +279,13 @@ function rpcId() {
   return globalThis.crypto?.randomUUID?.() || `rpc-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
-async function rpc(method, payload = {}, mode = state.mode, requestId = null) {
+async function rpc(method, payload = {}, mode = state.mode, requestId = null, timeoutMs) {
   const request = { type: "client-request", rpcId: requestId || rpcId(), method, payload };
   const response = await jsonFetch(`/api/harness/${mode}/${encodeURIComponent(method)}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(request),
-  });
+  }, timeoutMs);
   if (response.result?.ok === false) throw new Error(response.result.error?.message || response.result.error || `${method} 失败`);
   return response.result?.value ?? response.value ?? response;
 }
@@ -876,12 +876,41 @@ function configureStarterCards(clean) {
   }
 }
 
+// 发送/停止形态：回合执行中且输入框为空时，发送按钮原地变为停止键（主流
+// 对话端惯例，aria-label 本来就写着「发送或停止」）；一旦输入内容则恢复为
+// 发送——此时回车/点击按 busyMode 排队或引导（见 sendPrompt）。
+function updateSendButton() {
+  const button = $("#sendButton");
+  if (!button) return;
+  const inputEmpty = !$("#promptInput").value.trim() && !state.pendingImages.length;
+  const stopping = state.running && inputEmpty && !state.sending;
+  button.dataset.stop = stopping ? "1" : "0";
+  button.textContent = stopping ? "■" : "↑";
+  button.classList.toggle("stop", stopping);
+  button.title = stopping ? "停止执行"
+    : (state.running ? (state.busyMode === "steer" ? "引导当前任务（输入后回车）" : "排到下一条（输入后回车）") : "发送");
+}
+
 async function waitForHarness() {
   for (let count = 0; count < 50; count += 1) {
     try {
       await loadAgentFoundation();
       return;
     } catch (error) {
+      // 知识引擎 (DSH :3080) 未运行时，知识模式启动/切换只会 502 循环重试——
+      // 用 /api/health 确认引擎确实不在后自动切回纯净模式，避免整页卡死。
+      // 不设一次性标记：每次 waitForHarness（含手动切换模式）都独立判断，
+      // 回退只会 knowledge→clean 单向发生，不会循环。
+      if (count === 2 && state.mode === "knowledge") {
+        try {
+          const health = await fetch("/api/health").then(response => response.json());
+          if (health?.runtimes?.knowledge?.status !== "ready") {
+            setMode("clean");
+            toast("知识引擎未运行，已切回纯净模式");
+            continue;
+          }
+        } catch { /* health 不可用则维持原有重试节奏 */ }
+      }
       if (count === 49) {
         setService("error", "本地引擎未就绪");
         toast(error.message, true);
@@ -1165,7 +1194,8 @@ async function createSession() {
 
 async function pickProject() {
   try {
-    const picked = await rpc("host.pickDirectory", {});
+    // 原生选文件夹对话框没有 15s 超时的道理：用户慢慢挑，等 10 分钟。
+    const picked = await rpc("host.pickDirectory", {}, state.mode, null, 600000);
     const path = picked?.path || picked?.directory || (typeof picked === "string" ? picked : "");
     if (!path) return;
     const created = await rpc("workspace.create", { path });
@@ -1792,7 +1822,7 @@ function foldHistory(events) {
       const content = data.content || data.message?.content;
       const text = visibleTextFromContent(content);
       const images = imageRefsFromContent(content);
-      if (/^\/permission\s+(read-only|workspace-write|danger-full-access)\s*$/i.test(text)) continue;
+      if (/^\/permission\s+(read-only|workspace-write|full-auto|danger-full-access)\s*$/i.test(text)) continue;
       if (text || images.length) {
         turnToolCount = 0;
         const id = data.id || event.id;
@@ -2070,8 +2100,7 @@ function renderProjection() {
   $("#runState").className = `run-state ${running ? "running" : "idle"}`;
   $("#runState").querySelector("span").textContent = running ? "执行中" : "待命";
   setThinkingStatus(running);
-  $("#sendButton").textContent = "↑";
-  $("#sendButton").title = running ? (state.busyMode === "steer" ? "引导当前任务" : "排到下一条") : "发送";
+  updateSendButton();
   $("#cancelButton").classList.toggle("hidden", !running);
   $("#busyComposer").classList.toggle("hidden", !running);
   $$('[data-busy-mode]').forEach(button => button.classList.toggle("active", button.dataset.busyMode === state.busyMode));
@@ -2128,10 +2157,51 @@ function setThinkingStatus(active) {
   status.classList.toggle("active", Boolean(active));
 }
 
+// 工作模式：聊天（原样对话）/ 计划（只规划不执行，联动只读权限）/ 自动
+// （自主执行到底，联动全自动权限）。前置语随每条消息注入（本地气泡仍只
+// 显示用户原文）；权限联动复用 applyPermission（含回读校验）。
+const WORK_MODE_PREAMBLES = {
+  plan: "【计划模式】本轮只做规划：给出完整、分步、可核对的执行计划（要改哪些文件、跑哪些命令、有什么风险），不要实际创建或修改文件、不要执行任何变更命令；我确认后才会让你执行。\n\n",
+  auto: "【自动模式】自主执行到底：可以自行决定的事直接决定，不要中途停下来问我；全部完成后汇报结果与改动清单。\n\n",
+};
+
+function currentWorkMode() {
+  return $("#workModeSelect")?.value || "chat";
+}
+
+function modePreamble() {
+  return WORK_MODE_PREAMBLES[currentWorkMode()] || "";
+}
+
+function workModePermission(mode = currentWorkMode()) {
+  return mode === "plan" ? "read-only" : mode === "auto" ? "full-auto" : null;
+}
+
+async function selectWorkMode() {
+  const mode = currentWorkMode();
+  localStorage.setItem("boujoy-work-mode", mode);
+  const want = workModePermission(mode);
+  if (want && state.sessionId) await applyPermission(want);
+  toast(mode === "plan" ? "计划模式：只规划不执行" + (state.sessionId ? "（已切只读权限）" : "（首条消息起用只读权限）")
+      : mode === "auto" ? "自动模式：自主执行" + (state.sessionId ? "（已切全自动权限）" : "（首条消息起用全自动权限）")
+      : "聊天模式");
+}
+
+// 新会话的第一条消息前对齐权限：自动/计划模式下 registry 默认的
+// workspace-write+on-request 会重新弹批准框，正是要去掉的体验。
+async function ensureWorkModePermission() {
+  if (!state.sessionId) return;
+  const want = workModePermission();
+  if (!want) return;
+  if (state.projection?.permissions?.currentValue === want) return;
+  try { await applyPermission(want); } catch (_) { /* applyPermission 自己会 toast */ }
+}
+
 async function sendPrompt(text = $("#promptInput").value.trim()) {
   if ((!text && !state.pendingImages.length) || state.sending) return;
   if (!state.sessionId) await createSession();
   if (!state.sessionId) return;
+  await ensureWorkModePermission();
   state.sending = true;
   $("#sendButton").disabled = true;
   $("#promptInput").value = "";
@@ -2140,7 +2210,7 @@ async function sendPrompt(text = $("#promptInput").value.trim()) {
   // block in one prompt admission. Multimodal providers preserve this order.
   const content = [
     ...state.pendingImages.map(image => ({ type: "image", mediaType: image.mediaType, data: image.data, name: image.name })),
-    ...(text ? [{ type: "text", text }] : []),
+    ...(text ? [{ type: "text", text: modePreamble() + text }] : []),
   ];
   const deliveryMode = state.running ? state.busyMode : "queue";
   const submissionRpcId = rpcId();
@@ -2176,7 +2246,7 @@ async function sendPrompt(text = $("#promptInput").value.trim()) {
     autoResizePrompt();
     toast(error.message, true);
   }
-  finally { state.sending = false; $("#sendButton").disabled = false; }
+  finally { state.sending = false; $("#sendButton").disabled = false; updateSendButton(); }
 }
 
 // Delivery-confirmation fallback. session.prompt resolves before the harness
@@ -2227,7 +2297,7 @@ async function applyPermission(value) {
     select.value = actual;
     select.dataset.current = actual;
     updateModelSummary();
-    toast(`权限已切换并回读：${actual === "read-only" ? "只读" : actual === "danger-full-access" ? "完全访问" : "工作区写入"}`);
+    toast(`权限已切换并回读：${actual === "read-only" ? "只读" : actual === "full-auto" ? "全自动（免批准）" : actual === "danger-full-access" ? "完全访问" : "工作区写入"}`);
   } catch (error) {
     select.value = state.projection?.permissions?.currentValue || select.dataset.current || "workspace-write";
     toast(error.message, true);
@@ -2370,7 +2440,7 @@ function setBusyMode(mode) {
   state.busyMode = mode;
   localStorage.setItem("boujoy-busy-mode", mode);
   $$('[data-busy-mode]').forEach(button => button.classList.toggle("active", button.dataset.busyMode === mode));
-  if (state.running) $("#sendButton").title = mode === "steer" ? "引导当前任务" : "排到下一条";
+  updateSendButton();
 }
 
 async function loadPresets() {
@@ -3295,7 +3365,13 @@ async function loadSettings(tab = "general") {
       const items = unpackList(value, ["skills", "items"]);
       content.innerHTML = items.map(item => `<div class="setting-card"><strong>${escapeHtml(item.name || item.id || item)}</strong><small>${escapeHtml(item.description || item.path || "Skill")}</small></div>`).join("") || '<p class="muted">没有可用 Skills。</p>';
     }
-  } catch (error) { content.innerHTML = `<div class="setting-card"><strong>读取失败</strong><small>${escapeHtml(error.message)}</small></div>`; }
+  } catch (error) {
+    content.innerHTML = `<div class="setting-card setting-error" role="alert">
+      <strong>本地服务暂时不可用</strong>
+      <small>设置内容没有读取成功。请确认本地引擎已启动后再重试。</small>
+      <span class="setting-error-detail">${escapeHtml(error.message)}</span>
+    </div>`;
+  }
 }
 
 async function workspaceAction(action, id) {
@@ -3389,7 +3465,11 @@ async function loadProviders() {
     state.activeProviderId = value.activeProviderId || null;
     renderProviders();
   } catch (error) {
-    if (list) list.innerHTML = `<div class="setting-card"><strong>读取失败</strong><small>${escapeHtml(error.message)}</small></div>`;
+    if (list) list.innerHTML = `<div class="setting-card setting-error" role="alert">
+      <strong>模型服务暂时不可用</strong>
+      <small>无法读取 Provider 列表，请确认本地引擎已启动。</small>
+      <span class="setting-error-detail">${escapeHtml(error.message)}</span>
+    </div>`;
   }
 }
 
@@ -3788,7 +3868,7 @@ function bindEvents() {
   $("#deleteSessionForm").addEventListener("submit", deleteCurrentSession);
   $("#renameSessionButton").addEventListener("click", renameSession);
   $("#forkSessionButton").addEventListener("click", forkSession);
-  $("#promptInput").addEventListener("input", autoResizePrompt);
+  $("#promptInput").addEventListener("input", () => { autoResizePrompt(); updateSendButton(); });
   $("#promptInput").addEventListener("keydown", event => {
     // Ignore Enter while an IME composition is active: confirming a candidate
     // (Chinese/Japanese/Korean) fires keydown with key === "Enter" and must not
@@ -3796,7 +3876,10 @@ function bindEvents() {
     if (event.isComposing || event.keyCode === 229) return;
     if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); sendPrompt(); }
   });
-  $("#sendButton").addEventListener("click", () => sendPrompt());
+  $("#sendButton").addEventListener("click", () => {
+    if ($("#sendButton").dataset.stop === "1") { cancelRun(); return; }
+    sendPrompt();
+  });
   // Track user scroll intent on the message stream: scrolling up means "leave
   // my place alone" — stop auto-following until the user returns to bottom.
   const messageStream = $("#messageStream");
@@ -3840,6 +3923,9 @@ function bindEvents() {
   $("#modelSelect").addEventListener("change", selectModel);
   $("#effortSelect").addEventListener("change", applyEffort);
   $("#permissionSelect").addEventListener("change", selectPermission);
+  $("#workModeSelect").addEventListener("change", selectWorkMode);
+  const savedWorkMode = localStorage.getItem("boujoy-work-mode");
+  if (savedWorkMode && $("#workModeSelect")) $("#workModeSelect").value = savedWorkMode;
   $("#presetSelect").addEventListener("change", selectPreset);
   $("#attachButton").addEventListener("click", () => $("#imageInput").click());
   $("#imageInput").addEventListener("change", event => { addImages(event.target.files); event.target.value = ""; });
