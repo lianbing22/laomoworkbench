@@ -547,10 +547,13 @@ class MissionRunner(threading.Thread):
                 last = max((u["index"] for u in units), default=0)
                 self._transition(state, "verification", currentUnit=last)
                 return True
-            if any(u.get("state") == UNIT_INTEGRATING for u in units):
-                # an integration is still settling (e.g. external-lock
-                # backoff) — never terminal-block over an in-flight
-                # transaction; the loop retries reconcile
+            if any(u.get("state") in (UNIT_PASSED, UNIT_INTEGRATING)
+                   for u in units):
+                # Gate B (real codex) caught the dishonest terminal: a PASSED
+                # unit is integration-in-waiting — while one exists (or an
+                # integration is still settling, e.g. external-lock backoff)
+                # the DAG can still open up and "DAG 依赖无法满足" would be a
+                # lie. The recovery loop integrates it on the next pass.
                 time.sleep(0.2)
                 continue
             bad = [u for u in units if u.get("state") == "failed"]

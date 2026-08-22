@@ -341,6 +341,210 @@ def gate_a(ev: Evidence, scratch: Path) -> dict:
     return result
 
 
+
+
+UNIT_C_DESC = ("读取工作目录中的 deps/a.txt 与 deps/b.txt，然后创建 result.txt，"
+               "内容为三行：第一行是 deps/a.txt 的内容，第二行是 deps/b.txt 的内容，"
+               "第三行是 DEPENDENCY-OK。"
+               "除此以外不要创建或修改任何文件，不要执行 git 命令。")
+
+
+def craft_three_unit_plan(store, mid: str) -> None:
+    """A/B independent, C depends on both — the dependency-barrier fixture."""
+
+    def unit(uid, index, title, desc, acceptance, deps=None):
+        return {"id": uid, "index": index, "title": title, "description": desc,
+                "acceptance": acceptance, "dependencies": deps or [],
+                "state": "pending", "status": "pending",
+                "attempt": 0, "repairCount": 0, "conflictCount": 0,
+                "conflict": None,
+                "worktree": {"path": None, "branch": None,
+                             "baseSha": None, "headSha": None},
+                "jobId": None, "delta": None, "repairDirective": None,
+                "lastVerdict": None,
+                "worker": {"startedAt": None, "finishedAt": None},
+                "integration": None}
+    desc_a = ("创建文件 deps/a.txt（目录不存在则创建），"
+              "内容恰好为一行：REAL-CODEX-A。"
+              "除此以外不要创建或修改任何文件，不要执行 git 命令。")
+    desc_b = ("创建文件 deps/b.txt（目录不存在则创建），"
+              "内容恰好为一行：REAL-CODEX-B。"
+              "除此以外不要创建或修改任何文件，不要执行 git 命令。")
+    plan = {"version": 2, "replans": 0, "gitIntegration": True,
+            "units": [
+                unit("a", 0, "产物A", desc_a,
+                     ["deps/a.txt 存在且内容包含 REAL-CODEX-A"]),
+                unit("b", 1, "产物B", desc_b,
+                     ["deps/b.txt 存在且内容包含 REAL-CODEX-B"]),
+                unit("c", 2, "合成C", UNIT_C_DESC,
+                     ["result.txt 存在且包含 REAL-CODEX-A、REAL-CODEX-B、DEPENDENCY-OK"],
+                     deps=["a", "b"]),
+            ]}
+    store.save_plan(plan)
+    store.save_state({"state": "running", "cycles": 0, "currentUnit": 0,
+                      "noProgress": 0, "progressSignature": "",
+                      "tokensUsed": 0, "wallElapsedMs": 0,
+                      "agentActiveMs": 0, "waitingMs": 0, "pausedMs": 0,
+                      "phaseStartedAt": 0})
+
+
+def gate_b(ev: Evidence, scratch: Path) -> dict:
+    ev.log("Gate B — Dependency Barrier (real codex, bare PASS must not "
+           "satisfy a git dependency)")
+    repo = scratch / "fixture-b" / "repo"
+    base_sha = init_fixture(repo)
+    before = porcelain(repo)
+
+    adapter = CodexRuntimeAdapter(bin_path=GATE_BIN, default_cwd=str(repo),
+                                  debug_log=ev.log)
+    tap = TurnTap(ev, adapter)
+    mgr = MissionManager(adapter, repo)
+    checks: dict[str, bool] = {}
+    detail: dict = {}
+    window: dict = {"captured": False}
+    try:
+        created = mgr.create(
+            "三个单元：A/B 并行产出，C 依赖二者并合成结果",
+            cwd=str(repo),
+            acceptance_criteria=["integration 分支包含三个产物文件且 result.txt 合成正确"],
+            options={"maxParallelWorkers": 3},
+            verification={"requiredFiles": ["deps/a.txt", "deps/b.txt",
+                                            "result.txt"],
+                          "commands": ["grep -q REAL-CODEX-A result.txt",
+                                       "grep -q REAL-CODEX-B result.txt",
+                                       "grep -q DEPENDENCY-OK result.txt"]})
+        mid = created["mission"]["id"]
+        ev.log(f"mission {mid} created (maxParallelWorkers=3)")
+        craft_three_unit_plan(mgr.store_for(mid), mid)
+
+        # ONE-SHOT test hook: delay unit B's INTEGRATION only (never the
+        # dependency logic). While A is not yet integrated, keep deferring;
+        # once A is integrated, observe one full window (A integrated, B bare
+        # passed, C pending, free slot) and release on the next call.
+        from mission.manager import MissionRunner
+        orig_integrate = MissionRunner._integrate_harvested
+
+        def delayed(self, state, index):
+            if index != 1 or window.get("released"):
+                return orig_integrate(self, state, index)
+            plan = self.store.load_plan()
+            a_state = next((u["state"] for u in plan["units"]
+                            if u["index"] == 0), None)
+            b_state = next((u["state"] for u in plan["units"]
+                            if u["index"] == 1), None)
+            c_state = next((u["state"] for u in plan["units"]
+                            if u["index"] == 2), None)
+            if a_state != "integrated":
+                ev.log(f"hook: defer B integration (A={a_state})")
+                return "ok"
+            if not window["captured"]:
+                with mgr._lock:
+                    pool = mgr._unit_threads.get(mid) or {}
+                    owned = sum(1 for t in pool.values() if t.is_alive())
+                window.update({"captured": True, "ts": time.time(),
+                               "A": a_state, "B": b_state, "C": c_state,
+                               "ownedUnits": owned,
+                               "freeSlots": 3 - owned})
+                ev.log(f"hook WINDOW: A={a_state} B={b_state} C={c_state} "
+                       f"owned={owned} free={3 - owned} — C must stay pending")
+                return "ok"  # one more iteration with B still bare-passed
+            window["released"] = True
+            ev.log("hook: release B integration")
+            return orig_integrate(self, state, index)
+
+        MissionRunner._integrate_harvested = delayed
+        try:
+            mgr.start(mid)
+            deadline = time.monotonic() + MISSION_TIMEOUT
+            state = {}
+            while time.monotonic() < deadline:
+                state = mgr.status(mid)["mission"]
+                if state.get("state") in ("done", "failed", "blocked", "cancelled"):
+                    break
+                time.sleep(POLL)
+        finally:
+            MissionRunner._integrate_harvested = orig_integrate
+        ev.log(f"mission terminal: {state.get('state')} "
+               f"(stopReason={state.get('stopReason')})")
+        checks["mission-done"] = state.get("state") == "done"
+        detail["mission"] = {"id": mid, "state": state.get("state"),
+                             "stopReason": state.get("stopReason")}
+
+        runs = repo / ".laomo" / "runs" / mid
+        plan = json.loads((runs / "plan.json").read_text("utf-8"))
+        states = [u["state"] for u in plan["units"]]
+        checks["units-integrated"] = states == ["integrated"] * 3
+        detail["unitStates"] = states
+
+        events = [json.loads(l) for l in
+                  (runs / "events.ndjson").read_text("utf-8").splitlines() if l.strip()]
+        dispatch_ts = {e["detail"]["unit"]: e["ts"]
+                       for e in events if e["type"] == "dispatch"
+                       and isinstance(e.get("detail"), dict)}
+        integrated_ts = {e["detail"]["unit"]: e["ts"]
+                         for e in events if e["type"] == "integration"
+                         and isinstance(e.get("detail"), dict)
+                         and e["detail"].get("phase") == "integrated"}
+        detail["dispatchTs"] = dispatch_ts
+        detail["integratedTs"] = integrated_ts
+
+        # 3/4. the window itself: free slot + C pending while B bare-passed
+        checks["free-slot-proven"] = bool(
+            window.get("captured") and window.get("freeSlots", 0) >= 1)
+        checks["bare-pass-barrier"] = bool(
+            window.get("captured") and window.get("B") == "passed"
+            and window.get("C") == "pending")
+        detail["window"] = window
+
+        # 5/6/7. C starts strictly after BOTH deps integrated
+        c_dispatch = dispatch_ts.get(2)
+        barrier = max(integrated_ts.get(0, 0), integrated_ts.get(1, 0))
+        early_dispatches = [e["ts"] for e in events
+                            if e["type"] == "dispatch"
+                            and isinstance(e.get("detail"), dict)
+                            and e["detail"].get("unit") == 2
+                            and e["ts"] < barrier]
+        checks["no-early-dispatch"] = (c_dispatch is not None
+                                       and not early_dispatches)
+        c_turns = tap.unit_turns("/u2")
+        early_turns = [t for t in c_turns
+                       if (t.get("startedAt") or 0) * 1000 < barrier]
+        checks["no-early-codex-turn"] = bool(c_turns) and not early_turns
+        checks["start-after-integrated"] = bool(
+            c_dispatch and c_dispatch >= barrier
+            and c_turns
+            and (c_turns[0].get("startedAt") or 0) * 1000 >= barrier)
+        detail["codex"] = {"cTurns": c_turns,
+                           "earlyDispatchTs": early_dispatches,
+                           "earlyTurns": early_turns,
+                           "barrierTs": barrier}
+
+        # integrated-base visibility: C actually READ A+B's work — its
+        # result must combine both markers (C's worktree was cut from the
+        # integration HEAD that already carries A+B)
+        integ_branch = f"laomo/{mid}/integration"
+        try:
+            result = git(repo, "show", f"{integ_branch}:result.txt")
+        except AssertionError:
+            result = ""
+        checks["integrated-base-visibility"] = all(
+            marker in result for marker in
+            ("REAL-CODEX-A", "REAL-CODEX-B", "DEPENDENCY-OK"))
+        detail["resultTxt"] = result.strip()
+
+        # 8. source isolation
+        checks["source-isolation"] = (git(repo, "rev-parse", "HEAD") == base_sha
+                                      and porcelain(repo) == before)
+    finally:
+        adapter.shutdown()
+
+    verdict = all(checks.values())
+    result = {"gate": "B", "checks": checks, "detail": detail,
+              "verdict": "PASS" if verdict else "FAIL"}
+    ev.write("summary.json", result)
+    ev.log(f"Gate B verdict: {result['verdict']} checks={checks}")
+    return result
+
 # ---------------------------------------------------------------- registry
 
 
@@ -350,6 +554,7 @@ def gate_ev(scratch: Path, name: str) -> Evidence:
 
 GATES = {
     "A": lambda ev, scratch: gate_a(ev, scratch),
+    "B": lambda ev, scratch: gate_b(ev, scratch),
 }
 
 

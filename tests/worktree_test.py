@@ -775,6 +775,94 @@ class LockOwnershipTest(WorktreeTest):
         self.assertTrue(repo_lock.exists(), "用户主仓库的锁绝不能被删除")
 
 
+class DependencyBarrierDurableTest(WorktreeTest):
+    """Gate B hardening: while a PASSED unit awaits integration (a durable
+    in-between state — e.g. held by a test hook or an exotic crash window),
+    an idle scheduler must keep waiting, never declare the DAG
+    unsatisfiable; once it integrates, the dependent proceeds."""
+
+    def test_passed_awaiting_integration_does_not_block_dag(self):
+        from mission import manager as manager_mod
+        mid = self.create()
+        store = self.mgr.store_for(mid)
+        wm = WorktreeManager(str(self.repo), store, mid)
+        info = wm.ensure(0, "单元A")
+        (Path(info["path"]) / "deps").mkdir(exist_ok=True)
+        (Path(info["path"]) / "deps" / "a.txt").write_text("REAL-A\n", "utf-8")
+        self.assertTrue(wm.integrate(0, "单元A", branch=info["branch"])["ok"])
+        wm.cleanup(0, branch=info["branch"])
+        info_b = wm.ensure(1, "单元B")
+        (Path(info_b["path"]) / "deps").mkdir(exist_ok=True)
+        (Path(info_b["path"]) / "deps" / "b.txt").write_text("REAL-B\n", "utf-8")
+        plan = {
+            "version": 2, "replans": 0, "gitIntegration": True,
+            "units": [
+                {"id": "a", "index": 0, "title": "产物A", "description": "",
+                 "acceptance": ["x"], "dependencies": [],
+                 "state": "integrated", "status": "integrated",
+                 "attempt": 1, "repairCount": 0, "conflictCount": 0,
+                 "conflict": None,
+                 "worktree": info, "jobId": None, "delta": None,
+                 "repairDirective": None, "lastVerdict": "PASS",
+                 "integration": {"phase": "cleaned"},
+                 "worker": {"startedAt": 1, "finishedAt": 2}},
+                {"id": "b", "index": 1, "title": "产物B", "description": "",
+                 "acceptance": ["y"], "dependencies": [],
+                 "state": "passed", "status": "passed",
+                 "attempt": 1, "repairCount": 0, "conflictCount": 0,
+                 "conflict": None,
+                 "worktree": info_b,
+                 "jobId": None, "delta": None, "repairDirective": None,
+                 "lastVerdict": "PASS", "integration": None,
+                 "worker": {"startedAt": 1, "finishedAt": 2}},
+                {"id": "c", "index": 2, "title": "合成C", "description": "产出 c.txt",
+                 "acceptance": ["c.txt 存在"], "dependencies": ["a", "b"],
+                 "state": "pending", "status": "pending",
+                 "attempt": 0, "repairCount": 0, "conflictCount": 0,
+                 "conflict": None,
+                 "worktree": {"path": None, "branch": None,
+                              "baseSha": None, "headSha": None},
+                 "jobId": None, "delta": None, "repairDirective": None,
+                 "lastVerdict": None, "integration": None,
+                 "worker": {"startedAt": None, "finishedAt": None}},
+            ],
+        }
+        store.save_plan(plan)
+        store.save_state({"state": "running", "cycles": 2, "currentUnit": 2,
+                          "noProgress": 0, "progressSignature": "",
+                          "tokensUsed": 0, "wallElapsedMs": 0,
+                          "agentActiveMs": 0, "waitingMs": 0, "pausedMs": 0,
+                          "phaseStartedAt": 0})
+        orig = manager_mod.MissionRunner._integrate_harvested
+        hold = {"on": True}
+
+        def holding(self, state, index):
+            if index == 1 and hold["on"]:
+                return "ok"  # keep B passed: the durable in-between window
+            return orig(self, state, index)
+
+        manager_mod.MissionRunner._integrate_harvested = holding
+        try:
+            self.mgr.start(mid)
+            deadline = time.time() + 6
+            while time.time() < deadline:
+                st = (self.mgr.status(mid).get("mission") or {}).get("state")
+                if st in ("blocked", "failed", "cancelled"):
+                    break
+                time.sleep(0.1)
+            st = (self.mgr.status(mid).get("mission") or {}).get("state")
+            self.assertEqual(st, "running",
+                             "B=passed 等待集成期间不得宣判 DAG 死锁（终态=%s）" % st)
+            self.assertEqual(self.plan(mid)["units"][2]["state"], "pending",
+                             "C 在 B 未 integrated 前必须停在 pending")
+            hold["on"] = False  # release: next pass integrates B for real
+            self.assertEqual(self.wait_terminal(mid, timeout=30), "done")
+            final = [u["state"] for u in self.plan(mid)["units"]]
+            self.assertEqual(final, ["integrated"] * 3)
+        finally:
+            manager_mod.MissionRunner._integrate_harvested = orig
+
+
 class ConflictResolverGatesTest(WorktreeTest):
     """M5-C gates: second race during resolve, budget exhaustion, crash
     during the resolver — the resolver always works in the UNIT worktree
