@@ -31,3 +31,9 @@ docs/codex-schema-*/
 
 # Mission engine runtime state (run dirs + id->path index).
 .laomo/
+
+# Gate/dogfood run leftovers: background-job probes and seed files land in
+# the repo root when the workspace under test is the repo itself. Real-project
+# outputs belong under examples/, never in the product tree.
+job-done.txt
+seed.txt
