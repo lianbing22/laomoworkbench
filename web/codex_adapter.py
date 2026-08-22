@@ -1683,13 +1683,16 @@ class CodexRuntimeAdapter:
     _SANDBOX_MAP = {
         "read-only": {"type": "readOnly"},
         "workspace-write": {"type": "workspaceWrite"},
+        # 全自动: same workspace sandbox as missions, but the user is present —
+        # interactive approvals would still stall every command, so never-ask.
+        "full-auto": {"type": "workspaceWrite"},
         "danger-full-access": {"type": "dangerFullAccess"},
     }
 
     def _rpc_commands_execute(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
         args = body.get("args") or {}
         line = str(args.get("line") or body.get("line") or "")
-        m = re.fullmatch(r"\s*/permission\s+(read-only|workspace-write|danger-full-access)\s*", line)
+        m = re.fullmatch(r"\s*/permission\s+(read-only|workspace-write|full-auto|danger-full-access)\s*", line)
         sid = str(args.get("agentId") or body.get("agentId") or "")
         if not m:
             return ok_value({"ok": False, "output": f"codex runtime 不支持该命令: {line.strip()[:60]}"})
@@ -1711,8 +1714,9 @@ class CodexRuntimeAdapter:
         if not perm or perm not in self._SANDBOX_MAP:
             return {}
         params: dict[str, Any] = {"sandboxPolicy": self._SANDBOX_MAP[perm]}
-        # Keep interactive approvals on unless the user asked for full access.
-        params["approvalPolicy"] = "never" if perm == "danger-full-access" else "on-request"
+        # Keep interactive approvals on unless the user asked for an unattended
+        # level: full-auto (sandboxed, never-ask) or danger-full-access.
+        params["approvalPolicy"] = "never" if perm in ("full-auto", "danger-full-access") else "on-request"
         return params
 
     # respond -> answer pending codex server request

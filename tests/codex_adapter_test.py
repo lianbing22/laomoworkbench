@@ -337,6 +337,32 @@ class TestAdapterStatics(unittest.TestCase):
         m, e = adapter._session_model_overrides("s1")
         self.assertEqual((m, e), ("gpt-5.5", "high"))
 
+    def test_full_auto_permission_never_asks_inside_sandbox(self):
+        # 全自动 = the mission runtime's contract for interactive use: the
+        # workspace sandbox stays on, approvals are off so nothing stalls.
+        adapter = CodexRuntimeAdapter(default_cwd="/tmp")
+        adapter.rpc("clean", "commands/execute",
+                    {"agentId": "s1", "line": "/permission full-auto"})
+        params = adapter._sandbox_params("s1")
+        self.assertEqual(params["sandboxPolicy"], {"type": "workspaceWrite"})
+        self.assertEqual(params["approvalPolicy"], "never")
+        # the readback projection and list view must carry the level through
+        self.assertEqual(adapter._permission_view("s1")["currentValue"], "full-auto")
+
+    def test_permission_levels_approval_matrix(self):
+        adapter = CodexRuntimeAdapter(default_cwd="/tmp")
+        for level, sandbox, approval in (
+            # read-only still asks: a blocked command escalates via approval
+            ("read-only", {"type": "readOnly"}, "on-request"),
+            ("workspace-write", {"type": "workspaceWrite"}, "on-request"),
+            ("danger-full-access", {"type": "dangerFullAccess"}, "never"),
+        ):
+            adapter.rpc("clean", "commands/execute",
+                        {"agentId": "s2", "line": f"/permission {level}"})
+            params = adapter._sandbox_params("s2")
+            self.assertEqual(params["sandboxPolicy"], sandbox, level)
+            self.assertEqual(params["approvalPolicy"], approval, level)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

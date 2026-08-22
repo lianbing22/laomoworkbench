@@ -676,7 +676,8 @@ class BoujoyHandler(BaseHTTPRequestHandler):
         if os.environ.get("BOUJOY_DEBUG") == "1":
             super().log_message(fmt, *args)
 
-    def _headers(self, status: int, content_type: str, length: int | None = None) -> None:
+    def _headers(self, status: int, content_type: str, length: int | None = None,
+                 extra_headers: list[tuple[str, str]] | None = None) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Cache-Control", "no-store")
@@ -692,6 +693,8 @@ class BoujoyHandler(BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
             self.send_header("Access-Control-Allow-Headers", "Content-Type")
             self.send_header("Access-Control-Allow-Credentials", "true")
+        for name, value in (extra_headers or []):
+            self.send_header(name, value)
         if length is not None:
             self.send_header("Content-Length", str(length))
         self.end_headers()
@@ -722,6 +725,67 @@ class BoujoyHandler(BaseHTTPRequestHandler):
             return json.loads(self.rfile.read(size) or b"{}")
         except (ValueError, json.JSONDecodeError) as exc:
             raise ValueError("无效请求") from exc
+
+    def _preview_file(self, raw: str) -> None:
+        """Serve agent-produced files from the gateway cwd for preview.
+
+        Agent-built artifacts (chat-written HTML, mission outputs) live in the
+        project directory, outside the static root — the SPA fallback used to
+        swallow those URLs and render the app shell instead, which looked like
+        "the page has no CSS". Paths are confined to the server working
+        directory; responses carry a sandbox CSP so a generated page renders
+        (and its scripts run) in a null origin that can never reach this
+        gateway's APIs."""
+        root = Path.cwd().resolve()
+        raw = str(raw or "").strip() or "."
+        candidate = Path(raw)
+        if not candidate.is_absolute():
+            candidate = root / candidate
+        try:
+            candidate = candidate.resolve()
+            candidate.relative_to(root)
+        except (ValueError, OSError):
+            self._error(403, "forbidden")
+            return
+        if not candidate.exists():
+            self._error(404, "not found")
+            return
+        if candidate.is_dir():
+            self._preview_dir(candidate, root)
+            return
+        try:
+            data = candidate.read_bytes()
+        except OSError:
+            self._error(404, "not found")
+            return
+        content_type = mimetypes.guess_type(candidate.name)[0] or "application/octet-stream"
+        if content_type.startswith("text/") or content_type in {"application/javascript", "application/json"}:
+            content_type += "; charset=utf-8"
+        self._headers(200, content_type, len(data),
+                      extra_headers=[("Content-Security-Policy", "sandbox allow-scripts")])
+        self.wfile.write(data)
+
+    def _preview_dir(self, folder: Path, root: Path) -> None:
+        try:
+            entries = sorted(folder.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
+        except OSError:
+            self._error(404, "not found")
+            return
+        rows = []
+        for entry in entries:
+            if entry.name.startswith("."):
+                continue
+            rel = urllib.parse.quote(str(entry.relative_to(root)))
+            name = html_lib.escape(entry.name) + ("/" if entry.is_dir() else "")
+            rows.append(f'<li><a href="/api/preview?path={rel}">{name}</a></li>')
+        rel_root = html_lib.escape(str(folder.relative_to(root)) or ".")
+        body = (f"<!doctype html><meta charset='utf-8'><title>预览 {rel_root}</title>"
+                f"<body style='font:14px -apple-system,sans-serif;max-width:640px;margin:2rem'>"
+                f"<h3>📁 {rel_root}</h3><ul style='line-height:1.9'>{''.join(rows) or '<li>（空）</li>'}</ul></body>")
+        data = body.encode("utf-8")
+        self._headers(200, "text/html; charset=utf-8", len(data),
+                      extra_headers=[("Content-Security-Policy", "sandbox")])
+        self.wfile.write(data)
 
     def _serve_static(self, url_path: str) -> None:
         relative = urllib.parse.unquote(url_path).lstrip("/") or "index.html"
@@ -1312,6 +1376,9 @@ class BoujoyHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/config":
             self._json({"ok": True, "vaultName": self.config.vault.name})
+            return
+        if path == "/api/preview":
+            self._preview_file(urllib.parse.parse_qs(parsed.query).get("path", [""])[0])
             return
         if path == "/api/access-info":
             # Phone-pairing guide data: LAN IP + access code. The code is only

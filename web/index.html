@@ -10,6 +10,12 @@
   <link rel="icon" type="image/png" sizes="192x192" href="icon-192.png">
   <link rel="apple-touch-icon" href="icon-192.png">
   <link rel="stylesheet" href="app.css">
+  <style>
+    /* Send/stop morph: while a turn is running and the composer is empty, the
+       send button becomes a stop control (its aria-label always promised
+       发送或停止). Typing restores send mode — Enter then queues/steers. */
+    .send-button.stop { background: #e5484d; color: #fff; }
+  </style>
 </head>
 <body>
   <div class="scene" aria-hidden="true">
@@ -149,9 +155,10 @@
                     <select id="modelSelect" class="inline-select model-select" aria-label="模型"><option>读取模型…</option></select>
                     <select id="effortSelect" class="inline-select effort-select" aria-label="推理强度" title="推理强度"><option value="">强度…</option></select>
                     <select id="permissionSelect" class="inline-select" aria-label="权限模式">
-                      <option value="workspace-write">工作区写入</option>
+                      <option value="workspace-write">工作区写入（询问）</option>
+                      <option value="full-auto">全自动（免批准）</option>
                       <option value="read-only">只读</option>
-                      <option value="danger-full-access">完全访问</option>
+                      <option value="danger-full-access">完全访问（无沙箱）</option>
                     </select>
                     <select id="presetSelect" class="inline-select" aria-label="Agent 预设"><option value="">标准模式</option></select>
                   </div>
