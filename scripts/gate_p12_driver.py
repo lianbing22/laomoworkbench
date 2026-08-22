@@ -2662,6 +2662,226 @@ def gate_j(ev: Evidence, scratch: Path) -> dict:
     return result
 
 
+def gate_u(ev: Evidence, scratch: Path) -> dict:
+    """Usability Acceptance Run: created and driven like a normal user would
+    — REAL planner turn (no hand-crafted plan/state), real workers, DAG,
+    parallel slots, machine gate, fresh final evaluator, evidence — then a
+    full hygiene sweep for leaks and residue."""
+    ev.log("Usability Acceptance Run — real planner, full autonomous to DONE")
+    repo = scratch / "fixture-u" / "repo"
+    base_sha = init_fixture(repo)
+    before = porcelain(repo)
+
+    adapter = CodexRuntimeAdapter(bin_path=GATE_BIN, default_cwd=str(repo),
+                                  debug_log=ev.log)
+    tap = TurnTap(ev, adapter)
+    ptap = PromptTap(ev, adapter)
+    mgr = MissionManager(adapter, repo)
+    checks: dict[str, bool] = {}
+    detail: dict = {}
+    try:
+        created = mgr.create(
+            "构建一个小项目，共三个工作单元：单元A 创建 src/a.txt（内容恰好"
+            "一行 A-OK）；单元B 创建 src/b.txt（内容恰好一行 B-OK）；单元C "
+            "依赖单元A和单元B，读取两个文件后生成 src/summary.txt（内容三行："
+            "A-OK、B-OK、SUMMARY-OK）。单元A与B相互独立可并行，单元C 必须等 "
+            "A、B 都完成后再做。除上述文件外不要创建或修改任何其它文件，"
+            "全程不要执行 git 命令。",
+            cwd=str(repo),
+            acceptance_criteria=["src/a.txt、src/b.txt、src/summary.txt "
+                                 "全部存在且内容正确"],
+            options={"maxParallelWorkers": 2},
+            verification={
+                "requiredFiles": ["src/a.txt", "src/b.txt", "src/summary.txt"],
+                "commands": ["grep -q A-OK src/a.txt",
+                             "grep -q B-OK src/b.txt",
+                             "grep -q A-OK src/summary.txt",
+                             "grep -q B-OK src/summary.txt",
+                             "grep -q SUMMARY-OK src/summary.txt"]})
+        mid = created["mission"]["id"]
+        runs = repo / ".laomo" / "runs" / mid
+        ev.log(f"mission {mid} created the normal-user way; starting")
+        mgr.start(mid)  # real planner takes it from here
+
+        deadline = time.monotonic() + MISSION_TIMEOUT
+        state = {}
+        while time.monotonic() < deadline:
+            state = mgr.status(mid)["mission"]
+            if state.get("state") in ("done", "failed", "blocked", "cancelled"):
+                break
+            time.sleep(POLL)
+        ev.log(f"mission terminal: {state.get('state')} "
+               f"(stopReason={state.get('stopReason')})")
+        checks["mission-done"] = state.get("state") == "done"
+
+        plan = json.loads((runs / "plan.json").read_text("utf-8"))
+        units = plan["units"]
+        detail["plannedUnits"] = [
+            {"index": u["index"], "title": u["title"],
+             "deps": u.get("dependencies"),
+             "state": u["state"]} for u in units]
+        checks["real-planner"] = any(
+            "Mission Planner" in (c.get("prompt") or "")
+            for c in ptap.calls)
+        checks["three-units-dag"] = bool(
+            len(units) >= 3
+            and all(u["state"] == "integrated" for u in units)
+            and any(len(u.get("dependencies") or []) == 2 for u in units))
+
+        events = [json.loads(l) for l in
+                  (runs / "events.ndjson").read_text("utf-8").splitlines()
+                  if l.strip()]
+
+        def evts(etype, **kw):
+            out = []
+            for e in events:
+                if e["type"] != etype:
+                    continue
+                d = e.get("detail") if isinstance(e.get("detail"), dict) else {}
+                if all(d.get(k) == v for k, v in kw.items()):
+                    out.append(e)
+            return out
+
+        # dependency barrier held for the C unit (2 deps)
+        c_idx = next((u["index"] for u in units
+                      if len(u.get("dependencies") or []) == 2), None)
+        integ_ts = {e["detail"]["unit"]: e["ts"] for e in
+                    evts("integration", phase="integrated")}
+        c_disp = next((e["ts"] for e in evts("dispatch")
+                       if e["detail"].get("unit") == c_idx), None) \
+            if c_idx is not None else None
+        others = [ts for i, ts in integ_ts.items() if i != c_idx]
+        checks["dependency-barrier"] = bool(
+            c_disp is not None and len(others) >= 2
+            and c_disp >= max(others))
+
+        # serialized integration: no overlapping [start, integrated] windows
+        spans = []
+        starts = {e["detail"]["unit"]: e["ts"] for e in
+                  evts("integration", phase="start")}
+        for i, ts in integ_ts.items():
+            if i in starts and starts[i] <= ts:
+                spans.append((starts[i], ts, i))
+        spans.sort()
+        serialized = all(spans[k][1] <= spans[k + 1][0]
+                         for k in range(len(spans) - 1))
+        checks["serialized-integration"] = bool(spans) and serialized
+        detail["integrationSpans"] = spans
+
+        # real parallel workers: any cross-unit turn pair overlapping > 1s
+        turns = [tap.unit_turns(f"/u{i}") for i in range(len(units))]
+        overlaps = []
+        for a in range(len(turns)):
+            for b in range(a + 1, len(turns)):
+                for ta in turns[a]:
+                    for tb in turns[b]:
+                        ov = overlap(ta, tb)
+                        if ov is not None and ov > 1.0:
+                            overlaps.append(round(ov, 2))
+        checks["real-parallel-workers"] = bool(overlaps)
+        detail["workerOverlapSamples"] = overlaps[:3]
+
+        # machine PASS + final evaluator PASS
+        results = json.loads((runs / "verification" / "results.json")
+                             .read_text("utf-8"))
+        final = json.loads((runs / "verdicts" / "final.json").read_text("utf-8"))
+        checks["machine-verification-pass"] = bool(results.get("passed"))
+        checks["final-evaluator-pass"] = final.get("verdict") == "PASS"
+
+        # evidence manifest complete + hash-correct
+        import hashlib as _hl
+        mpath = runs / "evidence" / "manifest.json"
+        deadline2 = time.monotonic() + 15
+        while time.monotonic() < deadline2 and not mpath.is_file():
+            time.sleep(0.2)
+        manifest = json.loads(mpath.read_text("utf-8")) if mpath.is_file() else {}
+        entries = manifest.get("entries") or {}
+        kinds = {e.get("kind") for e in entries.values()}
+        bad = [r for r, e in entries.items()
+               if not Path(e["path"]).is_file()
+               or (_hl.sha256(Path(e["path"]).read_bytes()).hexdigest()
+                   != e.get("sha256"))]
+        checks["evidence-manifest"] = bool(
+            entries and {"mission", "state", "plan", "verification",
+                         "verdict", "artifact"} <= kinds and not bad)
+        detail["manifestEntries"] = len(entries)
+
+        # hygiene sweep
+        with mgr._lock:
+            pool = mgr._unit_threads.get(mid) or {}
+            unit_leaks = sum(1 for t in pool.values() if t.is_alive())
+            runner = mgr._runners.get(mid)
+            runner_alive = bool(runner and runner.is_alive())
+        jobs_running = [j for j in
+                        (json.loads(p.read_text("utf-8"))
+                         for p in (runs / "jobs").glob("*.json"))
+                        if j.get("status") == "running"] \
+            if (runs / "jobs").is_dir() else []
+        merge_heads = []
+        locks = []
+        wtree_root = repo / ".laomo" / "worktrees" / mid
+        if wtree_root.is_dir():
+            for w in wtree_root.iterdir():
+                if not w.is_dir():
+                    continue
+                if subprocess.run(["git", "-C", str(w), "rev-parse", "-q",
+                                   "--verify", "MERGE_HEAD"],
+                                  capture_output=True).returncode == 0:
+                    merge_heads.append(w.name)
+                gd = subprocess.run(["git", "-C", str(w), "rev-parse",
+                                     "--absolute-git-dir"],
+                                    capture_output=True,
+                                    text=True).stdout.strip()
+                if gd and (Path(gd) / "index.lock").is_file():
+                    locks.append(w.name)
+        with adapter._turns_lock:
+            active_turns = len(adapter._active_turns)
+        checks["no-leaks-or-residue"] = (
+            unit_leaks == 0 and not runner_alive and not jobs_running
+            and not merge_heads and not locks and active_turns == 0)
+        detail["hygiene"] = {"unitThreadLeaks": unit_leaks,
+                             "runnerAlive": runner_alive,
+                             "runningJobs": len(jobs_running),
+                             "mergeHeads": merge_heads, "indexLocks": locks,
+                             "activeCodexTurns": active_turns}
+
+        checks["source-isolation"] = (
+            git(repo, "rev-parse", "HEAD") == base_sha
+            and porcelain(repo) == before)
+
+        # status/list readable now, and by a FRESH control plane
+        ok_status = mgr.status(mid)["mission"].get("state") == "done"
+        listed = any(m.get("id") == mid for m in mgr.list().get("missions", []))
+        adapter2 = CodexRuntimeAdapter(bin_path=GATE_BIN,
+                                       default_cwd=str(repo),
+                                       debug_log=ev.log)
+        try:
+            mgr2 = MissionManager(adapter2, repo)
+            fresh_state = mgr2.status(mid)["mission"].get("state")
+            fresh_listed = any(m.get("id") == mid
+                               for m in mgr2.list().get("missions", []))
+        finally:
+            adapter2.shutdown()
+        checks["status-list-readable"] = bool(ok_status and listed
+                                              and fresh_state == "done"
+                                              and fresh_listed)
+        detail["freshManagerState"] = fresh_state
+        detail["mission"] = {"id": mid, "state": state.get("state"),
+                             "stopReason": state.get("stopReason")}
+    finally:
+        adapter.shutdown()
+
+    verdict = all(checks.values())
+    result = {"gate": "U", "checks": checks, "detail": detail,
+              "verdict": "PASS" if verdict else "FAIL"}
+    ev.write("summary.json", result)
+    ev.log(f"Usability Acceptance Run verdict: {result['verdict']} "
+           f"checks={checks}")
+    return result
+
+
+# ---------------------------------------------------------------- registry
+
 # ---------------------------------------------------------------- registry
 
 # ---------------------------------------------------------------- registry
@@ -2696,6 +2916,7 @@ GATES = {
     "H": lambda ev, scratch: gate_h(ev, scratch),
     "I": lambda ev, scratch: gate_i(ev, scratch),
     "J": lambda ev, scratch: gate_j(ev, scratch),
+    "U": lambda ev, scratch: gate_u(ev, scratch),
 }
 
 
