@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
 import threading
 import time
 import uuid
@@ -12,7 +13,8 @@ from typing import Any, Callable
 
 from .dag import (UNIT_DEP_DONE, UNIT_EVALUATING, UNIT_INTEGRATED,
                   UNIT_INTEGRATING, UNIT_PASSED, UNIT_PENDING, UNIT_READY,
-                  UNIT_REPAIRING, UNIT_RUNNING, UNIT_WAITING, normalize_plan)
+                  UNIT_REPAIRING, UNIT_RUNNING, UNIT_WAITING,
+                  dependency_satisfied, normalize_plan, plan_requires_integration)
 from .jobs import (JobWatcher, _process_identity, _terminate_job_process,
                    job_log_tail)
 from .models import (EVALUATOR_TURN_TIMEOUT, RUNS_DIRNAME, WORKER_TURN_TIMEOUT,
@@ -118,6 +120,23 @@ class MissionRunner(threading.Thread):
         if new_state in TERMINAL_STATES and disk_state == "waiting":
             self.manager.terminate_mission_jobs(self.mission_id, self.store)
 
+    def _verification_workspace(self) -> tuple[str, dict[str, Any] | None]:
+        """M5-B ⑤: the tree final verification and the fresh final evaluator
+        must see — the INTEGRATION workspace for git missions (the user's
+        checked-out branch is never the verified tree), the mission cwd for
+        the non-git P1.1 fallback. Returns (path, info); path is "" when a
+        git repo cannot produce the integration worktree (callers fail
+        closed — never silently verify the user's untouched checkout)."""
+        mission = self.store.load_mission()
+        cwd = str(mission.get("cwd") or os.getcwd())
+        wtree = WorktreeManager(cwd, self.store, self.mission_id)
+        if not wtree.available:
+            return cwd, None
+        info = wtree.ensure_integration(mission.get("baseSha"))
+        if info is None:
+            return "", None
+        return str(info["path"]), info
+
     def _emit_evidence_manifest(self) -> dict[str, Any]:
         """Snapshot the evidence trail (verdicts/verification/checkpoints/
         git diff/artifacts) with path+sha256+generatedAt. Immutable after
@@ -126,6 +145,10 @@ class MissionRunner(threading.Thread):
         if existing:
             return existing
         mission = self.store.load_mission()
+        # tolerant: the manifest is evidence, not a gate — resolve the
+        # integration workspace but never raise inside the done transition
+        workspace, integ_info = self._verification_workspace()
+        workspace = workspace or str(mission.get("cwd") or os.getcwd())
         entries: dict[str, dict[str, Any]] = {}
 
         def add(rel: str, path: Path, kind: str) -> None:
@@ -154,14 +177,15 @@ class MissionRunner(threading.Thread):
         for rel in (mission.get("verification") or {}).get("requiredFiles") or []:
             p = Path(rel)
             if not p.is_absolute():
-                p = Path(str(mission.get("cwd") or os.getcwd())) / p
+                p = Path(workspace) / p
             if p.is_file():
                 add(f"artifact/{rel}", p, "artifact")
             else:
                 entries[f"artifact/{rel}"] = {"path": str(p), "sha256": None,
                                               "generatedAt": _now_ms(),
                                               "kind": "artifact", "size": -1, "missing": True}
-        diff = _git_diff_summary(str(mission.get("cwd") or ""))
+        diff = _git_diff_summary(workspace,
+                                 (integ_info or {}).get("baseSha"))
         if diff:
             p = self.store.evidence_dir / "git-diff.txt"
             try:
@@ -465,6 +489,12 @@ class MissionRunner(threading.Thread):
                         self._transition(state, "failed",
                                          stopReason=f"单元 #{unit['index'] + 1} 集成失败（崩溃恢复重放）")
                         return False
+                    if res == "external-lock":
+                        # fail closed but NOT terminal: the integration waits
+                        # (the user's repo lock is never ours to delete); the
+                        # loop keeps running and reconcile retries with
+                        # backoff until the lock is gone
+                        continue
                 for unit in plan["units"]:
                     if unit.get("state") == UNIT_PASSED:
                         self._integrate_harvested(state, unit["index"])
@@ -479,7 +509,9 @@ class MissionRunner(threading.Thread):
                 with self.store.lock:
                     plan = self.store.load_plan()
                     by_id = {u["id"]: u for u in plan["units"]}
-                    done = {u["id"]: u["state"] in UNIT_DEP_DONE for u in plan["units"]}
+                    done = {u["id"]: dependency_satisfied(
+                        u["state"], plan_requires_integration(plan))
+                        for u in plan["units"]}
                     changed = False
                     for u in plan["units"]:
                         if u["state"] != UNIT_PENDING:
@@ -514,6 +546,12 @@ class MissionRunner(threading.Thread):
                 last = max((u["index"] for u in units), default=0)
                 self._transition(state, "verification", currentUnit=last)
                 return True
+            if any(u.get("state") == UNIT_INTEGRATING for u in units):
+                # an integration is still settling (e.g. external-lock
+                # backoff) — never terminal-block over an in-flight
+                # transaction; the loop retries reconcile
+                time.sleep(0.2)
+                continue
             bad = [u for u in units if u.get("state") == "failed"]
             if bad:
                 self._transition(state, "failed", stopReason=f"单元 #{bad[0]['index'] + 1} 失败")
@@ -636,10 +674,17 @@ class MissionRunner(threading.Thread):
         * anything else (crash before the merge, dirty tree, legacy record)
           => replay the idempotent integrate (commit-if-needed + merge;
           re-merging an already-merged branch is "Already up to date").
+          An EXTERNAL git lock in the user's repo blocks the replay (fail
+          closed, lock never deleted) — "external-lock" is retried with
+          backoff; the mission stays alive and resumes once it clears.
         """
         unit = self._unit(index)
         if unit is None:
             return "failed"
+        tx = dict(unit.get("integration") or {})
+        if tx.get("phase") == "external-lock" \
+                and _now_ms() - int(tx.get("externalLockAt") or 0) < 5000:
+            return "external-lock"  # backoff: retry the probe every ~5s
         mission = self.store.load_mission()
         wtree = WorktreeManager(str(mission.get("cwd") or os.getcwd()),
                                 self.store, self.mission_id)
@@ -654,15 +699,30 @@ class MissionRunner(threading.Thread):
                                              "reconciled": True,
                                              "reason": "worktree 不存在"})
             return "failed"
-        removed = wtree.clear_stale_locks(
+        report = wtree.clear_stale_locks(
             [Path(str(info["path"])), wtree.workspace])
-        if removed:
+        if report.get("removed") or report.get("external"):
             self.store.event("integration", {"unit": index,
                                              "phase": "cleared-stale-locks",
-                                             "locks": removed})
+                                             "removed": report.get("removed") or [],
+                                             "external": report.get("external") or []})
+        if report.get("external"):
+            # ownership-aware fail-closed: a lock in the USER's repo is never
+            # ours to delete (another tool may be mid-operation). The
+            # integration waits; reconcile retries with backoff and proceeds
+            # automatically once the lock is gone.
+            unit["integration"] = {**tx, "phase": "external-lock",
+                                   "externalLockAt": _now_ms()}
+            self._save_unit(unit)
+            self.store.event("integration", {"unit": index,
+                                             "phase": "external-lock",
+                                             "reconciled": True,
+                                             "locks": report["external"]})
+            return "external-lock"
         if tx.get("unitHead") and not tx.get("dirty") \
                 and wtree.is_merged(str(tx["unitHead"])):
-            head = wtree.rev(wtree.workspace)
+            head = wtree.rev(wtree.integration_dir()) \
+                or wtree.rev(wtree.workspace)
             unit["integration"] = {**tx, "phase": "merged", "headSha": head,
                                    "finishedAt": _now_ms(), "reconciled": True}
             unit["state"] = unit["status"] = "integrated"
@@ -718,7 +778,12 @@ class MissionRunner(threading.Thread):
         if not units:
             self._transition(state, "failed", stopReason="planner 未产出有效单元")
             return False
-        plan = {"version": 2, "units": units, "replans": 0}
+        wtree = WorktreeManager(str(mission.get("cwd") or os.getcwd()),
+                                self.store, self.mission_id)
+        plan = {"version": 2, "units": units, "replans": 0,
+                # M5-B: git 使命的依赖门要求 dep=INTEGRATED（bare PASS 不再
+                # 满足依赖）；非 git 回退仍按 passed 计。见 dag.dependency_satisfied
+                "gitIntegration": bool(wtree.available)}
         self.store.save_plan(plan)
         self.store.event("planning", {"units": len(units), "dag": notes})
         first = self._next_pending(plan, current=-1)
@@ -743,15 +808,19 @@ class MissionRunner(threading.Thread):
 
     @staticmethod
     def _next_pending(plan_index: dict[str, Any], current: int) -> int | None:
-        """Next runnable unit: pending + all dependencies passed/integrated.
-        Backward-compatible fallback for broken graphs (unknown dep ids)."""
+        """Next runnable unit: pending + all dependencies satisfied. Git
+        missions additionally require the dep to be INTEGRATED (M5-B);
+        non-git fallback counts a bare PASS. Backward-compatible fallback
+        for broken graphs (unknown dep ids)."""
         by_id = {u["id"]: u for u in plan_index["units"]}
         statuses = {u["id"]: (u.get("state") or u.get("status")) for u in plan_index["units"]}
         for u in plan_index["units"]:
             if u["status"] != "pending" or u["index"] == current:
                 continue
             deps = [d for d in (u.get("dependencies") or []) if d in by_id]
-            if all(statuses.get(d) in ("passed", "integrated") for d in deps):
+            if all(dependency_satisfied(statuses.get(d),
+                                        plan_requires_integration(plan_index))
+                   for d in deps):
                 return u["index"]
         for u in plan_index["units"]:
             if u["status"] == "pending" and u["index"] != current:
@@ -801,9 +870,18 @@ class MissionRunner(threading.Thread):
     def _phase_verification(self, state: dict[str, Any]) -> bool:
         """Harness Verification Gate — machine-only, no model turn. A failing
         gate sends the mission back to repair; it can never reach DONE."""
+        workspace, _ = self._verification_workspace()
+        if not workspace:
+            # fail closed: a git mission whose integration worktree cannot be
+            # produced must never verify (or DONE) against the user's
+            # untouched checkout
+            self.store.event("verification", {"skipped": "integration-unavailable"})
+            self._transition(state, "failed",
+                             stopReason="集成工作区不可用（git 仓库但 integration worktree 创建失败）")
+            return False
         mission = self.store.load_mission()
         gateway = VerificationRunner(self.store, mission.get("verification") or {},
-                                     str(mission.get("cwd") or os.getcwd()))
+                                     workspace)
         result = gateway.run()
         disk = self.store.load_state()
         disk["verifyResult"] = "pass" if result["passed"] else "fail"
@@ -835,19 +913,28 @@ class MissionRunner(threading.Thread):
             self.store.event("final-verdict", {"gate": "machine-not-passed"})
             self._transition(state, "verification")
             return True
+        workspace, _ = self._verification_workspace()
+        if not workspace:
+            # same fail-closed rule as the machine gate: the fresh final
+            # evaluator must see the integration tree or the mission stops
+            self.store.event("final-verdict", {"gate": "integration-unavailable"})
+            self._transition(state, "failed",
+                             stopReason="集成工作区不可用（最终验收拒绝在用户工作区上执行）")
+            return False
         criteria = mission.get("acceptanceCriteria") or []
         for u in plan["units"]:
             criteria.extend(u.get("acceptance") or [])
         prompt = (
             "你是最终验收员（Final Evaluator）。只读沙箱，逐条核验全部验收标准。\n"
-            f"目标：{mission.get('objective')}\n工作区：{mission.get('cwd')}\n"
+            f"目标：{mission.get('objective')}\n工作区：{workspace}\n"
             "全部验收标准：\n- " + "\n- ".join(criteria) + "\n"
             "可运行测试与只读检查。末尾必须输出：\n"
             "<<<LAOMO_VERDICT\n"
             '{"verdict":"PASS|NEEDS_WORK|BLOCKED","reasons":["..."],"repair":"..."}'
             "\nLAOMO_VERDICT>>>"
         )
-        result = self._turn(state, prompt, read_only=True, timeout=EVALUATOR_TURN_TIMEOUT)
+        result = self._turn(state, prompt, read_only=True,
+                            timeout=EVALUATOR_TURN_TIMEOUT, cwd=workspace)
         verdict = parse_json_marker(result.get("text") or "", _VERDICT_RE)
         if not isinstance(verdict, dict) or verdict.get("verdict") not in ("PASS", "NEEDS_WORK", "BLOCKED"):
             verdict = {"verdict": "NEEDS_WORK", "reasons": ["final evaluator 输出不可解析（default-fail）"],
@@ -1045,8 +1132,17 @@ class MissionManager:
         writes under verification/ but never touches mission state."""
         store = self.store_for(mission_id)
         mission = store.load_mission()
+        cwd = str(mission.get("cwd") or os.getcwd())
+        wtree = WorktreeManager(cwd, store, mission_id)
+        workspace = cwd
+        if wtree.available:
+            info = wtree.ensure_integration(mission.get("baseSha"))
+            if info is None:
+                # fail closed: never re-run the gate against the wrong tree
+                return {"ok": False, "error": "integration worktree unavailable"}
+            workspace = str(info["path"])
         gateway = VerificationRunner(store, mission.get("verification") or {},
-                                     str(mission.get("cwd") or os.getcwd()))
+                                     workspace)
         return {"ok": True, "result": gateway.run()}
 
     # -- lifecycle --
@@ -1068,6 +1164,7 @@ class MissionManager:
             "cwd": run_cwd, "options": options or {},
             "verification": verification or {},
             "createdAt": _now_ms(),
+            **self._git_base_probe(run_cwd),
         })
         store.save_state({"state": "draft", "cycles": 0, "currentUnit": 0,
                           "noProgress": 0, "progressSignature": "", "tokensUsed": 0,
@@ -1083,6 +1180,33 @@ class MissionManager:
                     continue
                 if runner.is_alive():
                     raise MissionError("已有正在运行的 Mission，先暂停或结束它", "busy")
+
+    @staticmethod
+    def _git_base_probe(cwd: str) -> dict[str, str | None]:
+        """M5-B ①: snapshot the user's repo at mission CREATION. The mission
+        builds from this exact base — the integration branch is cut from
+        baseSha and the user's checked-out branch is never touched. Tolerant:
+        non-git cwd (or empty repo) returns {} and the mission keeps the
+        P1.1 non-git behavior."""
+        try:
+            top = subprocess.run(["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+                                 capture_output=True, text=True, timeout=10)
+            if top.returncode != 0:
+                return {}
+            out: dict[str, str | None] = {}
+            sha = subprocess.run(["git", "-C", cwd, "rev-parse", "HEAD"],
+                                 capture_output=True, text=True, timeout=10)
+            if sha.returncode == 0 and sha.stdout.strip():
+                out["baseSha"] = sha.stdout.strip()
+            branch = subprocess.run(["git", "-C", cwd, "rev-parse",
+                                     "--abbrev-ref", "HEAD"],
+                                    capture_output=True, text=True, timeout=10)
+            if branch.returncode == 0:
+                name = branch.stdout.strip()
+                out["sourceBranch"] = name if name and name != "HEAD" else None
+            return out
+        except (OSError, subprocess.TimeoutExpired):
+            return {}
 
     def _reap_runner(self, mission_id: str, timeout: float = 5.0) -> None:
         """A paused runner exits asynchronously; reap it before respawn."""

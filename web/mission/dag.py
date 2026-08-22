@@ -36,6 +36,27 @@ UNIT_ACTIVE = {UNIT_READY, UNIT_RUNNING, UNIT_WAITING, UNIT_EVALUATING,
 UNIT_DEP_DONE = {UNIT_PASSED, UNIT_INTEGRATED}
 
 
+def dependency_satisfied(dep_state: str, require_integrated: bool) -> bool:
+    """Dependency gate for dispatching a dependent unit. With
+    require_integrated (git missions: worktrees + serial integration) the
+    dep must be INTEGRATED — a bare evaluator PASS is not enough, the
+    work must have landed on the integration branch. Without it (non-git
+    P1.1 fallback, integration is a no-op) a PASS counts as done."""
+    return dep_state in UNIT_DEP_DONE and (not require_integrated
+                                           or dep_state == UNIT_INTEGRATED)
+
+
+def plan_requires_integration(plan: dict) -> bool:
+    """True when the plan runs in git integration mode (per-unit worktrees +
+    serial integration into an integration branch), where a dependency only
+    satisfies dependents once INTEGRATED. Contract: the MissionManager stamps
+    ``plan["gitIntegration"] = wtree.available`` at planning time (planning
+    phase, before the first dispatch); this helper only reads that flag and
+    defaults to False — no flag / False means the non-git P1.1 fallback in
+    which integration is a no-op and a PASS satisfies dependents."""
+    return bool(plan.get("gitIntegration"))
+
+
 def slugify(title: str) -> str:
     s = re.sub(r"[^A-Za-z0-9]+", "-", (title or "").strip().lower()).strip("-")
     return s[:32]

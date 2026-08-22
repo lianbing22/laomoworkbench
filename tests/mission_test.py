@@ -1125,6 +1125,39 @@ class TestHarnessVerificationGate(MissionLoopTest):
         results = self.read_json(self.sub_files(mid, "verification", "results.json")[0])
         self.assertTrue(results["checks"][0]["passed"] and results["checks"][0]["kind"] == "http")
 
+    def test_38_non_git_mission_verifies_in_mission_cwd(self):
+        """M5-B ⑤ 回退契约：非 git 工作区的机器门禁与 final evaluator 仍以
+        mission cwd 为准（门禁摘要记录 cwd 作为证据），不创建 integration
+        worktree、不产生 integration 事件。"""
+        marker = self.root / "marker.txt"
+
+        def plant(prompt):
+            marker.write_text("ok", encoding="utf-8")
+            return handoff_text()
+
+        self.adapter.script("worker", plant)
+        self.adapter.set_default("evaluator", verdict_block("PASS", ["条件满足"]))
+        mid = self.create_mission(cwd=str(self.root), verification={
+            "commands": ["test -f marker.txt"], "requiredFiles": ["marker.txt"]})
+        self.mgr.start(mid)
+        self.assertTrue(self.wait_state(self.mgr, mid, ["done"], timeout=30),
+                        "非 git 回退应照常 DONE，实际: %s" % self.state_vals(self.mgr, mid)
+                        + " | " + self.stop_reason(self.mgr, mid))
+        results = self.read_json(self.sub_files(mid, "verification", "results.json")[0])
+        self.assertEqual(results.get("cwd"), str(self.root.resolve()),
+                         "门禁摘要必须记录实际运行的 cwd（证据化）")
+        final_calls = self.adapter.calls_for("evaluator")
+        self.assertTrue(final_calls, "final evaluator 应已运行")
+        last = final_calls[-1]
+        self.assertEqual(last["cwd"], str(self.root.resolve()),
+                         "非 git 使命的 final evaluator cwd 应为 mission cwd")
+        self.assertIn(f"工作区：{last['cwd']}", last["prompt"])
+        self.assertFalse((self.mdir(mid).parent.parent / "worktrees" / mid
+                          / "integration").is_dir(),
+                         "非 git 使命不得创建 integration worktree")
+        kinds = {e["type"] for e in self.read_ndjson(self.mdir(mid) / "events.ndjson")}
+        self.assertNotIn("integration", kinds)
+
 
 class TestEvidenceManifest(MissionLoopTest):
     def test_26_manifest_at_done_with_hashes_immutable(self):

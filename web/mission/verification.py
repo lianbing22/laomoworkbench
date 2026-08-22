@@ -40,7 +40,11 @@ class VerificationRunner:
         checks = (self._run_commands() + self._check_files() + self._check_http())
         passed = all(c.get("passed") for c in checks)
         summary = {"passed": passed, "checks": checks,
-                   "startedAt": started, "endedAt": _now_ms()}
+                   "startedAt": started, "endedAt": _now_ms(),
+                   # M5-B: prove WHICH tree the gate ran against (the
+                   # integration workspace for git missions, mission cwd
+                   # otherwise) — verifiable evidence, not a guess.
+                   "cwd": self.cwd}
         summary["resultHash"] = hashlib.sha256(json.dumps(
             [c.get("resultHash") or "" for c in checks], sort_keys=True).encode()).hexdigest()[:16]
         self.store.verification_dir.mkdir(parents=True, exist_ok=True)
@@ -141,10 +145,15 @@ class VerificationRunner:
         return out
 
 
-def _git_diff_summary(cwd: str) -> str | None:
+def _git_diff_summary(cwd: str, base_ref: str | None = None) -> str | None:
+    """Uncommitted diff of `cwd` (P1.1 evidence), or — with base_ref (M5-B
+    integration missions) — the committed diff base_ref..HEAD, which is the
+    honest summary of what the mission's integration branch carries."""
+    args = ["git", "-C", cwd, "diff", "--stat"]
+    if base_ref:
+        args.append(f"{base_ref}..HEAD")
     try:
-        out = subprocess.run(["git", "-C", cwd, "diff", "--stat"],
-                             capture_output=True, text=True, timeout=10)
+        out = subprocess.run(args, capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.TimeoutExpired):
         return None
     text = (out.stdout or "").strip()

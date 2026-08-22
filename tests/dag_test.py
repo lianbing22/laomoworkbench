@@ -21,6 +21,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "web"))
 MISSION_IMPORT_ERROR = None
 try:
     from mission import MissionError, MissionManager, normalize_plan  # noqa: E402
+    from mission.dag import dependency_satisfied, plan_requires_integration  # noqa: E402
+    from mission.dag import (UNIT_BLOCKED, UNIT_CANCELLED, UNIT_CONFLICT,  # noqa: E402
+                             UNIT_EVALUATING, UNIT_FAILED, UNIT_INTEGRATED,
+                             UNIT_INTEGRATING, UNIT_PASSED, UNIT_PENDING,
+                             UNIT_READY, UNIT_REPAIRING, UNIT_RUNNING,
+                             UNIT_WAITING)
 except Exception as _exc:  # mainline module not merged yet
     MISSION_IMPORT_ERROR = _exc
 
@@ -28,6 +34,12 @@ except Exception as _exc:  # mainline module not merged yet
         pass
 
     def normalize_plan(*a, **k):  # type: ignore[no-redef]
+        raise RuntimeError("mission package unavailable")
+
+    def dependency_satisfied(*a, **k):  # type: ignore[no-redef]
+        raise RuntimeError("mission package unavailable")
+
+    def plan_requires_integration(*a, **k):  # type: ignore[no-redef]
         raise RuntimeError("mission package unavailable")
 
 POLL_TIMEOUT = 15.0
@@ -164,6 +176,55 @@ class DagNormalizeTest(unittest.TestCase):
             existing=existing)
         self.assertEqual(added[0]["dependencies"], ["schema", "backend"])
         self.assertEqual(notes, [])
+
+    def test_normalized_units_round_trip_with_dependencies(self):
+        # regression guard: units emitted by normalize_plan (id/title/deps)
+        # can be fed straight back through the planner path and keep their
+        # ids and dependency edges.
+        raw = [{"id": "a", "title": "单元A"},
+               {"id": "b", "title": "单元B", "dependencies": ["a"]},
+               {"id": "c", "title": "单元C", "dependencies": ["单元B"]}]
+        units, _ = normalize_plan(raw)
+        again, notes = normalize_plan(
+            [{"id": u["id"], "title": u["title"],
+              "dependencies": list(u["dependencies"])} for u in units])
+        self.assertEqual(notes, [])
+        self.assertEqual([u["id"] for u in again], ["a", "b", "c"])
+        self.assertEqual({u["id"]: u["dependencies"] for u in again},
+                         {"a": [], "b": ["a"], "c": ["b"]})
+
+
+class DependencyGateTest(unittest.TestCase):
+    """M5-B: dependency satisfied = integrated on git missions (worktrees +
+    serial integration); a bare evaluator PASS only counts in the non-git
+    P1.1 fallback where integration is a no-op."""
+
+    @staticmethod
+    def all_unit_states():
+        return (UNIT_PENDING, UNIT_READY, UNIT_RUNNING, UNIT_WAITING,
+                UNIT_EVALUATING, UNIT_REPAIRING, UNIT_PASSED, UNIT_INTEGRATING,
+                UNIT_INTEGRATED, UNIT_CONFLICT, UNIT_BLOCKED, UNIT_FAILED,
+                UNIT_CANCELLED)
+
+    def test_git_mode_only_integrated_satisfies(self):
+        for state in self.all_unit_states():
+            self.assertIs(dependency_satisfied(state, True),
+                          state == UNIT_INTEGRATED, msg=state)
+        # the M5-B gate: a bare evaluator PASS must NOT satisfy a dependent
+        # in git mode — the work must land on the integration branch.
+        self.assertIs(dependency_satisfied(UNIT_PASSED, True), False)
+
+    def test_non_git_mode_passed_counts(self):
+        for state in self.all_unit_states():
+            self.assertIs(dependency_satisfied(state, False),
+                          state in (UNIT_PASSED, UNIT_INTEGRATED), msg=state)
+        self.assertIs(dependency_satisfied(UNIT_PASSED, False), True)
+        self.assertIs(dependency_satisfied(UNIT_INTEGRATED, False), True)
+
+    def test_plan_requires_integration_reads_flag(self):
+        self.assertIs(plan_requires_integration({}), False)
+        self.assertIs(plan_requires_integration({"gitIntegration": True}), True)
+        self.assertIs(plan_requires_integration({"gitIntegration": False}), False)
 
 
 # ------------------------------------------------------------------ flow
