@@ -6,6 +6,7 @@
 
 <p>
   <a href="README_EN.md">English</a> ·
+  <a href="docs/status.md">Status</a> ·
   <a href="docs/mission-contract.md">Mission Contract</a> ·
   <a href="docs/provider-contract.md">Provider Contract</a> ·
   <a href="docs/codex-protocol-notes.md">Codex Protocol Notes</a> ·
@@ -114,15 +115,14 @@ web/boujoy_server.py  本地网关（Python 标准库，无第三方依赖）
 
 ## 测试与质量门禁
 
-- 单元/集成测试：**166 项全绿**（`/usr/bin/python3 -m pytest tests/ -q`，仓库根执行）
-- 真实 Codex 门禁（`scripts/gate_p12_driver.py`、`scripts/gate_p12_runtime_concurrency.py`）：Gate 0/A/B/C/D/E/F/G/H/I/J + Usability 验收**全部 PASS**，覆盖并行执行、依赖屏障、冲突解决、长任务等待-唤醒、暂停恢复、取消中断、SIGKILL 崩溃恢复、集成事务楔死恢复、机器验收修复、终评排序与证据清单
+- **自动化测试（CI 可跑，无需真实模型）**：166 项全绿（pytest 为开发依赖：`python3 -m pytest tests/ -q`；工作台运行时本体仅用 Python 标准库、零第三方依赖）
+- **真实运行时认证（manual / local certification）**：`scripts/gate_p12_driver.py`、`scripts/gate_p12_runtime_concurrency.py`（需真实 Codex 登录，不进普通 CI）：Gate 0/A–J + Usability 验收**全部 PASS**，覆盖并行执行、依赖屏障、冲突解决、长任务等待-唤醒、暂停恢复、取消中断、SIGKILL 崩溃恢复、集成事务楔死恢复、机器验收修复、终评排序与证据清单
 - 纪律：门禁先真跑、相信证据、FAIL 即冻结分类（驱动/夹具/环境/产品），只有产品缺陷才改产品代码
 
 ## 项目状态
 
-- **P0/P0.5/P1/P1.1/P1.2 全部完成** —— 判定：LAOMO WORKBENCH — USABLE
-- 当前阶段：**3 个真实项目试运行**（参数锁定：`maxParallelWorkers=2`、3–6 单元、30min–2h、机器验收必选、禁生产/部署/迁移权限、DONE 后人工复核证据与集成 diff）
-- 排期中：Gate K 压力重复、文档同步、H2 冲突中崩溃真实门禁
+- **P0/P0.5/P1/P1.1/P1.2 全部完成 —— 判定：LAOMO WORKBENCH — USABLE**
+- 当前阶段：**真实项目试运行（dogfood）**，之后毕业压测（Gate K）与 H2；阶段台账、测试计数与逐门禁结论见 **[docs/status.md](docs/status.md)（状态单一事实源）**
 
 ## 安全模型
 

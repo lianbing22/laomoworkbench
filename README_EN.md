@@ -84,11 +84,11 @@ On-disk state: mission runs under `<workspace>/.laomo/runs/<id>/`; host state (p
 
 ## Testing & gates
 
-166 tests green (`/usr/bin/python3 -m pytest tests/ -q` from the repo root). Real-Codex gates (`scripts/gate_p12_driver.py`, `scripts/gate_p12_runtime_concurrency.py`) — 0/A/B/C/D/E/F/G/H/I/J plus the Usability acceptance run — all PASS: parallel workers, dependency barriers, conflict resolution, long-job wait–wake, pause/resume, cancel/interrupt, SIGKILL crash recovery, integration-WAL wedge recovery, machine-verify repair, final-evaluation ordering, evidence manifests.
+**Automated tests (CI-runnable, no real model needed):** 166 green — pytest is a dev dependency (`python3 -m pytest tests/ -q`); the workbench runtime itself uses only the Python standard library, zero third-party dependencies. **Real-runtime certification (manual / local, requires a real Codex login):** `scripts/gate_p12_driver.py`, `scripts/gate_p12_runtime_concurrency.py` — Gates 0/A–J plus the Usability acceptance run, all PASS: parallel workers, dependency barriers, conflict resolution, long-job wait–wake, pause/resume, cancel/interrupt, SIGKILL crash recovery, integration-WAL wedge recovery, machine-verify repair, final-evaluation ordering, evidence manifests.
 
 ## Status
 
-P0/P0.5/P1/P1.1/P1.2 complete — verdict: LAOMO WORKBENCH — USABLE. Currently in the real-projects phase (locked params: `maxParallelWorkers=2`, 3–6 units, 30min–2h, machine verification mandatory, no prod/deploy/migration permissions, human reviews evidence after each DONE). Upcoming: Gate K stress, docs sync, H2 mid-conflict crash gate.
+P0/P0.5/P1/P1.1/P1.2 complete — verdict: LAOMO WORKBENCH — USABLE. Currently in the real-projects (dogfood) phase; Gate K stress and H2 follow once it stabilizes. Stage ledger, test counts, and per-gate results live in [docs/status.md](docs/status.md) — the single source of truth for status.
 
 ## Security model
 

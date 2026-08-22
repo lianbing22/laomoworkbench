@@ -1,7 +1,8 @@
 # 更新日志
 
 本文件记录 `lianbing22/laomoworkbench` 自品牌化以来的全部功能更新。协议细节见
-[docs/codex-protocol-notes.md](docs/codex-protocol-notes.md)，P1 待办见 [P1_NOTES.md](P1_NOTES.md)。
+[docs/codex-protocol-notes.md](docs/codex-protocol-notes.md)，当前阶段状态与排期见
+[docs/status.md](docs/status.md)。
 
 ## 2026-08-22（二）— P0.5 Model Provider Profiles（多 agent 并行实施）
 
