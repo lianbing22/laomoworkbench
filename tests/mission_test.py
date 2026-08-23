@@ -1634,7 +1634,9 @@ class TestCancelInterruptPropagation(MissionLoopTest):
 
         def slow(prompt):
             calls["worker_started"] = True
-            calls["stalled"].wait(timeout=30)  # blocks inside run_turn
+            calls["stalled"].wait(timeout=90)  # blocks inside run_turn; far
+            # beyond the wall budget so ONLY the directed interrupt can
+            # unblock it in time (never a coincidental self-timeout)
             return handoff_text()
 
         adapter.script("planner", plan_block(sample_units(1)))
@@ -1677,25 +1679,35 @@ class TestCancelInterruptPropagation(MissionLoopTest):
 
         def slow(prompt):
             calls["worker_started"] = True
-            calls["stalled"].wait(timeout=30)  # blocks inside run_turn
+            calls["stalled"].wait(timeout=90)  # blocks inside run_turn; far
+            # beyond the wall budget so ONLY the directed interrupt can
+            # unblock it in time (never a coincidental self-timeout)
             return handoff_text()
 
         adapter.script("planner", plan_block(sample_units(1)))
         adapter.script("worker", slow)
         adapter.set_default("evaluator", verdict_block("PASS", ["ok"]))
         mgr = MissionManager(adapter, self.root)
+        # 15s budget: high enough that a starved CI runner's planning phase
+        # cannot exhaust it before dispatch (the 3s original could), low
+        # enough that slow()'s 90s self-timeout can never coincide with it.
         mid = mission_id_of(mgr.create("obj", acceptance_criteria=["a"],
-                                       options={"maxWallTimeSec": 3}))
+                                       options={"maxWallTimeSec": 15}))
         self.track(mid, mgr=mgr)
         mgr.start(mid)
         self.assertTrue(self.wait_until(
             lambda: calls["worker_started"], timeout=15),
             "worker turn 应已进入运行（wall 预算内）")
         # wall budget trips while the worker turn is still in flight
-        self.assertTrue(self.wait_state(mgr, mid, ["failed"], timeout=30),
+        self.assertTrue(self.wait_state(mgr, mid, ["failed"], timeout=90),
                         "maxWallTime 应在 turn 进行中触发终态")
+        # the terminal transition lands on disk a few ms BEFORE run()'s
+        # finally reap fires the interrupt — waiting for the reaper (not
+        # asserting immediately) is the race-free contract check
+        self.assertTrue(self.wait_until(lambda: calls["interrupt"] >= 1, timeout=15),
+                        "policy 终态必须像 cancel 一样定向 interrupt in-flight turn")
         self.assertEqual(calls["interrupt"], 1,
-                         "policy 终态必须像 cancel 一样定向 interrupt in-flight turn")
+                         "interrupt 恰好一次（重复收割也是缺陷）")
         # the reaper must end the unit thread (bounded) — no zombie workers
         def unit_threads_dead():
             with mgr._lock:
