@@ -1,0 +1,12 @@
+{
+  "project": "#2 CodexPlusPlus (new-feature nature)",
+  "repo": "/Users/lianb/Desktop/CodexPlusPlus",
+  "preDogfoodHead": "9a84e83",
+  "preDogfoodBranch": "main",
+  "preDogfoodPorcelain": [],
+  "baselineTests": "215 passed (python3.11 -m pytest tests/ -q, 10-14s)",
+  "verificationCommand": "/opt/homebrew/bin/python3.11 -m pytest tests/ -q",
+  "verificationSetupBurden": "MEDIUM",
+  "burdenReason": "pytest as machine gate was obvious, BUT proving the gate tests the integration worktree (not the user's editable-install checkout) required a copy+canary sabotage experiment; a naive operator would not know this hazard exists",
+  "canaryEvidence": "copy-of-repo sabotage -> 20 errors in copy; original stayed clean"
+}

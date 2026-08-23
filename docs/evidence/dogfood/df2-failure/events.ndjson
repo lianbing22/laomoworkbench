@@ -1,0 +1,18 @@
+{"ts": 1787441995614, "type": "created", "detail": {"objective": "为 Codex++ 新增 stats 子命令（codex_session_delete stats）：扫描本机 Codex 会话数据（rollouts），输出会话统计报告。默认输出人读文本：总会话数、按日期（天）的会话分布、按模型的会话分布", "cwd": "/Users/lianb/Desktop/CodexPlusPlus"}}
+{"ts": 1787442003999, "type": "start", "detail": null}
+{"ts": 1787442004001, "type": "runner", "detail": "started"}
+{"ts": 1787442030665, "type": "turn", "detail": {"ok": true, "elapsedMs": 26663, "tokens": 21224, "error": ""}}
+{"ts": 1787442030681, "type": "planning", "detail": {"units": 4, "dag": []}}
+{"ts": 1787442030682, "type": "transition", "detail": {"state": "running", "currentUnit": 0}}
+{"ts": 1787442030684, "type": "dispatch", "detail": {"unit": 0, "lease": "e6202abf"}}
+{"ts": 1787442391394, "type": "turn", "detail": {"ok": true, "elapsedMs": 360551, "tokens": 131885, "error": ""}}
+{"ts": 1787442391409, "type": "transition", "detail": {"state": "evaluating"}}
+{"ts": 1787442644274, "type": "turn", "detail": {"ok": true, "elapsedMs": 252864, "tokens": 95549, "error": ""}}
+{"ts": 1787442644275, "type": "verdict", "detail": {"unit": 0, "verdict": "PASS", "reasons": ["现状审计与会话数据契约已完整记录", "入口、目录筛选、字段提取、统计结构和容错规则与源码及本机 rollout 结构核对一致", "现有测试基线和测试入口已记录并部分复验"]}}
+{"ts": 1787442644368, "type": "integration", "detail": {"unit": 0, "phase": "start", "branch": "laomo/20260823-073955-5c03aa/u0", "baseSha": "9a84e83300651e3f674577b493f0dcc50db29ea5", "txUnitHead": "9a84e83300651e3f674577b493f0dcc50db29ea5"}}
+{"ts": 1787442644536, "type": "integration", "detail": {"unit": 0, "phase": "integrated", "branch": "laomo/20260823-073955-5c03aa/u0", "headSha": "351ec438ed42fc7bb894c188500f3972d9c75a5e"}}
+{"ts": 1787442644587, "type": "transition", "detail": {"state": "running", "currentUnit": 0}}
+{"ts": 1787442644589, "type": "dispatch", "detail": {"unit": 1, "lease": "2f69fff0"}}
+{"ts": 1787450191026, "type": "transition", "detail": {"state": "failed", "stopReason": "maxWallTime 达到上限（7200s，不含暂停）"}}
+{"ts": 1787450191028, "type": "runner", "detail": "exited"}
+{"ts": 1787460502077, "type": "turn", "detail": {"ok": true, "discarded": "terminal"}}

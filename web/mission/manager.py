@@ -255,8 +255,41 @@ class MissionRunner(threading.Thread):
                 self._transition(state, "failed", stopReason=f"runner 异常: {exc!r}")
             self.store.event("runner", f"crashed: {exc!r}")
         finally:
+            self._reap_unit_threads_on_terminal()
             self.manager.on_runner_exit(self.mission_id)
             self.store.event("runner", "exited")
+
+    def _reap_unit_threads_on_terminal(self) -> None:
+        """Contract: after a terminal transition NO runner/watcher/unit
+        threads may keep working. StopPolicy failures (maxWallTime…) fire
+        while unit worker turns are still in flight — without a directed
+        interrupt those real codex turns keep running for hours after the
+        user saw the terminal state, writing into a dead mission's worktrees
+        and burning tokens (dogfood #2: a 5h turn kept working 2h52m past
+        `failed`). Mirror cancel()'s Gate F sweep, bounded so a wedged thread
+        can never hold the runner exit hostage."""
+        state = self._state()
+        if state.get("state") not in TERMINAL_STATES:
+            return
+        with self.manager._lock:
+            pool = dict(self.manager._unit_threads.get(self.mission_id) or {})
+        live = [t for t in pool.values()
+                if t.is_alive() and t is not threading.current_thread()]
+        if not live:
+            return
+        interrupt_fn = getattr(self.manager.adapter, "interrupt_active_turns", None)
+        if callable(interrupt_fn):
+            try:
+                interrupt_fn(max_wait=10.0)
+            except Exception as exc:  # reaping must never wedge the exit
+                self.store.event("terminal-reap",
+                                 f"turn interrupt error: {str(exc)[:160]}")
+        for thread in live:
+            thread.join(timeout=15.0)
+        leaked = [t for t in live if t.is_alive()]
+        self.store.event("terminal-reap", {"threads": len(live),
+                                           "leaked": len(leaked),
+                                           "state": state.get("state")})
 
     def _loop(self) -> None:
         while not self._control.is_set():

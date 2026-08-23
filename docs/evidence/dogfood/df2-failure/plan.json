@@ -1,0 +1,165 @@
+{
+ "version": 2,
+ "units": [
+  {
+   "id": "contract",
+   "index": 0,
+   "title": "现状审计与会话数据契约",
+   "description": "检查现有 CLI 入口、子命令解析、rollouts 目录定位方式及会话文件格式，定义 stats 的内部统计结构与兼容解析规则，确认不影响现有子命令。",
+   "acceptance": [
+    "明确 stats 的调用入口与参数解析位置",
+    "明确会话数据目录、文件筛选规则及标题、时间、模型字段提取规则",
+    "定义等价输出结构：sessions_total、by_date、by_model、recent",
+    "定义目录不存在、目录为空、异常或不完整会话文件的零值/容错行为",
+    "现有子命令基线行为和测试入口已记录"
+   ],
+   "dependencies": [],
+   "state": "integrated",
+   "status": "integrated",
+   "attempt": 1,
+   "repairCount": 0,
+   "conflictCount": 0,
+   "conflict": null,
+   "worktree": {
+    "path": "/Users/lianb/Desktop/CodexPlusPlus/.laomo/worktrees/20260823-073955-5c03aa/u0",
+    "branch": "laomo/20260823-073955-5c03aa/u0",
+    "baseSha": "9a84e83300651e3f674577b493f0dcc50db29ea5",
+    "headSha": "351ec438ed42fc7bb894c188500f3972d9c75a5e"
+   },
+   "jobId": null,
+   "delta": null,
+   "repairDirective": null,
+   "lastVerdict": "PASS",
+   "worker": {
+    "startedAt": 1787442030841,
+    "finishedAt": 1787442391395
+   },
+   "lease": null,
+   "lastProgressSig": "32264679b80ce9ab9bc2dc0a36ccdaa8079d3f4f",
+   "integration": {
+    "phase": "cleaned",
+    "branch": "laomo/20260823-073955-5c03aa/u0",
+    "unitHead": "9a84e83300651e3f674577b493f0dcc50db29ea5",
+    "dirty": true,
+    "startedAt": 1787442644367,
+    "headSha": "351ec438ed42fc7bb894c188500f3972d9c75a5e",
+    "finishedAt": 1787442644535
+   }
+  },
+  {
+   "id": "stats-core",
+   "index": 1,
+   "title": "实现 rollouts 扫描与统计核心逻辑",
+   "description": "新增独立的 stats 统计模块，扫描指定 rollouts 目录并生成稳定的内部报告结构，支持按日期、模型聚合及最近 5 个活跃会话排序。",
+   "acceptance": [
+    "能统计 sessions_total",
+    "能生成按日期聚合的 by_date",
+    "能生成按模型聚合的 by_model",
+    "recent 最多包含 5 条，且每条包含标题和时间并按最近活跃时间排序",
+    "rollouts 目录不存在或为空时返回零值报告，不抛异常",
+    "核心逻辑可通过传入临时目录测试，不读取真实 ~/.codex 数据"
+   ],
+   "dependencies": [
+    "contract"
+   ],
+   "state": "evaluating",
+   "status": "evaluating",
+   "attempt": 1,
+   "repairCount": 0,
+   "conflictCount": 0,
+   "conflict": null,
+   "worktree": {
+    "path": "/Users/lianb/Desktop/CodexPlusPlus/.laomo/worktrees/20260823-073955-5c03aa/u1",
+    "branch": "laomo/20260823-073955-5c03aa/u1",
+    "baseSha": "351ec438ed42fc7bb894c188500f3972d9c75a5e",
+    "headSha": "351ec438ed42fc7bb894c188500f3972d9c75a5e"
+   },
+   "jobId": null,
+   "delta": null,
+   "repairDirective": null,
+   "lastVerdict": null,
+   "worker": {
+    "startedAt": 1787442644681,
+    "finishedAt": 1787460502086
+   },
+   "lease": null
+  },
+  {
+   "id": "cli-stats",
+   "index": 2,
+   "title": "接入 stats 子命令与双格式输出",
+   "description": "将统计核心接入 python -m codex_session_delete stats，提供默认人读文本和 --json 机器可读输出，同时保持原有命令参数与行为不变。",
+   "acceptance": [
+    "python -m codex_session_delete stats 在本机真实数据上退出码为 0，并输出总会话数",
+    "默认文本输出包含总会话数、按日期分布、按模型分布、最近 5 个活跃会话的标题与时间",
+    "--json 输出可被 json.loads 解析",
+    "JSON 顶层至少包含 sessions_total、by_date、by_model、recent 四个字段",
+    "空目录或不存在目录时文本和 JSON 均以零值正常退出",
+    "执行现有子命令的既有参数和输出行为未发生变化"
+   ],
+   "dependencies": [
+    "stats-core"
+   ],
+   "state": "pending",
+   "status": "pending",
+   "attempt": 0,
+   "repairCount": 0,
+   "conflictCount": 0,
+   "conflict": null,
+   "worktree": {
+    "path": null,
+    "branch": null,
+    "baseSha": null,
+    "headSha": null
+   },
+   "jobId": null,
+   "delta": null,
+   "repairDirective": null,
+   "lastVerdict": null,
+   "worker": {
+    "startedAt": null,
+    "finishedAt": null
+   }
+  },
+  {
+   "id": "stats-tests",
+   "index": 3,
+   "title": "新增 pytest 覆盖与完整回归验收",
+   "description": "使用 pytest 临时目录 fixture 构造多种 rollouts 会话数据，覆盖统计、格式化、边界和兼容性场景，并运行仓库完整测试集。",
+   "acceptance": [
+    "测试使用临时目录 fixture 模拟会话数据，不依赖真实 ~/.codex 内容",
+    "覆盖多会话、跨日期、跨模型及最近 5 条排序",
+    "覆盖标题、时间或模型字段缺失/不完整文件的容错行为",
+    "覆盖目录为空和目录不存在时的零值报告",
+    "覆盖默认文本输出与 --json 输出结构及 json.loads 解析",
+    "仓库现有 215 个 pytest 测试与新增 stats 测试全部通过"
+   ],
+   "dependencies": [
+    "stats-core",
+    "cli-stats"
+   ],
+   "state": "pending",
+   "status": "pending",
+   "attempt": 0,
+   "repairCount": 0,
+   "conflictCount": 0,
+   "conflict": null,
+   "worktree": {
+    "path": null,
+    "branch": null,
+    "baseSha": null,
+    "headSha": null
+   },
+   "jobId": null,
+   "delta": null,
+   "repairDirective": null,
+   "lastVerdict": null,
+   "worker": {
+    "startedAt": null,
+    "finishedAt": null
+   }
+  }
+ ],
+ "replans": 0,
+ "gitIntegration": true
+}

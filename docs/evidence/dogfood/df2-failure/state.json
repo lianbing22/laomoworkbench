@@ -1,0 +1,16 @@
+{
+ "state": "failed",
+ "cycles": 3,
+ "currentUnit": 0,
+ "noProgress": 0,
+ "progressSignature": "32264679b80ce9ab9bc2dc0a36ccdaa8079d3f4f",
+ "tokensUsed": 248658,
+ "wallElapsedMs": 8160343,
+ "agentActiveMs": 8160343,
+ "waitingMs": 0,
+ "pausedMs": 0,
+ "phaseStartedAt": 1787450191024,
+ "updatedAt": 1787450191024,
+ "activeMs": 8160343,
+ "stopReason": "maxWallTime 达到上限（7200s，不含暂停）"
+}

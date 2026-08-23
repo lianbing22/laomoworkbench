@@ -1652,6 +1652,54 @@ class TestCancelInterruptPropagation(MissionLoopTest):
         self.assertEqual(len(adapter.calls), frozen,
                          "cancel 后不得再发生任何模型 turn")
 
+    def test_50_policy_fail_reaps_inflight_unit_turns(self):
+        """Dogfood #2 regression: maxWallTime terminal fired while a unit
+        worker turn was still in flight; nothing reaped it — a real codex
+        turn kept working 2h52m past `failed`, writing into the dead
+        mission's worktree and discarding its result. Terminal must sweep
+        in-flight unit threads exactly like cancel does (Gate F)."""
+        calls = {"interrupt": 0, "worker_started": False,
+                 "stalled": threading.Event()}
+
+        class InterruptableAdapter(FakeAdapter):
+            def interrupt_active_turns(self, max_wait=10.0):
+                calls["interrupt"] += 1
+                calls["stalled"].set()   # the real impl unblocks the turn
+                return []
+
+        adapter = InterruptableAdapter()
+
+        def slow(prompt):
+            calls["worker_started"] = True
+            calls["stalled"].wait(timeout=30)  # blocks inside run_turn
+            return handoff_text()
+
+        adapter.script("planner", plan_block(sample_units(1)))
+        adapter.script("worker", slow)
+        adapter.set_default("evaluator", verdict_block("PASS", ["ok"]))
+        mgr = MissionManager(adapter, self.root)
+        mid = mission_id_of(mgr.create("obj", acceptance_criteria=["a"],
+                                       options={"maxWallTimeSec": 3}))
+        self.track(mid, mgr=mgr)
+        mgr.start(mid)
+        self.assertTrue(self.wait_until(
+            lambda: calls["worker_started"], timeout=15),
+            "worker turn 应已进入运行（wall 预算内）")
+        # wall budget trips while the worker turn is still in flight
+        self.assertTrue(self.wait_state(mgr, mid, ["failed"], timeout=30),
+                        "maxWallTime 应在 turn 进行中触发终态")
+        self.assertEqual(calls["interrupt"], 1,
+                         "policy 终态必须像 cancel 一样定向 interrupt in-flight turn")
+        # the reaper must end the unit thread (bounded) — no zombie workers
+        def unit_threads_dead():
+            with mgr._lock:
+                pool = mgr._unit_threads.get(mid) or {}
+            return not any(t.is_alive() for t in pool.values())
+        self.assertTrue(self.wait_until(unit_threads_dead, timeout=15,
+                                        desc="终态后 unit 线程必须被收割"))
+        events = (self.mdir(mid) / "events.ndjson").read_text("utf-8")
+        self.assertIn("terminal-reap", events, "收割必须留审计事件")
+
 
 class TestMachineGateRepairScope(MissionLoopTest):
     """Gate I finding: the machine-gate repair directive asks for files the
