@@ -241,6 +241,61 @@ class ExtensionsGatewayTest(unittest.TestCase):
         status, _ = self._post("/api/extensions/mcp-save", {"entry": "not-an-object"})
         self.assertEqual(status, 400)
 
+    # -- skills routes ----------------------------------------------------------
+
+    def _skills_adapter(self, entries):
+        state = {"entries": [dict(e) for e in entries]}
+
+        def on_list(p):
+            if p.get("forceReload") and state.get("flip"):
+                state["entries"] = [dict(e, enabled=state["flip"].get(e["name"], e["enabled"]))
+                                    for e in state["entries"]]
+            return {"data": [{"cwd": p.get("cwds", [None])[0],
+                              "skills": [dict(e) for e in state["entries"]]}]}
+
+        def on_write(p):
+            target = next((e for e in state["entries"] if e["name"] == p.get("name")), None)
+            if target is not None:
+                state.setdefault("flip", {})[target["name"]] = bool(p["enabled"])
+            return {"effectiveEnabled": bool(p["enabled"])}
+        return StubAdapter({"skills/list": on_list, "skills/config/write": on_write})
+
+    def test_skills_list_route(self):
+        self._install(self._skills_adapter([
+            {"name": "a", "description": "d", "path": "/s/a/SKILL.md",
+             "scope": "user", "enabled": True}]))
+        status, body = self._post("/api/extensions/skills-list", {})
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["counts"]["total"], 1)
+        self.assertEqual(body["skills"][0]["name"], "a")
+
+    def test_skill_toggle_route_roundtrip(self):
+        self._install(self._skills_adapter([
+            {"name": "a", "description": "d", "path": "/s/a/SKILL.md",
+             "scope": "user", "enabled": True}]))
+        status, body = self._post("/api/extensions/skill-toggle",
+                                  {"name": "a", "enabled": False})
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+        self.assertFalse(body["skill"]["enabled"])
+        # follow-up list (forceReload) reflects the verified state
+        status, body = self._post("/api/extensions/skills-list",
+                                  {"forceReload": True})
+        self.assertFalse(body["skills"][0]["enabled"])
+
+    def test_skill_toggle_without_selector_400(self):
+        self._install(self._skills_adapter([]))
+        status, body = self._post("/api/extensions/skill-toggle",
+                                  {"enabled": True})
+        self.assertEqual(status, 400)
+
+    def test_skills_routes_capability_501(self):
+        self._install(StubAdapter())  # no skills handlers -> unknown variant
+        status, body = self._post("/api/extensions/skills-list", {})
+        self.assertEqual(status, 501)
+        self.assertEqual(body["code"], "CAPABILITY_UNAVAILABLE")
+
 
 if __name__ == "__main__":
     unittest.main()

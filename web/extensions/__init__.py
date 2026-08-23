@@ -7,9 +7,11 @@ adapter's codex_request transport only.
 from .models import (CapabilityUnavailable, ExtensionError, PostconditionFailed,
                      plugin_canonical_id, secret_risk_warnings, validate_mcp_name)
 from .codex_plugins import CodexPluginClient
+from .codex_skills import CodexSkillsClient
 from .mcp_config import McpConfigService
 from .service import ExtensionService
 
 __all__ = ["CapabilityUnavailable", "ExtensionError", "PostconditionFailed",
            "plugin_canonical_id", "secret_risk_warnings", "validate_mcp_name",
-           "CodexPluginClient", "McpConfigService", "ExtensionService"]
+           "CodexPluginClient", "CodexSkillsClient", "McpConfigService",
+           "ExtensionService"]

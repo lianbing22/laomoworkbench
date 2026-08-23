@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import Any, Protocol
 
 from .codex_plugins import CodexPluginClient
+from .codex_skills import CodexSkillsClient
 from .mcp_config import McpConfigService
 from .models import CapabilityUnavailable, ExtensionError, block, unsupported_block
 
@@ -31,6 +32,7 @@ class ExtensionService:
     def __init__(self, adapter: CodexTransport | None) -> None:
         self._adapter = adapter
         self._plugins = CodexPluginClient(adapter.codex_request) if adapter else None
+        self._skills = CodexSkillsClient(adapter.codex_request) if adapter else None
         self._mcp = McpConfigService(adapter.codex_request) if adapter else None
 
     # -- aggregate read ------------------------------------------------------
@@ -140,6 +142,17 @@ class ExtensionService:
     def market_upgrade(self, marketplace_name: str | None = None) -> dict[str, Any]:
         self._require()
         return {"ok": True, **self._plugins.market_upgrade(marketplace_name)}
+
+    # -- skills (native skills/list + skills/config/write) --------------------
+
+    def skills_list(self, cwd: str | None, force_reload: bool = False) -> dict[str, Any]:
+        self._require()
+        return {"ok": True, **self._skills.list(cwd, force_reload)}
+
+    def skill_set_enabled(self, enabled: bool, name: str | None = None,
+                          path: str | None = None, cwd: str | None = None) -> dict[str, Any]:
+        self._require()
+        return {"ok": True, **self._skills.set_enabled(enabled, name, path, cwd)}
 
     # -- mcp -------------------------------------------------------------------
 

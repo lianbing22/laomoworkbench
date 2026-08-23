@@ -10,18 +10,16 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .models import (CapabilityUnavailable, ExtensionError, PostconditionFailed,
-                     plugin_canonical_id, unsupported_block)
+                     is_capability_error, plugin_canonical_id, unsupported_block)
 
 # Marketplace kinds the schema allows (plugin/list filter). v1 queries local
 # marketplaces (the default) — kinds are passed through verbatim when given.
 MARKETPLACE_KINDS = {"local", "vertical", "workspace-directory",
                      "shared-with-me", "created-by-me-remote"}
 
-_UPSTREAM_UNKNOWN_HINTS = ("unknown variant", "unknown method", "unrecognized")
-
 
 def _is_capability_error(exc: BaseException) -> bool:
-    return any(h in str(exc) for h in _UPSTREAM_UNKNOWN_HINTS)
+    return is_capability_error(exc)
 
 
 def _is_git_marketplace(path: str | None) -> bool:

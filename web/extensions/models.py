@@ -19,6 +19,16 @@ SECRETISH_KEY_RE = re.compile(
 ENV_REF_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 
 
+# upstream's unknown-method wording (JSON-RPC -32600 "unknown variant ...");
+# any of these hints means the installed codex runtime lacks the RPC — a
+# capability state, not an error
+_UPSTREAM_UNKNOWN_HINTS = ("unknown variant", "unknown method", "unrecognized")
+
+
+def is_capability_error(exc: BaseException) -> bool:
+    return any(h in str(exc) for h in _UPSTREAM_UNKNOWN_HINTS)
+
+
 class ExtensionError(Exception):
     """Normalized extension-layer error. `code` is machine-readable and maps
     1:1 onto the gateway's HTTP error payload."""

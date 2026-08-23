@@ -652,5 +652,136 @@ class TestP201Hardening(unittest.TestCase):
         self.assertEqual(seen["scan_cwds"], ["/ws/x"])
 
 
+class SkillsState:
+    """Stateful adapter double with the EXACT probed shapes: skills/list
+    returns {data:[{cwd, skills:[...]}]}; skills/config/write flips the
+    matching entry and returns {effectiveEnabled}."""
+
+    def __init__(self, entries):
+        # entries: [{name, description, path, scope, enabled}]
+        self.entries = [dict(e) for e in entries]
+        self.list_calls = []
+
+    def codex_request(self, method, params=None, timeout=60.0):
+        if method == "skills/list":
+            self.list_calls.append(params)
+            return {"data": [{"cwd": "/ws", "skills": [dict(e) for e in self.entries]}]}
+        if method == "skills/config/write":
+            target = None
+            if params.get("name"):
+                target = next((e for e in self.entries
+                               if e["name"] == params["name"]), None)
+            elif params.get("path"):
+                target = next((e for e in self.entries
+                               if e["path"] == params["path"]), None)
+            if target is None:
+                return {"effectiveEnabled": False}
+            target["enabled"] = bool(params["enabled"])
+            return {"effectiveEnabled": target["enabled"]}
+        raise RuntimeError(
+            f"codex rpc error: {method}: {{'code': -32600, 'message': "
+            f"'Invalid request: unknown variant `{method}`'}}")
+
+    def codex_available(self):
+        return True
+
+
+def skill_entry(name, path=None, scope="user", enabled=True, description="d"):
+    return {"name": name, "description": description,
+            "path": path or f"/skills/{name}/SKILL.md",
+            "scope": scope, "enabled": enabled}
+
+
+class TestSkills(unittest.TestCase):
+    def test_list_flattens_groups_and_counts(self):
+        st = SkillsState([
+            skill_entry("ad-creative", scope="user"),
+            skill_entry("built-in", scope="system"),
+            skill_entry("off-one", scope="user", enabled=False),
+        ])
+        out = ExtensionService(st).skills_list("/ws")
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["counts"], {"total": 3, "enabled": 2,
+                                         "byScope": {"user": 2, "system": 1}})
+        self.assertEqual([s["name"] for s in out["skills"]],
+                         ["off-one", "ad-creative", "built-in"])  # disabled first
+        self.assertEqual(out["groups"], [{"cwd": "/ws", "count": 3}])
+        self.assertEqual(st.list_calls[0], {"cwds": ["/ws"]})
+        self.assertNotIn("forceReload", st.list_calls[0])
+
+    def test_list_passes_force_reload(self):
+        st = SkillsState([skill_entry("a")])
+        ExtensionService(st).skills_list("/ws", force_reload=True)
+        self.assertEqual(st.list_calls[0],
+                         {"cwds": ["/ws"], "forceReload": True})
+
+    def test_toggle_postcondition_verifies_via_force_reload(self):
+        st = SkillsState([skill_entry("ad-creative")])
+        out = ExtensionService(st).skill_set_enabled(
+            False, name="ad-creative", cwd="/ws")
+        self.assertFalse(out["skill"]["enabled"])
+        self.assertFalse(out["effectiveEnabled"])
+        # the verifying re-read must bypass the skills cache
+        self.assertEqual(st.list_calls[-1],
+                         {"cwds": ["/ws"], "forceReload": True})
+
+    def test_toggle_requires_exactly_one_selector(self):
+        st = SkillsState([skill_entry("a")])
+        with self.assertRaises(ExtensionError):
+            ExtensionService(st).skill_set_enabled(True, cwd="/ws")
+        with self.assertRaises(ExtensionError):
+            ExtensionService(st).skill_set_enabled(True, name="a",
+                                                   path="/skills/a/SKILL.md")
+
+    def test_toggle_rejects_relative_path_and_control_chars(self):
+        st = SkillsState([skill_entry("a")])
+        with self.assertRaises(ExtensionError):
+            ExtensionService(st).skill_set_enabled(True, path="skills/a/SKILL.md")
+        with self.assertRaises(ExtensionError):
+            ExtensionService(st).skill_set_enabled(True, name="a\nb")
+
+    def test_toggle_unknown_skill_fails_postcondition(self):
+        st = SkillsState([skill_entry("a")])
+        # upstream accepts (effectiveEnabled reported) but nothing changed
+        real = st.codex_request
+
+        def accepted_but_noop(method, params=None, timeout=60.0):
+            if method == "skills/config/write":
+                return {"effectiveEnabled": True}
+            return real(method, params, timeout)
+        st.codex_request = accepted_but_noop
+        with self.assertRaises(PostconditionFailed):
+            ExtensionService(st).skill_set_enabled(False, name="ghost", cwd="/ws")
+
+    def test_toggle_state_not_changed_fails_postcondition(self):
+        # upstream reports success shape but the re-read shows no flip
+        st = SkillsState([skill_entry("a", enabled=True)])
+        calls = {"n": 0}
+        real = st.codex_request
+
+        def stubborn(method, params=None, timeout=60.0):
+            if method == "skills/config/write":
+                return {"effectiveEnabled": False}  # contradicts the request
+            return real(method, params, timeout)
+        st.codex_request = stubborn
+        with self.assertRaises(PostconditionFailed):
+            ExtensionService(st).skill_set_enabled(False, name="a", cwd="/ws")
+
+    def test_capability_degrades_to_unsupported(self):
+        t = FakeTransport()  # no skills handlers -> unknown variant
+        from extensions import CapabilityUnavailable
+        with self.assertRaises(CapabilityUnavailable):
+            ExtensionService(t).skills_list("/ws")
+
+    def test_toggle_by_path_selector(self):
+        st = SkillsState([skill_entry("a"), skill_entry("a", path="/other/a/SKILL.md")])
+        out = ExtensionService(st).skill_set_enabled(
+            False, path="/other/a/SKILL.md", cwd="/ws")
+        self.assertEqual(out["skill"]["path"], "/other/a/SKILL.md")
+        self.assertFalse(out["skill"]["enabled"])
+        by_name = next(e for e in st.entries if e["name"] == "a" and e["path"] != "/other/a/SKILL.md")
+        self.assertTrue(by_name["enabled"])
+
+
 if __name__ == "__main__":
     unittest.main()
