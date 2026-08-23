@@ -864,6 +864,21 @@ dialog::backdrop { background: rgba(3,4,7,.74); backdrop-filter: blur(8px); }
 .setting-actions button:hover { color: var(--ink); background: var(--acid); }
 .credential-row { display: grid; grid-template-columns: 1fr auto auto; gap: 7px; margin-top: 10px; }
 .credential-row input { min-width: 0; padding: 8px; border: 1px solid var(--line); color: inherit; background: rgba(255,255,255,.04); font-family: var(--mono); }
+/* Skills 管理面（设置 → Skills）：工具条 / 范围筛选 / 技能卡 */
+.skills-toolbar { display: grid; grid-template-columns: 1fr auto; gap: 7px; margin-top: 10px; }
+.skills-toolbar input { min-width: 0; padding: 8px; border: 1px solid var(--line); color: inherit; background: rgba(255,255,255,.04); font-family: var(--mono); }
+.skills-toolbar button { padding: 5px 9px; border: 1px solid var(--line); color: inherit; background: transparent; font: 800 7px var(--mono); }
+.skills-toolbar button:hover { color: var(--ink); background: var(--acid); }
+.skills-scope-row { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; }
+.skill-chip { padding: 4px 8px; border: 1px solid var(--line); color: var(--muted); background: transparent; font: 800 7px var(--mono); }
+.skill-chip.active { color: var(--ink); border-color: var(--acid); background: var(--acid); }
+.skill-card .skill-card-main { display: block; }
+.skill-card strong { display: inline; margin-right: 7px; }
+.skill-badge { display: inline-block; margin-right: 5px; padding: 2px 6px; border: 1px solid var(--acid); color: var(--acid); font: 800 7px var(--mono); }
+.skill-badge.off { border-color: var(--warn, #ffd629); color: var(--warn, #ffd629); }
+.skill-badge.scope { border-color: var(--line); color: var(--muted); }
+.skill-desc { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; margin-top: 5px; line-height: 1.5; }
+.skill-path { display: block; margin-top: 4px; opacity: .65; word-break: break-all; }
 .interrupt-body { max-height: 420px; overflow: auto; margin-top: 18px; padding: 16px; border: 1px solid var(--line); background: rgba(255,255,255,.035); font-size: 11px; line-height: 1.65; }
 .interrupt-options { display: grid; gap: 8px; margin-top: 12px; }
 .interrupt-option { display: flex; gap: 9px; padding: 10px; border: 1px solid var(--line); }

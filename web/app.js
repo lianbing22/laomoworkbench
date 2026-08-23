@@ -269,7 +269,11 @@ async function jsonFetch(url, options = {}, timeoutMs = 15000) {
       return retryData;
     }
     const data = await response.json().catch(() => ({ ok: false, error: `HTTP ${response.status}` }));
-    if (!response.ok || data.ok === false) throw new Error(data.error || `HTTP ${response.status}`);
+    if (!response.ok || data.ok === false) {
+      const err = new Error(data.error || `HTTP ${response.status}`);
+      if (data && data.code) err.code = data.code; // CAPABILITY_UNAVAILABLE …
+      throw err;
+    }
     return data;
   } catch (error) {
     if (error?.name === "AbortError") throw new Error(`请求超时（${Math.round(timeoutMs / 1000)} 秒无响应）`);
@@ -3724,9 +3728,7 @@ async function loadSettings(tab = "general") {
       const items = unpackList(value, ["presets", "items"]);
       content.innerHTML = items.map(item => `<div class="setting-card"><strong>${escapeHtml(item.name || item.id)}${item.isDefault ? " · 默认" : ""}</strong><small>${escapeHtml(item.description || "Agent 预设")}</small><div class="setting-actions"><button data-preset-action="select:${escapeHtml(item.id)}">用于当前会话</button><button data-preset-action="read:${escapeHtml(item.id)}">查看</button><button data-preset-action="copy:${escapeHtml(item.id)}">复制为自定义</button>${item.trust === "user" ? `<button data-preset-action="open:${escapeHtml(item.id)}">打开文件</button><button data-preset-action="remove:${escapeHtml(item.id)}">删除</button>` : ""}</div></div>`).join("") || '<p class="muted">没有 Agent 预设。</p>';
   } else {
-      const value = await rpc("skill.list", { sessionId: state.sessionId });
-      const items = unpackList(value, ["skills", "items"]);
-      content.innerHTML = items.map(item => `<div class="setting-card"><strong>${escapeHtml(item.name || item.id || item)}</strong><small>${escapeHtml(item.description || item.path || "Skill")}</small></div>`).join("") || '<p class="muted">没有可用 Skills。</p>';
+      await renderSkillsSettingsTab(content);
     }
   } catch (error) {
     content.innerHTML = `<div class="setting-card setting-error" role="alert">
@@ -3735,6 +3737,119 @@ async function loadSettings(tab = "general") {
       <span class="setting-error-detail">${escapeHtml(error.message)}</span>
     </div>`;
   }
+}
+
+// --- Skills 管理（Codex 原生 skills/list + skills/config/write）--------------
+// Skills 是 SKILL.md 目录，由 Codex 自己发现——老墨不自建格式，只做管理面：
+// 搜索 / 按来源范围筛选 / 逐个启停 / 强制刷新。启停是 mutation：服务端写后
+// forceReload 复核（WRITE -> REFETCH -> VERIFY），前端只在复核通过后报成功。
+
+const skillsSettings = {
+  items: [], visible: [], counts: null,
+  query: "", scope: "all", busy: new Set(),
+};
+
+function skillScopeLabel(scope) {
+  return { user: "用户", project: "项目", system: "系统" }[scope] || scope || "未知";
+}
+
+async function renderSkillsSettingsTab(content, forceReload = false) {
+  try {
+    const data = await extApi("/skills-list", forceReload ? { forceReload: true } : {});
+    skillsSettings.items = data.skills || [];
+    skillsSettings.counts = data.counts || null;
+    renderSkillsList(content);
+  } catch (error) {
+    if (error.code === "CAPABILITY_UNAVAILABLE" || /unknown variant/i.test(error.message || "")) {
+      content.innerHTML = `<div class="setting-card"><strong>Skills 能力不可用</strong><small>当前 Codex 运行时没有原生 skills RPC（推荐 Codex ≥ 0.149.0-alpha.4.1）。升级本地引擎后这里会自动可用。</small></div>`;
+    } else if (error.code === "CODEX_RUNTIME_REQUIRED") {
+      content.innerHTML = `<div class="setting-card"><strong>Skills 需要 Codex 运行时</strong><small>当前没有可用的本地 Codex 引擎。</small></div>`;
+    } else {
+      content.innerHTML = `<div class="setting-card setting-error" role="alert"><strong>Skills 列表读取失败</strong><small>请稍后重试，或点「强制刷新」绕过缓存重新扫描。</small><span class="setting-error-detail">${escapeHtml(error.message)}</span></div>`;
+    }
+  }
+}
+
+function skillsFilterChips() {
+  const byScope = (skillsSettings.counts || {}).byScope || {};
+  const chips = [`<button type="button" class="skill-chip${skillsSettings.scope === "all" ? " active" : ""}" data-skill-scope="all">全部 ${skillsSettings.items.length}</button>`];
+  for (const scope of Object.keys(byScope)) {
+    chips.push(`<button type="button" class="skill-chip${skillsSettings.scope === scope ? " active" : ""}" data-skill-scope="${escapeHtml(scope)}">${escapeHtml(skillScopeLabel(scope))} ${byScope[scope]}</button>`);
+  }
+  return chips.join("");
+}
+
+function renderSkillsList(content = $("#settingsContent")) {
+  const counts = skillsSettings.counts || {};
+  const q = skillsSettings.query.trim().toLowerCase();
+  skillsSettings.visible = skillsSettings.items.filter(s =>
+    (skillsSettings.scope === "all" || s.scope === skillsSettings.scope) &&
+    (!q || `${s.name || ""} ${s.description || ""}`.toLowerCase().includes(q)));
+  const summary = [
+    `共 ${counts.total ?? skillsSettings.items.length} 个`,
+    counts.enabled != null ? `启用 ${counts.enabled}` : "",
+    Object.entries(counts.byScope || {}).map(([scope, n]) => `${skillScopeLabel(scope)} ${n}`).join(" / "),
+  ].filter(Boolean).join(" · ");
+  content.innerHTML = `
+    <div class="setting-card skills-toolbar-card">
+      <strong>Skills</strong>
+      <small>${escapeHtml(summary)}。技能由 Codex 原生发现（SKILL.md 目录）；已停用的技能不会注入会话。</small>
+      <div class="skills-toolbar">
+        <input id="skillsQuery" type="search" placeholder="搜索名称或描述…" value="${escapeHtml(skillsSettings.query)}" autocomplete="off">
+        <button type="button" data-skills-refresh title="绕过 Codex 缓存重新扫描磁盘">↻ 强制刷新</button>
+      </div>
+      <div class="skills-scope-row">${skillsFilterChips()}</div>
+    </div>
+    ${skillsSettings.visible.map((s, index) => `
+      <div class="setting-card skill-card">
+        <div class="skill-card-main">
+          <strong>${escapeHtml(s.name || "(未命名)")}</strong>
+          <span class="skill-badge${s.enabled ? "" : " off"}">${s.enabled ? "启用" : "已停用"}</span>
+          <span class="skill-badge scope">${escapeHtml(skillScopeLabel(s.scope))}</span>
+          ${s.description ? `<small class="skill-desc">${escapeHtml(s.description)}</small>` : ""}
+          ${s.path ? `<small class="skill-path">${escapeHtml(s.path)}</small>` : ""}
+        </div>
+        <div class="setting-actions">
+          <button type="button" data-skill-toggle="${index}">${s.enabled ? "停用" : "启用"}</button>
+          ${s.path ? `<button type="button" data-skill-open="${index}">打开文件</button>` : ""}
+        </div>
+      </div>`).join("") || '<p class="muted">没有匹配的 Skills。</p>'}`;
+}
+
+async function skillsToggleAction(index, button) {
+  const current = skillsSettings.visible[index];
+  if (!current) return;
+  const target = !current.enabled;
+  const busyKey = current.path || current.name || String(index);
+  if (skillsSettings.busy.has(busyKey)) return;
+  skillsSettings.busy.add(busyKey);
+  const label = button.textContent;
+  button.disabled = true; button.textContent = "…";
+  try {
+    // 服务端 WRITE -> REFETCH(forceReload) -> VERIFY；返回即已复核
+    const result = await extApi("/skill-toggle", {
+      name: current.name || null, path: current.path || null, enabled: target,
+    });
+    const pos = skillsSettings.items.findIndex(s =>
+      (current.path && s.path === current.path) ||
+      (!current.path && s.name === current.name));
+    if (pos >= 0) skillsSettings.items[pos] = { ...skillsSettings.items[pos], ...result.skill };
+    if (result.counts) skillsSettings.counts = result.counts;
+    toast(`已${target ? "启用" : "停用"} ${result.skill.name || "Skill"}`);
+    renderSkillsList();
+  } catch (error) {
+    button.disabled = false; button.textContent = label;
+    toast(extErrorMessage(error), true);
+  } finally {
+    skillsSettings.busy.delete(busyKey);
+  }
+}
+
+async function skillsOpenFile(index) {
+  const entry = skillsSettings.visible[index];
+  if (!entry?.path) return;
+  try { await rpc("host.openPath", { path: entry.path }); }
+  catch (error) { toast(`打开失败：${error.message}`, true); }
 }
 
 async function workspaceAction(action, id) {
@@ -4131,6 +4246,13 @@ function bindEvents() {
     if (workspaceActionButton) { const [action, id] = workspaceActionButton.dataset.workspaceAction.split(":"); workspaceAction(action, id); return; }
     const presetActionButton = event.target.closest("[data-preset-action]");
     if (presetActionButton) { const [action, id] = presetActionButton.dataset.presetAction.split(":"); presetAction(action, id); return; }
+    const skillsToggleButton = event.target.closest("[data-skill-toggle]");
+    if (skillsToggleButton) { skillsToggleAction(Number(skillsToggleButton.dataset.skillToggle), skillsToggleButton); return; }
+    const skillsOpenButton = event.target.closest("[data-skill-open]");
+    if (skillsOpenButton) { skillsOpenFile(Number(skillsOpenButton.dataset.skillOpen)); return; }
+    const skillsScopeChip = event.target.closest("[data-skill-scope]");
+    if (skillsScopeChip) { skillsSettings.scope = skillsScopeChip.dataset.skillScope; renderSkillsList(); return; }
+    if (event.target.closest("[data-skills-refresh]")) { renderSkillsSettingsTab($("#settingsContent"), true); return; }
     const settingsActionButton = event.target.closest("[data-open-settings-document],[data-setting-busy],[data-credential-set],[data-credential-unset],[data-discover-models],[data-open-providers]");
     if (settingsActionButton) { settingsAction(settingsActionButton); return; }
     const goalActionButton = event.target.closest("[data-goal-action]");
@@ -4394,6 +4516,14 @@ function bindEvents() {
   $$("[data-settings]").forEach(button => button.addEventListener("click", () => {
     $$("[data-settings]").forEach(item => item.classList.toggle("active", item === button)); loadSettings(button.dataset.settings);
   }));
+  // Skills 搜索框随输随筛（内容区整体重绘，重绘后恢复焦点与光标）
+  $("#settingsContent").addEventListener("input", event => {
+    if (event.target.id !== "skillsQuery") return;
+    skillsSettings.query = event.target.value;
+    renderSkillsList();
+    const input = $("#skillsQuery");
+    if (input) { input.focus(); input.setSelectionRange(input.value.length, input.value.length); }
+  });
   $("#commandButton").addEventListener("click", () => { renderCommands(); $("#commandDialog").showModal(); setTimeout(() => $("#commandSearch").focus(), 0); });
   $("#commandSearch").addEventListener("input", event => renderCommands(event.target.value));
   $("#interruptAllow").addEventListener("click", event => { event.preventDefault(); resolveInterrupt(true); });

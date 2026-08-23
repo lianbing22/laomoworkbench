@@ -4,6 +4,33 @@
 [docs/codex-protocol-notes.md](docs/codex-protocol-notes.md)，当前阶段状态与排期见
 [docs/status.md](docs/status.md)。
 
+## 2026-08-23（日）— Skills 配置模块（Codex 原生 skills RPC）
+
+设置 → Skills 从空壳只读列表升级为真实管理面。老墨不自建 skill 格式——
+Skill 是 SKILL.md 目录（开放格式，同 [anthropics/skills] 的 Agent Skills
+规范），由 Codex 自己发现与注入，老墨只做管理（启停交互参考
+[xingkongliang/skills-manager] 与 Claude 官方设置）：
+
+- **真实数据源**：直连 codex app-server 原生 `skills/list`（schema 留存 +
+  本机实测冻结协议，见 `docs/extension-contract.md` Skills 契约与
+  `docs/evidence/extension-skills/`；实测 251 个 skill，scope 由上游如实
+  上报）。旧 `skill.list` 桩（永远返回空）删除，harness RPC 落到诚实降级。
+- **逐个启停**：`skills/config/write`（name/path 二选一选择器）——服务端
+  写后 `forceReload` 重读复核（WRITE → REFETCH → VERIFY），复核不通过
+  报 POSTCONDITION_FAILED，绝不提前报成功。
+- **管理面**：搜索（名称/描述）、按来源范围筛选（用户/项目/系统带计数）、
+  已停用置顶、SKILL.md 路径展示与打开、强制刷新（绕过上游缓存重扫磁盘）。
+- **能力降级**：运行时无 skills RPC → 如实显示能力不可用（推荐 Codex ≥
+  0.149.0-alpha.4.1）；无 Codex 运行时 → 独立降级文案。
+- **网关**：`/api/extensions/skills-list`、`/api/extensions/skill-toggle`
+  （跟随 active workspace cwd，同 plugin inventory）；聚合 GET 不含 skills
+  块，避免扩展页每次加载白付一次扫描。
+- **测试**：10 项 service 测试 + 4 项网关测试（scripted transport 用实测
+  形状）；独立端口真机 E2E 通过（列表 → 停用 → 复核 → 启用，净零还原）。
+
+[anthropics/skills]: https://github.com/anthropics/skills
+[xingkongliang/skills-manager]: https://github.com/xingkongliang/skills-manager
+
 ## 2026-08-23（日）— 主题配置模块重构（next-themes 架构移植）
 
 参照 [pacocoursey/next-themes](https://github.com/pacocoursey/next-themes) 的成熟架构，

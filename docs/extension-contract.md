@@ -24,6 +24,8 @@
 | `config/value/write` | ✅ | `keyPath, mergeStrategy: replace\|upsert, value`（`expectedVersion?`、`filePath?` 默认用户 config.toml） | `{status: ok\|okOverridden, version, filePath}` |
 | `config/mcpServer/reload` | ✅ | `{}` | `{}`（成功即 reload） |
 | `mcpServerStatus/list` | ✅ | `threadId?`、`detail?: full\|toolsAndAuthOnly`、`cursor?`、`limit?` | `{data: [McpServerStatus], nextCursor?}` |
+| `skills/list` | ✅ | `cwds?: [path]`（空 = 会话 cwd）、`forceReload?: bool`（绕过缓存重扫磁盘） | `{data: [{cwd, skills: [SkillEntry]}]}` |
+| `skills/config/write` | ✅ | `enabled: bool` + **恰好一个** `name`（名称选择器）/ `path`（绝对路径选择器） | `{effectiveEnabled: bool}` |
 
 未知方法 → `-32600 "unknown variant"`（JSON-RPC error，不是 HTTP 语义）。
 
@@ -82,6 +84,32 @@ keyPath=`mcp_servers.<name>`，**禁止**自己编辑 TOML 文本。实测两种
 - `mcp_delete`：`config/value/write {keyPath, mergeStrategy:"replace", value:null}`
   → reload → 复核条目不存在 → postcondition
 - name 校验 `^[A-Za-z0-9_-]{1,64}$`（进入 keyPath，禁止路径/控制字符）
+
+## Skills 契约（P2.0.3，实测冻结）
+
+老墨不自建 skill 格式。Skill = SKILL.md 目录（开放格式，同
+anthropics/skills 的 Agent Skills 规范），由 Codex 自己发现与注入；老墨
+只做管理面（列表 / 搜索 / 逐个启停）。实测本机（251 skills，scope
+user 245 / system 6；探测脚本与原始输出见 `docs/evidence/extension-skills/`）：
+
+- `SkillEntry`：`{name, description, path (…/SKILL.md), scope:
+  user|project|system, enabled: bool}`——scope 是上游自己的词，不合成
+- `skills/list` 返回按 cwd 分组的 `data[]`；**必须传 active workspace
+  cwd**（与 plugin/list 同理，才能发现 project-scope skills）
+- 上游有 `skillsChanged` 通知（本地 skill 文件变更信号）→ 处理方式：
+  重新 `skills/list`（v1 用显式「强制刷新」按钮触发 `forceReload`，
+  不挂通知监听）
+- **启停是强 postcondition**：`skills/config/write` → `skills/list
+  {forceReload: true, 同 cwds}` → 校验目标条目 `enabled` 已翻转。上游
+  返回的 `effectiveEnabled` 只随响应携带，**绝不单独采信**
+- `skills/extraRoots/set {extraRoots: [abs]}`（schema 已有）v1 不暴露
+- `plugin/skill/read {remoteMarketplaceName, remotePluginId, skillName}`
+  只服务远程市场插件的 skill 详情，v1 不用（PluginDetail 的 skills
+  计数已够风险预览）
+- 写选择器校验：`name` ≤128 字符无控制符；`path` 必须绝对路径 ≤1024
+- 网关：`GET 聚合不含 skills 块`（避免每次扩展页加载白付一次扫描）；
+  独立路由 `/api/extensions/skills-list`（`forceReload?`）与
+  `/api/extensions/skill-toggle`（`{name|path, enabled}`）
 
 ## Configured vs Runtime Status（语义分离）
 

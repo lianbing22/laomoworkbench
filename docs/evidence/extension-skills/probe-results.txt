@@ -1,0 +1,9 @@
+groups: [('/Users/lianb/Downloads/bh', 251, ['system', 'user'])]
+first entry keys: ['description', 'enabled', 'name', 'path', 'scope']
+config/write(enabled=True, name=ad-creative) -> {"effectiveEnabled": true}
+config.skills after write: null
+disable -> {"effectiveEnabled": false}
+after disable: {"name": "ad-creative", "enabled": false}
+re-enable -> {"effectiveEnabled": true}
+after re-enable: {"name": "ad-creative", "enabled": true}
+config.skills finally: null
