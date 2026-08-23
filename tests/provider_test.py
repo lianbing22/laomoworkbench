@@ -650,5 +650,194 @@ class TestMockResponsesServer(unittest.TestCase):
         self.assertFalse(by_status[401]["authOk"])
 
 
+# --- 11. quick-start presets ---------------------------------------------------------
+
+
+class TestPresets(ProviderTestCase):
+    def test_public_list_carries_preset_catalogue(self):
+        listing = self.mgr.public_list()
+        presets = listing.get("presets") or []
+        self.assertTrue(presets, "preset catalogue must not be empty")
+        ids = [p["id"] for p in presets]
+        self.assertEqual(len(ids), len(set(ids)), "preset ids must be unique")
+        for preset in presets:
+            for field in ("id", "name", "baseUrl", "note"):
+                self.assertTrue(str(preset.get(field) or "").strip(), field)
+            self.assertRegex(preset["baseUrl"], r"^https?://")
+        # presets are data only: the returned copies never mutate the catalog
+        listing["presets"][0]["name"] = "tampered"
+        self.assertNotEqual(self.mgr.public_list()["presets"][0]["name"], "tampered")
+
+    def test_every_preset_base_url_passes_profile_validation(self):
+        # A preset baseUrl that save_profile would reject is a bug: the form
+        # pre-fills it and the user should never hit a validation error on it.
+        for preset in self.mgr.public_list()["presets"]:
+            try:
+                self.mgr.save_profile({
+                    "name": f"Preset {preset['id']}",
+                    "type": "custom",
+                    "baseUrl": preset["baseUrl"],
+                    "models": [{"id": "m-1", "label": "M1"}],
+                    "secret": FAKE_SECRET,
+                })
+            except ProviderError as exc:
+                self.fail(f"preset {preset['id']} baseUrl rejected: {exc}")
+
+
+# --- 12. model discovery (GET {base}/models) ----------------------------------------
+
+
+class TestDiscoverModels(unittest.TestCase):
+    server = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server = mock_responses_server.make_server("127.0.0.1", 0)
+        import threading
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        cls.base = f"http://127.0.0.1:{cls.server.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory(prefix="laomo-discover-test-")
+        self.addCleanup(tmp.cleanup)
+        self.creds = FakeCredentialStore()
+        self.mgr = ProviderProfileManager(Path(tmp.name), self.creds)
+
+    def _closed_port_base(self) -> str:
+        import socket
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            return f"http://127.0.0.1:{sock.getsockname()[1]}"
+
+    def test_happy_path_from_draft_form(self):
+        result = self.mgr.discover_models(base_url=f"{self.base}/v1",
+                                          secret="sk-fake-mock")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["models"], ["mock-one", "mock-two", "missing-model"])
+        # the catalogue request carried the bearer token, path /v1/models
+        status, payload = self._get_log()
+        entry = payload["requests"][-1]
+        self.assertEqual((entry["method"], entry["path"], entry["status"]),
+                         ("GET", "/v1/models", 200))
+        self.assertNotIn("sk-fake-mock", json.dumps(payload))
+
+    def _get_log(self):
+        with urllib.request.urlopen(f"{self.base}/__test_log", timeout=10) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8"))
+
+    def test_auth_failure_without_secret(self):
+        with self.assertRaises(ProviderError) as ctx:
+            self.mgr.discover_models(base_url=f"{self.base}/v1")
+        self.assertEqual(ctx.exception.code, "auth-failed")
+
+    def test_missing_models_endpoint_is_protocol_incompatible(self):
+        with self.assertRaises(ProviderError) as ctx:
+            self.mgr.discover_models(base_url=f"{self.base}/nope", secret="sk-fake-mock")
+        self.assertEqual(ctx.exception.code, "protocol-incompatible")
+
+    def test_unreachable_endpoint(self):
+        with self.assertRaises(ProviderError) as ctx:
+            self.mgr.discover_models(base_url=self._closed_port_base(), secret="sk-x")
+        self.assertEqual(ctx.exception.code, "unreachable")
+
+    def test_invalid_base_url_rejected(self):
+        with self.assertRaises(ProviderError) as ctx:
+            self.mgr.discover_models(base_url="not-a-url")
+        self.assertEqual(ctx.exception.code, "invalid")
+
+    def test_saved_profile_uses_stored_credential(self):
+        pub = self.mgr.save_profile({
+            "name": "Discover Me", "type": "custom",
+            "baseUrl": f"{self.base}/v1",
+            "models": [{"id": "placeholder", "label": "Placeholder"}],
+            "secret": "sk-fake-mock",
+        })
+        result = self.mgr.discover_models(profile_id=pub["id"])  # no secret passed
+        self.assertEqual(result["models"], ["mock-one", "mock-two", "missing-model"])
+        # the candidate secret is never persisted by discovery
+        self.assertEqual(self.creds.set_calls, [(pub["id"], "sk-fake-mock")])
+
+    def test_builtin_and_unknown_profiles_rejected(self):
+        with self.assertRaises(ProviderError) as ctx:
+            self.mgr.discover_models(profile_id=BUILTIN_CHATGPT_ID)
+        self.assertEqual(ctx.exception.code, "invalid")
+        with self.assertRaises(ProviderError) as ctx:
+            self.mgr.discover_models(profile_id="no-such-provider")
+        self.assertEqual(ctx.exception.code, "invalid")
+
+
+# --- 13. session.create model precedence --------------------------------------------
+
+
+class _CreateFakeRpc:
+    """FakeRpc, but thread/start answers with a usable threadId."""
+
+    def __init__(self):
+        self.requests: list[dict] = []
+
+    def request(self, method, params=None, timeout=60.0):
+        self.requests.append({"method": method, "params": params})
+        return {"threadId": "t-create-1"}
+
+
+class TestSessionCreateModelDefaults(unittest.TestCase):
+    def _adapter(self):
+        tmp = tempfile.TemporaryDirectory(prefix="laomo-create-test-")
+        self.addCleanup(tmp.cleanup)
+        adapter = CodexRuntimeAdapter(default_cwd=tmp.name, state_root=os.path.join(tmp.name, "host-state"))
+        proc = FakeProcess()
+        proc.rpc = _CreateFakeRpc()
+        adapter.process = proc
+        return adapter
+
+    def _save_selection(self, adapter, **data):
+        updated = adapter._state.settings_update("model-selection", data, None)
+        self.assertIsNotNone(updated)
+
+    def test_host_default_applied_when_provider_matches(self):
+        adapter = self._adapter()
+        self._save_selection(adapter, model="gpt-5.6-luna", provider="chatgpt",
+                             reasoningEffort="high")
+        res = adapter.rpc("clean", "session.create", {})
+        self.assertTrue(res["result"]["ok"])
+        params = adapter.process.rpc.requests[0]["params"]
+        self.assertEqual(params.get("model"), "gpt-5.6-luna")
+        self.assertEqual(params.get("effort"), "high")
+        # registry mirrors it, so session.models reports the right current
+        sid = res["result"]["value"]["sessionId"]
+        self.assertEqual(adapter._session_model_overrides(sid), ("gpt-5.6-luna", "high"))
+
+    def test_host_default_ignored_for_other_provider(self):
+        adapter = self._adapter()
+        self._save_selection(adapter, model="deepseek-chat", provider="deepseek",
+                             reasoningEffort="low")
+        adapter.rpc("clean", "session.create", {})
+        params = adapter.process.rpc.requests[0]["params"]
+        self.assertNotIn("model", params)
+        self.assertNotIn("effort", params)
+
+    def test_explicit_body_overrides_host_default(self):
+        adapter = self._adapter()
+        self._save_selection(adapter, model="saved-model", provider="chatgpt",
+                             reasoningEffort="high")
+        adapter.rpc("clean", "session.create", {"model": "explicit-model",
+                                                "reasoningEffort": "low"})
+        params = adapter.process.rpc.requests[0]["params"]
+        self.assertEqual(params.get("model"), "explicit-model")
+        self.assertEqual(params.get("effort"), "low")
+
+    def test_no_saved_default_leans_on_provider_params(self):
+        adapter = self._adapter()
+        adapter.rpc("clean", "session.create", {})
+        params = adapter.process.rpc.requests[0]["params"]
+        self.assertNotIn("model", params)
+        self.assertNotIn("effort", params)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

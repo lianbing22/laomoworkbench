@@ -28,6 +28,8 @@ import re
 import subprocess
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
 from pathlib import Path
 from typing import Any, Callable
@@ -37,6 +39,34 @@ BUILTIN_CHATGPT_ID = "chatgpt"
 # Current Codex only accepts the Responses wire protocol (verified against
 # 0.148.0-alpha.21; the legacy "chat" wire api has been removed upstream).
 SUPPORTED_WIRE_APIS = ("responses",)
+
+# Curated quick-start templates for the "new provider" form. Every entry must
+# speak the OpenAI Responses wire protocol natively or through a converting
+# gateway — chat-completions-only vendors would fail the runtime with
+# protocol-incompatible, so they are deliberately not listed. Mirrors the
+# preset-catalogue pattern of Cherry Studio / LobeChat provider configs.
+PROVIDER_PRESETS: list[dict[str, Any]] = [
+    {"id": "openai", "name": "OpenAI 官方",
+     "baseUrl": "https://api.openai.com/v1",
+     "keyUrl": "https://platform.openai.com/api-keys",
+     "note": "Responses 协议原生。"},
+    {"id": "deepseek", "name": "DeepSeek 官方",
+     "baseUrl": "https://api.deepseek.com/v1",
+     "keyUrl": "https://platform.deepseek.com/api_keys",
+     "note": "原生 Responses 端点（deepseek-chat / deepseek-reasoner）。"},
+    {"id": "openrouter", "name": "OpenRouter",
+     "baseUrl": "https://openrouter.ai/api/v1",
+     "keyUrl": "https://openrouter.ai/keys",
+     "note": "Responses 协议 drop-in 兼容，一个 Key 聚合多家模型。"},
+    {"id": "litellm", "name": "LiteLLM 网关（本机）",
+     "baseUrl": "http://127.0.0.1:4000/v1",
+     "keyUrl": "",
+     "note": "本机 LiteLLM Proxy 默认端口；网关负责把各家协议转成 Responses。"},
+    {"id": "new-api", "name": "new-api / one-api 网关（本机）",
+     "baseUrl": "http://127.0.0.1:3000/v1",
+     "keyUrl": "",
+     "note": "本机网关默认端口（new-api 3000 / one-api 3000）；需先在网关里配好渠道。"},
+]
 
 
 def _now_ms() -> int:
@@ -231,7 +261,8 @@ class ProviderProfileManager:
         return {"ok": True,
                 "providers": [self.public(p) for p in self.list()],
                 "activeProviderId": self.active_id(),
-                "secretStorage": self.credentials.storage_description()}
+                "secretStorage": self.credentials.storage_description(),
+                "presets": [dict(p) for p in PROVIDER_PRESETS]}
 
     # -- CRUD --
     _URL_RE = re.compile(r"^https?://[^\s/$.?#].[^\s]*$", re.I)
@@ -318,6 +349,65 @@ class ProviderProfileManager:
         if not self.get(profile_id) or profile_id == BUILTIN_CHATGPT_ID:
             raise ProviderError("Provider 不存在", "not-found")
         self.credentials.set(profile_id, secret)
+
+    # -- model discovery --------------------------------------------------------
+    def discover_models(self, profile_id: str | None = None,
+                        base_url: str | None = None,
+                        secret: str | None = None) -> dict[str, Any]:
+        """Fetch the provider's OpenAI-compatible catalogue (GET {base}/models).
+
+        Two modes: a saved profile id (uses the stored credential) or a form
+        draft (baseUrl + candidate secret — used for this request only and
+        never stored). Returns {"ok": True, "models": [id, ...]}; failures
+        raise ProviderError whose code matches the provider outcome taxonomy
+        (auth-failed | unreachable | protocol-incompatible | runtime-error).
+        """
+        if profile_id:
+            profile = self.get(profile_id)
+            if not profile or profile.get("type") != "custom":
+                raise ProviderError("仅自定义服务支持从接口拉取模型", "invalid")
+            base_url = profile.get("baseUrl") or ""
+            if not secret:
+                secret = self.credentials.get(profile_id)
+        base_url = str(base_url or "").strip().rstrip("/")
+        if not base_url or not self._URL_RE.match(base_url):
+            raise ProviderError("Base URL 必须是合法的 http(s) 地址", "invalid")
+        request = urllib.request.Request(f"{base_url}/models",
+                                         headers={"Accept": "application/json"})
+        if secret and str(secret).strip():
+            request.add_header("Authorization", f"Bearer {str(secret).strip()}")
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                raw = response.read(1_048_576).decode("utf-8", "replace")
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403):
+                raise ProviderError("鉴权失败：API Key 无效或未填写", "auth-failed") from None
+            if exc.code in (404, 405):
+                raise ProviderError("该端点没有 /models 接口（协议不兼容）",
+                                    "protocol-incompatible") from None
+            raise ProviderError(f"服务返回 HTTP {exc.code}", "runtime-error") from None
+        except urllib.error.URLError as exc:
+            reason = getattr(exc, "reason", exc)
+            if isinstance(reason, TimeoutError):
+                raise ProviderError("端点不可达：连接超时", "unreachable") from None
+            raise ProviderError("端点不可达：检查 Base URL 与网络", "unreachable") from None
+        except (TimeoutError, OSError):
+            raise ProviderError("端点不可达：检查 Base URL 与网络", "unreachable") from None
+        try:
+            payload = json.loads(raw or "{}")
+        except json.JSONDecodeError:
+            raise ProviderError("返回内容不是 JSON：该端点可能不兼容 /models 协议",
+                                "protocol-incompatible") from None
+        entries = payload.get("data") if isinstance(payload, dict) else payload
+        models: list[str] = []
+        if isinstance(entries, list):
+            for entry in entries:
+                mid = str(entry.get("id") or "").strip() if isinstance(entry, dict) else ""
+                if mid and mid not in models:
+                    models.append(mid)
+        if not models:
+            raise ProviderError("端点可达，但没有返回任何模型", "protocol-incompatible")
+        return {"ok": True, "models": models}
 
     def activate(self, profile_id: str) -> str:
         profile = self.get(profile_id)

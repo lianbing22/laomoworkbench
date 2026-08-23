@@ -1767,3 +1767,33 @@ class TestEvaluatorSandboxMisattribution(MissionLoopTest):
                       "提示词必须指向机器验收作为执行验证的归属")
         self.assertNotIn("就按 NEEDS_WORK 记录", prompt,
                          "旧条款（写行为失败=NEEDS_WORK）必须移除")
+
+
+class TestMissionModelPinning(MissionLoopTest):
+    """create(model=/effort=) 把模型选择钉在 mission 文档上，run_turn 逐轮回读。"""
+
+    def test_create_stores_model_and_effort(self):
+        result = self.mgr.create(DEFAULT_OBJECTIVE, cwd=str(self.root),
+                                 acceptance_criteria=["a"],
+                                 model="gpt-5.6-luna", effort="high")
+        mid = mission_id_of(result)
+        self.track(mid)
+        meta = self.read_json(self.mdir(mid) / "mission.json")
+        self.assertEqual(meta.get("model"), "gpt-5.6-luna")
+        self.assertEqual(meta.get("effort"), "high")
+
+    def test_create_without_model_leaves_fields_absent(self):
+        mid = self.create_mission(acceptance=["a"])
+        meta = self.read_json(self.mdir(mid) / "mission.json")
+        self.assertNotIn("model", meta)
+        self.assertNotIn("effort", meta)
+
+    def test_blank_strings_are_dropped_not_stored(self):
+        result = self.mgr.create(DEFAULT_OBJECTIVE, cwd=str(self.root),
+                                 acceptance_criteria=["a"],
+                                 model="   ", effort="")
+        mid = mission_id_of(result)
+        self.track(mid)
+        meta = self.read_json(self.mdir(mid) / "mission.json")
+        self.assertNotIn("model", meta)
+        self.assertNotIn("effort", meta)

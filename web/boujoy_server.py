@@ -1777,6 +1777,20 @@ class BoujoyHandler(BaseHTTPRequestHandler):
                 result = adapter.test_provider(managers, str(payload.get("id", "")))
                 self._json(result)
                 return
+            if action == "discover":
+                # Pull the provider's OpenAI-compatible catalogue (GET
+                # {base}/models). Structured failures come back HTTP 200 with
+                # {ok: false, outcome, message} so the form can grade the
+                # error exactly like a failed connection test.
+                try:
+                    result = managers.discover_models(
+                        profile_id=str(payload.get("id") or "") or None,
+                        base_url=payload.get("baseUrl"),
+                        secret=payload.get("secret"))
+                except ProviderError as exc:
+                    result = {"ok": False, "outcome": exc.code, "message": str(exc)}
+                self._json(result)
+                return
             self._error(404, "未知 provider 操作")
         except ProviderError as exc:
             self._error(400 if exc.code != "not-found" else 404, str(exc))
@@ -2086,7 +2100,9 @@ class BoujoyHandler(BaseHTTPRequestHandler):
                                         cwd=payload.get("cwd"),
                                         acceptance_criteria=payload.get("acceptanceCriteria"),
                                         options=payload.get("options"),
-                                        verification=payload.get("verification") or {})
+                                        verification=payload.get("verification") or {},
+                                        model=payload.get("model"),
+                                        effort=payload.get("effort"))
                 elif action in ("start", "pause", "resume", "cancel"):
                     result = getattr(mgr, action)(str(payload.get("id") or ""))
                 else:

@@ -1343,7 +1343,9 @@ class MissionManager:
     def create(self, objective: str, cwd: str | None = None,
                acceptance_criteria: list[str] | None = None,
                options: dict[str, Any] | None = None,
-               verification: dict[str, Any] | None = None) -> dict[str, Any]:
+               verification: dict[str, Any] | None = None,
+               model: str | None = None,
+               effort: str | None = None) -> dict[str, Any]:
         objective = str(objective or "").strip()
         if not objective:
             raise MissionError("objective 不能为空")
@@ -1352,11 +1354,17 @@ class MissionManager:
         store = MissionStore(self.runs_root(Path(run_cwd)) / mission_id)
         store.ensure_dirs()
         self._register_run(mission_id, store.root)
+        # Optional model pinning: every planner/worker/evaluator turn of this
+        # mission runs on it (run_turn reads these back per turn).
+        model = str(model or "").strip() or None
+        effort = str(effort or "").strip() or None
         store.save_mission({
             "id": mission_id, "objective": objective,
             "acceptanceCriteria": [str(a) for a in (acceptance_criteria or [])],
             "cwd": run_cwd, "options": options or {},
             "verification": verification or {},
+            **({"model": model} if model else {}),
+            **({"effort": effort} if effort else {}),
             "createdAt": _now_ms(),
             **self._git_base_probe(run_cwd),
         })

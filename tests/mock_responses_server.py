@@ -12,6 +12,12 @@ provider profiles end-to-end without any real API key:
           event stream when run with --sse (or when the request has
           "stream": true)
 
+    GET /v1/models   (alias: GET /models)
+        - Authorization must be "Bearer <non-empty>" -> else 401
+        - 200 {"object": "list", "data": [{"id": "mock-one"},
+          {"id": "mock-two"}, {"id": "missing-model"}]}
+          (OpenAI-compatible model-catalogue shape for discovery tests)
+
     GET /__test_log
         - JSON summary of the API requests received so far
           ({"method", "path", "auth", "authOk", "model", "status"}) so test
@@ -35,6 +41,12 @@ REQUEST_LOG: list[dict] = []
 _LOG_LOCK = threading.Lock()
 
 _RESPONSES_PATHS = ("/v1/responses", "/responses")
+_MODELS_PATHS = ("/v1/models", "/models")
+_MODEL_CATALOGUE = [
+    {"id": "mock-one", "object": "model", "owned_by": "laomo-mock"},
+    {"id": "mock-two", "object": "model", "owned_by": "laomo-mock"},
+    {"id": "missing-model", "object": "model", "owned_by": "laomo-mock"},
+]
 
 
 def clear_log() -> None:
@@ -148,8 +160,23 @@ class ResponsesMockHandler(BaseHTTPRequestHandler):
             with _LOG_LOCK:
                 snapshot = list(REQUEST_LOG)
             self._send_json(200, {"ok": True, "count": len(snapshot), "requests": snapshot})
-        else:
-            self._send_json(404, {"error": {"message": "not found"}})
+            return
+        if path in _MODELS_PATHS:
+            auth = self.headers.get("Authorization") or ""
+            auth_ok = auth.startswith("Bearer ") and auth[len("Bearer "):].strip() != ""
+            entry = {"method": "GET", "path": path,
+                     "auth": (auth.split(" ", 1)[0] + " ********") if auth else None,
+                     "authOk": auth_ok, "model": None}
+            if not auth_ok:
+                entry["status"] = 401
+                _log_entry(entry)
+                self._send_json(401, {"error": {"message": "Invalid API key"}})
+                return
+            entry["status"] = 200
+            _log_entry(entry)
+            self._send_json(200, {"object": "list", "data": _MODEL_CATALOGUE})
+            return
+        self._send_json(404, {"error": {"message": "not found"}})
 
     def do_POST(self):
         path = self.path.split("?", 1)[0]

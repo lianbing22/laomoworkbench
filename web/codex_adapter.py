@@ -1220,6 +1220,21 @@ class CodexRuntimeAdapter:
         return ok_value({"sessions": items, "items": items})
 
     # session.create -> thread/start
+    def _host_model_defaults(self) -> dict[str, Any]:
+        """Persisted model selection (settings ns "model-selection"), written
+        by the UI on every model/effort change so the choice survives gateway
+        restarts and pre-seeds new sessions. Shape: {model, provider,
+        reasoningEffort} — provider rides along so a stale pin made under one
+        service never lands on another service's sessions."""
+        try:
+            for ns in self._state.settings_namespaces():
+                if ns.get("ns") == "model-selection":
+                    data = ns.get("data")
+                    return dict(data) if isinstance(data, dict) else {}
+        except Exception:
+            pass
+        return {}
+
     def _rpc_session_create(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
         proc = self._ensure_process()
         provider_id = "chatgpt"
@@ -1228,7 +1243,15 @@ class CodexRuntimeAdapter:
             self._register_active_provider(provider_id)
         params: dict[str, Any] = {"cwd": self.workspace_cwd()}
         params.update(self._provider_thread_params(provider_id))
-        model, effort = self._session_model_overrides(body.get("sessionId") or "")
+        # Model precedence: explicit body > host-saved default (provider-
+        # matched) > provider defaultModel (folded in above) > Codex default.
+        model = str(body.get("model") or "").strip() or None
+        effort = str(body.get("reasoningEffort") or "").strip() or None
+        if not model or not effort:
+            saved = self._host_model_defaults()
+            if saved.get("provider") in (None, "", provider_id):
+                model = model or (str(saved.get("model") or "").strip() or None)
+                effort = effort or (str(saved.get("reasoningEffort") or "").strip() or None)
         if model:
             params["model"] = model
         if effort:
@@ -1240,6 +1263,10 @@ class CodexRuntimeAdapter:
         self.registry.ensure(tid, cwd=self.workspace_cwd())
         self.registry.set_loaded(tid, True)
         self.registry.set_provider(tid, provider_id)
+        if model or effort:
+            # Registry mirrors the applied defaults so session.models reports
+            # the new session's model correctly right after creation.
+            self.registry.set_model(tid, model, effort)
         self._emit(self.translator.session_added(tid))
         return ok_value({"sessionId": tid, "id": tid, "providerId": provider_id})
 
@@ -2126,8 +2153,9 @@ class CodexRuntimeAdapter:
     def _rpc_subagent_interrupt(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
         return err_value("codex 运行时暂不支持子代理")
 
-    def _rpc_skill_list(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
-        return ok_value({"skills": [], "supported": False})
+    # skill.list 不再有桩：Skills 由扩展平台的原生 skills/list 承接
+    # （/api/extensions/skills-list）；旧 harness RPC 落到 _rpc_generic 的
+    # 诚实降级（supported: false）。
 
     def _rpc_generic(self, endpoint: str, body: dict[str, Any]) -> dict[str, Any]:
         self._debug_log(f"stubbed rpc: {endpoint}")
