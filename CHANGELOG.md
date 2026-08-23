@@ -4,6 +4,25 @@
 [docs/codex-protocol-notes.md](docs/codex-protocol-notes.md)，当前阶段状态与排期见
 [docs/status.md](docs/status.md)。
 
+## 2026-08-23（日）— 主题配置模块重构（next-themes 架构移植）
+
+参照 [pacocoursey/next-themes](https://github.com/pacocoursey/next-themes) 的成熟架构，
+把明暗二态切换升级为完整主题模块（原生 JS 移植，无构建依赖）：
+
+- **首帧防闪**：`index.html` `<head>` 内联同步 bootstrap 在首绘前把存储的模式解析为
+  `html[data-theme]`，浅色用户不再先看到一帧暗色；JS 被禁用时保持品牌默认暗色。
+- **三态模式**：跟随系统 / 浅色 / 深色（`localStorage["boujoy-theme"]` 存模式而非解析值，
+  旧存的 `light`/`dark` 语义不变；首次运行跟随 OS——OS 未明确偏好浅色时解析为暗）。
+- **系统跟随**：`system` 模式下监听 `prefers-color-scheme` 变化实时切换。
+- **跨标签页同步**：`storage` 事件采纳兄弟页选择、绝不回写（避免事件循环）。
+- **原生控件同步**：CSS `color-scheme` + `html.style.colorScheme`（暗 `:root`/浅
+  `html[data-theme="light"]`），滚动条与表单控件随主题；`meta[name=theme-color]` 与
+  manifest 的 `theme_color` 对齐真实色板（`#080a0d` 暗 / `#f1eadc` 浅），且切换时动态更新。
+- **入口**：主题按钮改为三态循环（◐ 跟随系统 → ☼ 浅色 → ☾ 深色，title/aria 同步）；
+  命令面板提供三个显式主题命令。
+- **测试**：`tests/smoke_test.py` 新增静态契约断言（bootstrap 存在、三态模块标记、
+  跨标签页去回写、遗留二态初始化移除）。
+
 ## 2026-08-22（二）— P0.5 Model Provider Profiles（多 agent 并行实施）
 
 在 P0 基础上产品化模型服务配置：用户不碰 Codex 配置文件，即可配置/验证/启用
