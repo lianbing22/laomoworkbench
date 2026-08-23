@@ -10,7 +10,10 @@ const HISTORY_FETCH_LIMIT = 50;
 
 const state = {
   page: "agent",
-  theme: localStorage.getItem("boujoy-theme") || "dark",
+  // themeMode is the user's choice (system | light | dark); theme is the
+  // resolved one CSS consumes via html[data-theme]. Owned by the theme module.
+  themeMode: "system",
+  theme: "dark",
   // Default to clean: this deployment's knowledge runtime (DSH 3080) may be
   // absent; an explicit knowledge choice is still remembered.
   mode: localStorage.getItem("boujoy-mode") === "knowledge" ? "knowledge" : "clean",
@@ -802,11 +805,73 @@ async function restartBoujoy() {
   }
 }
 
-function setTheme(theme) {
-  state.theme = theme;
-  document.documentElement.dataset.theme = theme;
-  localStorage.setItem("boujoy-theme", theme);
-  $("#themeButton").textContent = theme === "dark" ? "☼" : "◐";
+// --- Theme module ------------------------------------------------------------
+// Vanilla port of next-themes' architecture (pacocoursey/next-themes): tri-
+// state mode, a pre-paint bootstrap in index.html owning first paint, this
+// module owning everything after. html[data-theme] always holds the RESOLVED
+// theme; localStorage["boujoy-theme"] holds the MODE. Legacy saved values
+// "light"/"dark" keep their meaning; first run now follows the OS (dark
+// unless the OS explicitly prefers light).
+const THEME_STORAGE_KEY = "boujoy-theme";
+const THEME_MODES = ["system", "light", "dark"];
+const THEME_META = {
+  system: { glyph: "◐", label: "主题：跟随系统" },
+  light: { glyph: "☼", label: "主题：浅色" },
+  dark: { glyph: "☾", label: "主题：深色" },
+};
+
+function readStoredThemeMode() {
+  try {
+    const saved = localStorage.getItem(THEME_STORAGE_KEY);
+    return THEME_MODES.includes(saved) ? saved : "system";
+  } catch (_) { return "system"; }
+}
+
+function resolveTheme(mode) {
+  if (mode !== "system") return mode;
+  return window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+}
+
+function applyResolvedTheme(resolved) {
+  state.theme = resolved;
+  document.documentElement.dataset.theme = resolved;
+  // color-scheme keeps native widgets (scrollbars, form controls) in step;
+  // theme-color retints the PWA/title bar to the real surface tokens.
+  document.documentElement.style.colorScheme = resolved;
+  const meta = document.querySelector('meta[name="theme-color"]');
+  if (meta) meta.setAttribute("content", resolved === "light" ? "#f1eadc" : "#080a0d");
+  const view = THEME_META[state.themeMode] || THEME_META.system;
+  const button = $("#themeButton");
+  button.textContent = view.glyph;
+  button.title = view.label;
+  button.setAttribute("aria-label", view.label);
+}
+
+function setTheme(mode) {
+  state.themeMode = THEME_MODES.includes(mode) ? mode : "system";
+  try { localStorage.setItem(THEME_STORAGE_KEY, state.themeMode); } catch (_) { /* private mode */ }
+  applyResolvedTheme(resolveTheme(state.themeMode));
+}
+
+function initTheme() {
+  // The bootstrap in index.html already resolved data-theme before first
+  // paint; re-resolving here is idempotent and keeps DOM/state in lockstep
+  // without a second write.
+  state.themeMode = readStoredThemeMode();
+  applyResolvedTheme(resolveTheme(state.themeMode));
+  const media = window.matchMedia("(prefers-color-scheme: light)");
+  const onSystemChange = () => {
+    if (state.themeMode === "system") applyResolvedTheme(resolveTheme("system"));
+  };
+  if (media.addEventListener) media.addEventListener("change", onSystemChange);
+  else if (media.addListener) media.addListener(onSystemChange); // iOS < 14
+  // Cross-tab sync (next-themes pattern): adopt the sibling's choice, never
+  // echo it back — writing here would loop the storage event.
+  window.addEventListener("storage", (event) => {
+    if (event.key !== THEME_STORAGE_KEY) return;
+    state.themeMode = THEME_MODES.includes(event.newValue) ? event.newValue : "system";
+    applyResolvedTheme(resolveTheme(state.themeMode));
+  });
 }
 
 function showPage(page) {
@@ -3687,7 +3752,9 @@ const COMMANDS = [
   { name: "新建会话", hint: "⌘ N", run: createSession },
   { name: "选择新项目", hint: "⌘ O", run: pickProject },
   { name: "模型服务管理", hint: "Provider", run: openProviderDialog },
-  { name: "切换明暗主题", hint: "", run: () => setTheme(state.theme === "dark" ? "light" : "dark") },
+  { name: "主题：跟随系统", hint: "", run: () => setTheme("system") },
+  { name: "主题：浅色", hint: "", run: () => setTheme("light") },
+  { name: "主题：深色", hint: "", run: () => setTheme("dark") },
   { name: "切换知识 / 纯净模式", hint: "", run: () => setMode(state.mode === "knowledge" ? "clean" : "knowledge") },
   { name: "重启老墨工作台", hint: "安全重启", run: restartBoujoy },
 ];
@@ -3788,7 +3855,10 @@ function bindEvents() {
     const busyModeButton = event.target.closest("[data-busy-mode]");
     if (busyModeButton) { setBusyMode(busyModeButton.dataset.busyMode); return; }
   });
-  $("#themeButton").addEventListener("click", () => setTheme(state.theme === "dark" ? "light" : "dark"));
+  $("#themeButton").addEventListener("click", () => {
+    const next = THEME_MODES[(THEME_MODES.indexOf(state.themeMode) + 1) % THEME_MODES.length];
+    setTheme(next);
+  });
   // Mobile hamburger drawer (DeepSeek-app style ☰ menu)
   const mobileDrawer = $("#mobileDrawer");
   const renderMobileSessions = () => {
@@ -4045,7 +4115,7 @@ function bindEvents() {
 }
 
 async function init() {
-  setTheme(state.theme);
+  initTheme();
   // Sync the mode toggle with the persisted mode before the first harness boot.
   $("#modeSwitch").setAttribute("aria-pressed", String(state.mode === "clean"));
   $("#modeName").textContent = state.mode === "clean" ? "纯净模式" : "知识模式";
