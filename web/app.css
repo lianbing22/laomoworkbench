@@ -706,6 +706,7 @@ html[data-theme="dark"] .page-news::before { background-image: linear-gradient(r
 .collection-toolbar { display: flex; align-items: center; gap: 20px; margin: 32px 0 22px; }
 .collection-toolbar .search-cut { max-width: 520px; color: var(--paper); background: rgba(7,9,13,.75); }
 .collection-toolbar > span { color: rgba(255,255,255,.61); font: 900 9px var(--mono); }
+.collection-toolbar .toolbar-cuts { display: flex; gap: 8px; margin-left: auto; }
 .expert-grid { display: grid; grid-template-columns: repeat(3,minmax(220px,1fr)); gap: 16px; padding-bottom: 40px; }
 .record-card { position: relative; min-height: 260px; padding: 20px; overflow: hidden; border: 3px solid var(--ink); color: var(--ink); background: var(--paper); box-shadow: 7px 7px 0 var(--ink); clip-path: polygon(1% 2%,98% 0,100% 94%,4% 100%,0 13%); }
 .record-card:nth-child(3n+2) { background: var(--acid); transform: rotate(.7deg); }
@@ -718,6 +719,8 @@ html[data-theme="dark"] .page-news::before { background-image: linear-gradient(r
 .record-status { padding: 4px 7px; border: 2px solid currentColor; font: 900 7px var(--mono); }
 .record-card h3 { margin: 24px 0 7px; font: 1000 20px var(--display); letter-spacing: -.05em; }
 .record-card p { min-height: 46px; margin: 0; opacity: .68; font-size: 10px; line-height: 1.55; }
+.record-tags { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 9px; }
+.record-tag { padding: 3px 6px; border: 2px solid currentColor; opacity: .82; font: 900 8px var(--mono); }
 .record-actions { position: relative; z-index: 2; display: flex; flex-wrap: wrap; gap: 6px; margin-top: 22px; }
 .record-actions button { padding: 7px 9px; border: 2px solid currentColor; color: inherit; background: transparent; font: 900 8px var(--mono); }
 .record-actions .call { color: var(--paper); background: var(--ink); }
@@ -786,6 +789,11 @@ dialog::backdrop { background: rgba(3,4,7,.74); backdrop-filter: blur(8px); }
 .permission-warning p { margin: 8px 0 0; color: var(--text); font-size: 11px; line-height: 1.65; }
 .danger-access { background: var(--pink) !important; }
 .dispatch-badge { margin: 16px 0 0; padding: 13px; color: var(--ink); background: var(--yellow); border: 2px solid var(--ink); box-shadow: 4px 4px 0 var(--pink); font: 900 11px var(--display); }
+.dispatch-section-label { margin: 16px 0 0; color: var(--muted); font: 800 9px var(--mono); }
+.dispatch-vars { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 4px 14px; }
+.dispatch-preview { margin-top: 16px; border: 1px solid var(--line); }
+.dispatch-preview summary { padding: 10px 12px; color: var(--muted); font: 800 9px var(--mono); cursor: pointer; user-select: none; }
+.dispatch-preview pre { max-height: 260px; overflow: auto; margin: 0; padding: 14px; color: var(--paper); background: var(--ink); font: 500 10px/1.7 var(--mono); white-space: pre-wrap; word-break: break-word; }
 .reader-dialog { width: min(970px,calc(100vw - 60px)); height: min(820px,calc(100vh - 60px)); padding: 0; border: 3px solid var(--ink); color: var(--ink); background: var(--paper-2); box-shadow: 12px 12px 0 var(--blue); }
 .reader-dialog header { position: sticky; top: 0; z-index: 3; padding: 19px 24px; color: var(--paper); background: var(--ink); }
 .reader-dialog header > div:last-child { display: flex; gap: 7px; }

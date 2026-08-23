@@ -269,14 +269,16 @@ def isolated_gateway_checks() -> list[str]:
             record_path = vault / "05-Prompts" / "Boujoy-Harness" / "Experts" / f"{record_id}.md"
             assert record_path.is_file() and "type: boujoy-expert" in record_path.read_text("utf-8")
             status, value = request(origin + "/api/records?kind=expert")
-            assert status == 200 and any(item["id"] == record_id for item in value["records"])
-            record.update({"id": record_id, "description": "已更新"})
+            assert status == 200 and any(item["id"] == record_id and item["tags"] == [] for item in value["records"])
+            record.update({"id": record_id, "description": "已更新", "tags": ["产品", "战略", "战略", "  ", "x" * 40]})
             status, value = request(origin + "/api/records/save", record)
             assert status == 200 and value["record"]["description"] == "已更新"
+            assert value["record"]["tags"] == ["产品", "战略", "x" * 24], value["record"]
+            assert "tags:" in record_path.read_text("utf-8")
             status, _ = request(origin + "/api/records/delete", {"kind": "expert", "id": record_id})
             assert status == 200 and not record_path.exists()
             assert any(path.name.startswith(record_id) for path in (fake_home / ".Trash").iterdir())
-            passed.append("expert Markdown CRUD + recoverable trash")
+            passed.append("expert Markdown CRUD + tags round-trip + recoverable trash")
 
             status, value = request(origin + "/api/session/delete", {"sessionId": fake_session.name, "mode": "knowledge"})
             assert status == 200 and value["movedLogs"] == 1 and not fake_session.exists()
@@ -353,6 +355,18 @@ def isolated_gateway_checks() -> list[str]:
             assert "textBlocks" in app_js
             assert "function safeHttpHref" in app_js
             assert 'parsed.protocol === "http:" || parsed.protocol === "https:"' in app_js
+            # Theme module (next-themes port): pre-paint bootstrap in the head
+            # script, tri-state mode in app.js, color-scheme in CSS.
+            assert 'localStorage.getItem("boujoy-theme")' in index_html
+            assert "(prefers-color-scheme: light)" in index_html
+            assert 'html lang="zh-CN" data-theme="dark"' in index_html  # no-JS fallback stays dark
+            assert "color-scheme: dark" in app_css and "color-scheme: light" in app_css
+            assert "const THEME_STORAGE_KEY" in app_js and "THEME_MODES" in app_js
+            assert "function resolveTheme" in app_js and "function initTheme" in app_js
+            assert 'event.key !== THEME_STORAGE_KEY' in app_js  # cross-tab adopt, never echo
+            assert 'localStorage.getItem("boujoy-theme") || "dark"' not in app_js  # legacy binary init gone
+            assert 'setTheme(state.theme === "dark" ? "light" : "dark")' not in app_js
+            passed.append("theme module: pre-paint bootstrap + tri-state + cross-tab sync")
             server_source = SERVER.read_text("utf-8")
             assert "source.recv(64 * 1024)" in server_source
             assert "deadline = time.monotonic() + 300" not in server_source

@@ -258,7 +258,7 @@
           <div><p class="section-kicker">CALL THE RIGHT BRAIN</p><h2>专家不是头像，<br><span>是可调用的方法。</span></h2><p>创建、组合并直接派发到 Agent。所有配置保存在本地 Markdown。</p></div>
           <button id="addExpertButton" class="giant-add">＋<span>新增专家</span></button>
         </div>
-        <div class="collection-toolbar"><label class="search-cut"><span>⌕</span><input id="expertSearch" placeholder="搜索专家…"></label><span id="expertCount">0 位专家</span></div>
+        <div class="collection-toolbar"><label class="search-cut"><span>⌕</span><input id="expertSearch" placeholder="搜索专家或标签…"></label><span id="expertCount">0 位专家</span><span class="toolbar-cuts"><button id="expertExportButton" class="mini-cut">↓ 导出</button><button id="expertImportButton" class="mini-cut">↑ 导入</button></span></div>
         <div id="expertGrid" class="expert-grid empty-collection"></div>
       </section>
 
@@ -419,9 +419,11 @@
     <form method="dialog" id="recordForm">
       <header><div><p id="recordKicker">NEW RECORD</p><h2 id="recordDialogTitle">新增专家</h2></div><button type="button" value="cancel" class="dialog-close" data-close-dialog="recordDialog" aria-label="关闭">×</button></header>
       <input id="recordId" type="hidden"><input id="recordKind" type="hidden">
+      <label id="recordTemplateWrap">从模板开始<select id="recordTemplate"></select></label>
       <label>名称<input id="recordName" required maxlength="80" placeholder="例如：产品战略专家"></label>
       <label>一句话说明<input id="recordDescription" maxlength="180" placeholder="擅长什么，什么时候调用"></label>
-      <label>系统指令<textarea id="recordInstructions" required rows="10" placeholder="写下角色、判断标准、工作流程和输出要求…"></textarea></label>
+      <label>标签<input id="recordTags" maxlength="120" placeholder="用逗号分隔，如：产品, 战略"></label>
+      <label>系统指令<textarea id="recordInstructions" required rows="10" placeholder="写下角色、判断标准、工作流程和输出要求…&#10;&#10;指令里可以写 {{变量名}}，派发时会让你现场填写。"></textarea></label>
       <label class="check-row"><input id="recordEnabled" type="checkbox" checked><span>启用这个配置</span></label>
       <footer><button type="button" value="cancel" class="ghost-button" data-close-dialog="recordDialog">取消</button><button type="submit" id="saveRecordButton" value="default" class="primary-cut">保存到 Markdown</button></footer>
     </form>
@@ -433,8 +435,20 @@
       <input id="dispatchKind" type="hidden"><input id="dispatchId" type="hidden">
       <div id="dispatchBadge" class="dispatch-badge"></div>
       <label id="dispatchStyleWrap">叠加输出风格<select id="dispatchStyle"><option value="">不叠加风格</option></select></label>
+      <div id="dispatchVarsWrap" class="hidden"><p class="dispatch-section-label">填写变量</p><div id="dispatchVars" class="dispatch-vars"></div></div>
       <label>本次任务<textarea id="dispatchTask" required rows="7" placeholder="告诉它这次要解决什么…"></textarea></label>
+      <details id="dispatchPreviewWrap" class="dispatch-preview"><summary>预览最终 Prompt</summary><pre id="dispatchPreview"></pre></details>
       <footer><button type="button" value="cancel" class="ghost-button" data-close-dialog="dispatchDialog">取消</button><button type="submit" id="confirmDispatch" value="default" class="primary-cut">送进 Agent →</button></footer>
+    </form>
+  </dialog>
+
+  <dialog id="importDialog" class="boujoy-dialog import-dialog">
+    <form method="dialog" id="importForm">
+      <header><div><p>IMPORT ROSTER</p><h2>导入专家</h2></div><button type="button" value="cancel" class="dialog-close" data-close-dialog="importDialog" aria-label="关闭">×</button></header>
+      <label>导入为<select id="importKind"><option value="expert">专家</option><option value="style">风格</option></select></label>
+      <label>粘贴内容<textarea id="importText" rows="9" placeholder="支持两种格式：&#10;1. 本产品导出的 JSON（自动识别专家/风格，忽略上一项）&#10;2. Markdown（frontmatter 的 name/description 会自动读取，正文作为指令；可粘贴多份，用 --- 分隔；兼容 Claude agents 格式）"></textarea></label>
+      <label>或选择文件<input id="importFile" type="file" accept=".json,.md,.txt"></label>
+      <footer><button type="button" value="cancel" class="ghost-button" data-close-dialog="importDialog">取消</button><button type="submit" id="importRunButton" value="default" class="primary-cut">导入</button></footer>
     </form>
   </dialog>
 

@@ -3305,6 +3305,114 @@ async function captureCurrentConversation() {
   }
 }
 
+// Structured expert templates: every one follows the 角色 → 判断标准 → 工作流程
+// → 输出要求 anatomy, and some carry {{变量}} placeholders that the dispatch
+// dialog asks to fill at call time (Langfuse-style compile-on-dispatch).
+const EXPERT_TEMPLATES = [
+  {
+    name: "产品战略专家",
+    description: "拆解业务问题，给出可执行的取舍与路线建议",
+    tags: ["产品", "战略"],
+    instructions: [
+      "## 角色",
+      "你是一位资深产品战略顾问，擅长在信息不全时做出可信的取舍判断。",
+      "## 判断标准",
+      "先明确目标和约束（用户、成本、时间），优先考虑可验证的假设，而不是完美方案。",
+      "## 工作流程",
+      "1. 用一句话复述本次要解决的核心问题。",
+      "2. 列出 2-3 个可选方案，各自给出代价与收益。",
+      "3. 明确推荐一个方案，并说明放弃其他方案的原因。",
+      "4. 给出落地前的 3 个关键验证点。",
+      "## 输出要求",
+      "结论先行，控制在 500 字以内；不确定的信息要标注「假设」。",
+    ].join("\n"),
+  },
+  {
+    name: "代码评审专家",
+    description: "以缺陷优先级审查代码，先抓正确性与边界，再看风格",
+    tags: ["工程", "质量"],
+    instructions: [
+      "## 角色",
+      "你是一位严谨的代码评审员，只报告有真实影响的问题，不做风格洁癖。",
+      "## 判断标准",
+      "缺陷按 P0（会导致错误/数据问题）、P1（边界与并发隐患）、P2（可维护性）分级；无法确认的只提疑问不下结论。",
+      "## 工作流程",
+      "1. 先通读改动理解意图。",
+      "2. 按正确性 → 边界条件 → 并发/资源 → 可读性顺序审查。",
+      "3. 每个问题给出文件:行号、风险描述和建议修法。",
+      "## 输出要求",
+      "按优先级分组列表；没有 P0 问题时明确说「无阻断问题」。",
+    ].join("\n"),
+  },
+  {
+    name: "内容主笔",
+    description: "把素材整理成结构清晰、有观点的长文",
+    tags: ["写作", "内容"],
+    instructions: [
+      "## 角色",
+      "你是一位资深内容主笔，文风克制、信息密度高，拒绝空话套话。",
+      "## 判断标准",
+      "每一段都要回答读者心里的下一个问题；删掉不影响结论的句子。",
+      "## 工作流程",
+      "1. 先列大纲并与主题对齐。",
+      "2. 成文时每个小节先给结论再给论据。",
+      "3. 结尾给读者一个可执行的动作。",
+      "## 输出要求",
+      "Markdown 格式；标题不超过两级；全文围绕 {{目标读者}} 的关注点展开。",
+    ].join("\n"),
+  },
+  {
+    name: "数据分析专家",
+    description: "从原始数据到结论，量化不确定性与陷阱",
+    tags: ["数据", "分析"],
+    instructions: [
+      "## 角色",
+      "你是一位数据分析专家，先质疑数据质量，再做分析。",
+      "## 判断标准",
+      "结论必须给出依据的口径和样本范围；相关不等于因果，相关结论必须标注。",
+      "## 工作流程",
+      "1. 描述数据来源 {{数据来源}} 的口径、范围与缺失情况。",
+      "2. 给出关键指标的分布与异常点。",
+      "3. 提出 2-3 个可信结论，各自附置信程度。",
+      "4. 指出本次分析做不到什么。",
+      "## 输出要求",
+      "先用 3 句话给结论摘要，再展开过程；数字保留必要精度。",
+    ].join("\n"),
+  },
+  {
+    name: "头脑风暴搭档",
+    description: "围绕主题快速发散再收敛，产出可挑选的候选方向",
+    tags: ["创意", "发散"],
+    instructions: [
+      "## 角色",
+      "你是一位发散思维强的创意搭档，先追求数量，再帮助收敛。",
+      "## 工作流程",
+      "1. 围绕 {{主题}} 快速给出 10 个方向，短的、长的、离谱的都要。",
+      "2. 按「可行性 × 新颖度」标出 3 个高潜力方向。",
+      "3. 为这 3 个方向各写一句下一步验证动作。",
+      "## 输出要求",
+      "发散阶段不评判；收敛阶段给出明确理由；总长不超过 400 字。",
+    ].join("\n"),
+  },
+];
+
+function parseTemplateVars(text) {
+  const names = [];
+  const pattern = /\{\{\s*([^{}\n]{1,24}?)\s*\}\}/g;
+  let match;
+  while ((match = pattern.exec(String(text || "")))) {
+    if (!names.includes(match[1])) names.push(match[1]);
+  }
+  return names;
+}
+
+function applyTemplateVars(text, values) {
+  return String(text || "").replace(/\{\{\s*([^{}\n]{1,24}?)\s*\}\}/g, (whole, name) => {
+    const value = values?.[name];
+    return value && String(value).trim() ? String(value).trim() : whole;
+  });
+}
+
 async function loadRecords(kind) {
   try {
     const value = await jsonFetch(`/api/records?kind=${kind}`);
@@ -3314,10 +3422,16 @@ async function loadRecords(kind) {
   } catch (error) { toast(error.message, true); }
 }
 
+function recordTagsHtml(item) {
+  const tags = Array.isArray(item.tags) ? item.tags.slice(0, 8) : [];
+  if (!tags.length) return "";
+  return `<div class="record-tags">${tags.map(tag => `<span class="record-tag">#${escapeHtml(tag)}</span>`).join("")}</div>`;
+}
+
 function renderRecords(kind) {
   const list = state.records[kind];
   const search = $(`#${kind}Search`).value.trim().toLowerCase();
-  const filtered = list.filter(item => `${item.name} ${item.description}`.toLowerCase().includes(search));
+  const filtered = list.filter(item => `${item.name} ${item.description} ${(item.tags || []).join(" ")}`.toLowerCase().includes(search));
   $(`#${kind}Count`).textContent = kind === "expert" ? `${filtered.length} 位专家` : `${filtered.length} 种风格`;
   const grid = $(`#${kind}Grid`);
   if (!filtered.length) {
@@ -3328,12 +3442,14 @@ function renderRecords(kind) {
     <article class="record-card ${item.enabled ? "" : "disabled"}" data-index="${String(index + 1).padStart(2, "0")}">
       <div class="record-top"><span class="record-avatar">${escapeHtml(item.name.slice(0,1).toUpperCase())}</span><span class="record-status">${item.enabled ? "ON CALL" : "OFF"}</span></div>
       <h3>${escapeHtml(item.name)}</h3><p>${escapeHtml(item.description || "尚未填写说明")}</p>
-      <div class="record-actions"><button class="call" data-record-call="expert:${escapeHtml(item.id)}">调用专家 →</button><button data-record-edit="expert:${escapeHtml(item.id)}">编辑</button><button data-record-copy="expert:${escapeHtml(item.id)}">复制</button><button data-record-delete="expert:${escapeHtml(item.id)}">删除</button></div>
+      ${recordTagsHtml(item)}
+      <div class="record-actions"><button class="call" data-record-call="expert:${escapeHtml(item.id)}">调用专家 →</button><button data-record-toggle="expert:${escapeHtml(item.id)}">${item.enabled ? "停用" : "启用"}</button><button data-record-edit="expert:${escapeHtml(item.id)}">编辑</button><button data-record-copy="expert:${escapeHtml(item.id)}">复制</button><button data-record-delete="expert:${escapeHtml(item.id)}">删除</button></div>
     </article>` : `
     <article class="style-card record-card ${item.enabled ? "" : "disabled"}" data-index="${String(index + 1).padStart(2, "0")}">
       <div class="style-swatch"></div><div class="record-top"><span class="record-status">${item.enabled ? "ACTIVE" : "OFF"}</span></div>
       <h3>${escapeHtml(item.name)}</h3><p>${escapeHtml(item.description || "尚未填写说明")}</p>
-      <div class="record-actions"><button class="call" data-record-call="style:${escapeHtml(item.id)}">使用风格 →</button><button data-record-edit="style:${escapeHtml(item.id)}">编辑</button><button data-record-copy="style:${escapeHtml(item.id)}">复制</button><button data-record-delete="style:${escapeHtml(item.id)}">删除</button></div>
+      ${recordTagsHtml(item)}
+      <div class="record-actions"><button class="call" data-record-call="style:${escapeHtml(item.id)}">使用风格 →</button><button data-record-toggle="style:${escapeHtml(item.id)}">${item.enabled ? "停用" : "启用"}</button><button data-record-edit="style:${escapeHtml(item.id)}">编辑</button><button data-record-copy="style:${escapeHtml(item.id)}">复制</button><button data-record-delete="style:${escapeHtml(item.id)}">删除</button></div>
     </article>`).join("");
 }
 
@@ -3342,11 +3458,29 @@ function openRecordDialog(kind, item = null, copy = false) {
   $("#recordId").value = copy ? "" : item?.id || "";
   $("#recordName").value = item ? `${item.name}${copy ? " 副本" : ""}` : "";
   $("#recordDescription").value = item?.description || "";
+  $("#recordTags").value = Array.isArray(item?.tags) ? item.tags.join(", ") : "";
   $("#recordInstructions").value = item?.instructions || "";
   $("#recordEnabled").checked = item?.enabled ?? true;
+  const useTemplate = kind === "expert" && !item;
+  $("#recordTemplateWrap").classList.toggle("hidden", !useTemplate);
+  const select = $("#recordTemplate");
+  select.innerHTML = '<option value="">（可选）从模板开始…</option>' + EXPERT_TEMPLATES.map((template, index) => `<option value="${index}">${escapeHtml(template.name)}</option>`).join("");
+  select.value = "";
   $("#recordKicker").textContent = item && !copy ? "EDIT RECORD" : "NEW RECORD";
   $("#recordDialogTitle").textContent = `${item && !copy ? "编辑" : "新增"}${kind === "expert" ? "专家" : "风格"}`;
   $("#recordDialog").showModal();
+}
+
+function applyExpertTemplate(select) {
+  const template = EXPERT_TEMPLATES[Number(select.value)];
+  select.value = "";
+  if (!template) return;
+  if ($("#recordInstructions").value.trim() && !confirm("用模板内容覆盖当前系统指令？")) return;
+  if (!$("#recordName").value.trim()) $("#recordName").value = template.name;
+  if (!$("#recordDescription").value.trim()) $("#recordDescription").value = template.description;
+  const existing = $("#recordTags").value.split(/[,，]/).map(tag => tag.trim()).filter(Boolean);
+  $("#recordTags").value = [...new Set([...existing, ...template.tags])].join(", ");
+  $("#recordInstructions").value = template.instructions;
 }
 
 async function saveRecord(event) {
@@ -3356,6 +3490,7 @@ async function saveRecord(event) {
     id: $("#recordId").value,
     name: $("#recordName").value.trim(),
     description: $("#recordDescription").value.trim(),
+    tags: $("#recordTags").value.split(/[,，]/).map(tag => tag.trim()).filter(Boolean),
     instructions: $("#recordInstructions").value.trim(),
     enabled: $("#recordEnabled").checked,
   };
@@ -3364,6 +3499,17 @@ async function saveRecord(event) {
     $("#recordDialog").close();
     await loadRecords(payload.kind);
     toast("已保存到本地 Markdown");
+  } catch (error) { toast(error.message, true); }
+}
+
+async function toggleRecord(kind, id) {
+  const item = state.records[kind].find(record => record.id === id);
+  if (!item) return;
+  const payload = { kind, id, name: item.name, description: item.description || "", tags: item.tags || [], instructions: item.instructions, enabled: !item.enabled };
+  try {
+    await jsonFetch("/api/records/save", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+    await loadRecords(kind);
+    toast(payload.enabled ? `已启用「${item.name}」` : `已停用「${item.name}」`);
   } catch (error) { toast(error.message, true); }
 }
 
@@ -3377,6 +3523,31 @@ async function deleteRecord(kind, id) {
   } catch (error) { toast(error.message, true); }
 }
 
+function dispatchVarValues() {
+  const values = {};
+  $$("#dispatchVars [data-var]").forEach(input => { values[input.dataset.var] = input.value; });
+  return values;
+}
+
+function assembleDispatchPrompt() {
+  const kind = $("#dispatchKind").value;
+  const item = state.records[kind].find(record => record.id === $("#dispatchId").value);
+  const task = $("#dispatchTask").value.trim();
+  if (!item || !task) return "";
+  const values = dispatchVarValues();
+  const parts = [`请按以下${kind === "expert" ? "专家" : "风格"}配置完成任务。`, `【${item.name}】\n${applyTemplateVars(item.instructions, values)}`];
+  if (kind === "expert" && $("#dispatchStyle").value) {
+    const style = state.records.style.find(record => record.id === $("#dispatchStyle").value);
+    if (style) parts.push(`【输出风格：${style.name}】\n${applyTemplateVars(style.instructions, values)}`);
+  }
+  parts.push(`【本次任务】\n${task}`);
+  return parts.join("\n\n");
+}
+
+function updateDispatchPreview() {
+  $("#dispatchPreview").textContent = assembleDispatchPrompt() || "（填写本次任务后这里会显示最终 Prompt）";
+}
+
 function openDispatch(kind, id) {
   const item = state.records[kind].find(record => record.id === id);
   if (!item) return;
@@ -3387,6 +3558,10 @@ function openDispatch(kind, id) {
   $("#dispatchStyleWrap").classList.toggle("hidden", kind !== "expert");
   $("#dispatchStyle").innerHTML = '<option value="">不叠加风格</option>' + state.records.style.filter(style => style.enabled).map(style => `<option value="${escapeHtml(style.id)}">${escapeHtml(style.name)}</option>`).join("");
   $("#dispatchTask").value = "";
+  const vars = parseTemplateVars(item.instructions);
+  $("#dispatchVarsWrap").classList.toggle("hidden", !vars.length);
+  $("#dispatchVars").innerHTML = vars.map(name => `<label>{{${escapeHtml(name)}}}<input data-var="${escapeHtml(name)}" placeholder="本次要填入的值"></label>`).join("");
+  updateDispatchPreview();
   $("#dispatchDialog").showModal();
 }
 
@@ -3396,18 +3571,128 @@ function confirmDispatch(event) {
   const item = state.records[kind].find(record => record.id === $("#dispatchId").value);
   const task = $("#dispatchTask").value.trim();
   if (!item || !task) return;
-  const parts = [`请按以下${kind === "expert" ? "专家" : "风格"}配置完成任务。`, `【${item.name}】\n${item.instructions}`];
-  if (kind === "expert" && $("#dispatchStyle").value) {
-    const style = state.records.style.find(record => record.id === $("#dispatchStyle").value);
-    if (style) parts.push(`【输出风格：${style.name}】\n${style.instructions}`);
-  }
-  parts.push(`【本次任务】\n${task}`);
+  const prompt = assembleDispatchPrompt();
+  if (!prompt) return;
   $("#dispatchDialog").close();
   showPage("agent");
-  $("#promptInput").value = parts.join("\n\n");
+  $("#promptInput").value = prompt;
   autoResizePrompt();
   $("#contextChips").innerHTML = `<span class="context-chip">${escapeHtml(item.name)}</span>`;
   $("#promptInput").focus();
+}
+
+// -- Roster import / export ---------------------------------------------------
+
+function exportRecords() {
+  const pick = record => ({ name: record.name, description: record.description || "", tags: record.tags || [], instructions: record.instructions, enabled: record.enabled !== false });
+  const bundle = { version: 1, exported: new Date().toISOString(), experts: state.records.expert.map(pick), styles: state.records.style.map(pick) };
+  if (!bundle.experts.length && !bundle.styles.length) { toast("还没有可导出的配置", true); return; }
+  const blob = new Blob([JSON.stringify(bundle, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `boujoy-roster-${new Date().toISOString().slice(0, 10)}.json`;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  toast(`已导出 ${bundle.experts.length} 位专家 / ${bundle.styles.length} 种风格`);
+}
+
+function parseMarkdownRecords(text, fallbackKind) {
+  const records = [];
+  const segments = text.trim().split(/^-{3,}\s*$/m);
+  // Without frontmatter the whole text is one instruction blob.
+  if (segments.length < 3) {
+    const name = (text.match(/^#\s+(.+)$/m) || [])[1]?.trim() || `导入${fallbackKind === "expert" ? "专家" : "风格"}`;
+    const instructions = text.replace(/^#\s+.+$/m, "").trim();
+    if (instructions) records.push({ kind: fallbackKind, name, description: "", instructions, tags: [], enabled: true });
+    return records;
+  }
+  // segments = [pre, frontmatter, body, frontmatter, body, ...]
+  for (let index = 1; index + 1 < segments.length; index += 2) {
+    const frontmatter = segments[index] || "";
+    const body = (segments[index + 1] || "").trim();
+    const fields = {};
+    for (const line of frontmatter.split("\n")) {
+      const sep = line.indexOf(":");
+      if (sep > 0) fields[line.slice(0, sep).trim()] = line.slice(sep + 1).trim().replace(/^["']|["']$/g, "");
+    }
+    const heading = (body.match(/^#\s+(.+)$/m) || [])[1]?.trim();
+    const instructionSplit = body.split(/^##\s+(?:指令|Instructions)\s*$/m);
+    const instructions = (instructionSplit.length > 1 ? instructionSplit.slice(1).join("\n\n## ") : body.replace(/^#\s+.+$/m, "")).trim();
+    if (!instructions) continue;
+    const tags = (fields.tags || "").replace(/^\[|\]$/g, "").split(",").map(tag => tag.trim().replace(/^["']|["']$/g, "")).filter(Boolean);
+    records.push({
+      kind: (fields.type === "boujoy-style" || fallbackKind === "style") ? "style" : "expert",
+      name: fields.name || heading || `导入${fallbackKind === "expert" ? "专家" : "风格"}${records.length + 1}`,
+      description: fields.description || "",
+      instructions,
+      tags,
+      enabled: (fields.enabled || "true").toLowerCase() !== "false",
+    });
+  }
+  return records;
+}
+
+function parseImportPayload(text, fallbackKind) {
+  const trimmed = text.trim();
+  if (!trimmed) return [];
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    let data;
+    try { data = JSON.parse(trimmed); } catch { throw new Error("JSON 解析失败，请检查粘贴内容"); }
+    const flat = Array.isArray(data) ? data.map(record => ({ ...record })) : [];
+    if (!flat.length && data && typeof data === "object") {
+      for (const kind of ["expert", "style"]) {
+        for (const record of data[kind === "expert" ? "experts" : "styles"] || []) flat.push({ ...record, kind });
+      }
+    }
+    return flat
+      .map(record => ({
+        kind: record.kind === "style" ? "style" : "expert",
+        name: String(record.name || "").trim(),
+        description: String(record.description || ""),
+        instructions: String(record.instructions || record.prompt || "").trim(),
+        tags: Array.isArray(record.tags) ? record.tags.map(tag => String(tag)) : [],
+        enabled: record.enabled !== false,
+      }))
+      .filter(record => record.name && record.instructions);
+  }
+  return parseMarkdownRecords(trimmed, fallbackKind);
+}
+
+function openImportDialog() {
+  $("#importText").value = "";
+  $("#importFile").value = "";
+  $("#importKind").value = "expert";
+  $("#importDialog").showModal();
+}
+
+async function runImport(event) {
+  event.preventDefault();
+  const button = $("#importRunButton");
+  const payloadText = $("#importText").value;
+  if (!payloadText.trim()) { toast("请先粘贴内容或选择文件", true); return; }
+  let records;
+  try {
+    records = parseImportPayload(payloadText, $("#importKind").value);
+  } catch (error) { toast(error.message, true); return; }
+  if (!records.length) { toast("没有解析出可导入的配置", true); return; }
+  if (!confirm(`将导入 ${records.length} 项配置，同名会自动追加副本。继续？`)) return;
+  button.disabled = true;
+  let done = 0;
+  try {
+    for (const record of records) {
+      await jsonFetch("/api/records/save", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(record) });
+      done += 1;
+    }
+    $("#importDialog").close();
+    await Promise.all([loadRecords("expert"), loadRecords("style")]);
+    toast(`已导入 ${done} 项配置`);
+  } catch (error) {
+    toast(`导入到第 ${done + 1} 项时失败：${error.message}`, true);
+    if (done) await Promise.all([loadRecords("expert"), loadRecords("style")]);
+  } finally {
+    button.disabled = false;
+  }
 }
 
 async function loadSettings(tab = "general") {
@@ -3809,12 +4094,13 @@ function bindEvents() {
     if (openButton) { event.preventDefault(); state.readerStack = []; openReader(openButton.dataset.openPath); return; }
     const starter = event.target.closest("[data-starter]");
     if (starter) { $("#promptInput").value = starter.dataset.starter; autoResizePrompt(); $("#promptInput").focus(); return; }
-    for (const action of ["call", "edit", "copy", "delete"]) {
+    for (const action of ["call", "toggle", "edit", "copy", "delete"]) {
       const target = event.target.closest(`[data-record-${action}]`);
       if (target) {
         const [kind, id] = target.dataset[`record${action[0].toUpperCase()}${action.slice(1)}`].split(":");
         const item = state.records[kind].find(record => record.id === id);
         if (action === "call") openDispatch(kind, id);
+        if (action === "toggle") toggleRecord(kind, id);
         if (action === "edit") openRecordDialog(kind, item);
         if (action === "copy") openRecordDialog(kind, item, true);
         if (action === "delete") deleteRecord(kind, id);
@@ -4060,7 +4346,18 @@ function bindEvents() {
   $("#expertSearch").addEventListener("input", () => renderRecords("expert"));
   $("#styleSearch").addEventListener("input", () => renderRecords("style"));
   $("#recordForm").addEventListener("submit", saveRecord);
+  $("#recordTemplate").addEventListener("change", event => applyExpertTemplate(event.target));
   $("#dispatchForm").addEventListener("submit", confirmDispatch);
+  $("#dispatchForm").addEventListener("input", updateDispatchPreview);
+  $("#dispatchForm").addEventListener("change", updateDispatchPreview);
+  $("#expertExportButton").addEventListener("click", exportRecords);
+  $("#expertImportButton").addEventListener("click", openImportDialog);
+  $("#importForm").addEventListener("submit", runImport);
+  $("#importFile").addEventListener("change", async event => {
+    const file = event.target.files[0];
+    if (!file) return;
+    try { $("#importText").value = await file.text(); } catch (error) { toast(`读取文件失败：${error.message}`, true); }
+  });
   $("#goalForm").addEventListener("submit", saveGoal);
   $("#goalMissionMode").addEventListener("change", syncGoalMissionMode);
   $("#permissionForm").addEventListener("submit", confirmFullAccess);

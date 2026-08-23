@@ -256,6 +256,27 @@ def safe_slug(value: str) -> str:
     return cleaned or datetime.now().strftime("record-%Y%m%d%H%M%S")
 
 
+def normalize_tags(value: Any, limit: int = 8, max_len: int = 24) -> list[str]:
+    """Accept a list or comma-separated string; dedupe keeping order."""
+    if isinstance(value, str):
+        raw = value.split(",")
+    elif isinstance(value, (list, tuple)):
+        raw = value
+    else:
+        raw = []
+    tags: list[str] = []
+    for item in raw:
+        tag = str(item).strip().strip('"').strip("'").strip()
+        if not tag:
+            continue
+        tag = tag[:max_len]
+        if tag not in tags:
+            tags.append(tag)
+        if len(tags) >= limit:
+            break
+    return tags
+
+
 # -- Minimal WebSocket forwarding --------------------------------------------
 # Harness's event streams (events.mux / events.host) are WebSocket-only and
 # reject cross-origin upgrades. The product page lives on this gateway (8766)
@@ -1102,6 +1123,19 @@ class BoujoyHandler(BaseHTTPRequestHandler):
 
         return visit(value)
 
+    @staticmethod
+    def _parse_tags(value: str) -> list[str]:
+        text = value.strip()
+        if not text:
+            return []
+        if text.startswith("[") and text.endswith("]"):
+            try:
+                parsed: Any = json.loads(text)
+            except ValueError:
+                parsed = text[1:-1].split(",")
+            return normalize_tags(parsed)
+        return normalize_tags(text)
+
     def _parse_record(self, path: Path) -> dict[str, Any] | None:
         try:
             text = path.read_text("utf-8")
@@ -1122,6 +1156,7 @@ class BoujoyHandler(BaseHTTPRequestHandler):
             "name": fields.get("name") or path.stem,
             "description": fields.get("description", ""),
             "enabled": fields.get("enabled", "true").lower() != "false",
+            "tags": self._parse_tags(fields.get("tags", "")),
             "instructions": instructions,
             "updated": fields.get("updated", ""),
         }
@@ -1151,13 +1186,16 @@ class BoujoyHandler(BaseHTTPRequestHandler):
                 record_id = f"{base}-{index}"
                 index += 1
         enabled = bool(payload.get("enabled", True))
+        tags = normalize_tags(payload.get("tags"))
         updated = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        tag_line = f"tags: [{', '.join(yaml_string(tag) for tag in tags)}]\n" if tags else ""
         text = (
             "---\n"
             f"type: boujoy-{kind}\n"
             f"name: {yaml_string(name)}\n"
             f"description: {yaml_string(description)}\n"
             f"enabled: {'true' if enabled else 'false'}\n"
+            f"{tag_line}"
             f"updated: {updated}\n"
             "---\n\n"
             f"# {name}\n\n"
@@ -2012,6 +2050,15 @@ class BoujoyHandler(BaseHTTPRequestHandler):
                     result = svc.mcp_save(entry)
                 elif action == "mcp-delete":
                     result = svc.mcp_delete(str(payload.get("name") or ""))
+                elif action == "skills-list":
+                    result = svc.skills_list(
+                        ws_cwd, force_reload=bool(payload.get("forceReload")))
+                elif action == "skill-toggle":
+                    result = svc.skill_set_enabled(
+                        enabled=bool(payload.get("enabled")),
+                        name=payload.get("name") or None,
+                        path=payload.get("path") or None,
+                        cwd=ws_cwd)
                 else:
                     self._error(404, "未知 extension 操作")
                     return
