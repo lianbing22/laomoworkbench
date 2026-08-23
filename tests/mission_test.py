@@ -1610,7 +1610,11 @@ class TestParallelWorkUnits(MissionLoopTest):
                         "cancel 应及时生效")
         runner = self.mgr._runners.get(mid) if hasattr(self.mgr, "_runners") else None
         if runner is not None:
-            self.assertFalse(runner.is_alive(), "runner 线程应已退出")
+            # bounded wait: cancel()'s join(5) can expire on a loaded runner
+            # just before the thread fully unwinds — wait, don't assert-race
+            self.assertTrue(self.wait_until(
+                lambda: not runner.is_alive(), timeout=15),
+                "runner 线程应已退出")
         frozen = len(records)
         time.sleep(1.5)
         self.assertEqual(len(records), frozen, "cancel 后不得再有 worker 完成")
