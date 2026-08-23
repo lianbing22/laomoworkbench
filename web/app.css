@@ -1390,6 +1390,9 @@ html[data-theme="light"] textarea:focus-visible, html[data-theme="light"] select
 .provider-test-ok { margin: 8px 0 0; padding: 8px 10px; border-left: 3px solid var(--acid); color: var(--acid); background: color-mix(in srgb, var(--acid) 8%, transparent); font: 750 8px/1.6 var(--mono); }
 .provider-models-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 16px; }
 .provider-models-head label { margin-top: 0; }
+.provider-models-tools { display: flex; align-items: center; gap: 8px; }
+#providerPresetNote { margin-top: -6px; }
+.goal-model-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 4px; }
 .provider-model-row { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr) 34px; gap: 7px; margin-top: 8px; }
 .provider-model-row input { min-width: 0; margin-top: 0 !important; padding: 9px 10px !important; font-family: var(--mono) !important; font-size: 11px !important; }
 .provider-model-remove { border: 1px solid var(--line); color: inherit; background: transparent; font: 1000 14px var(--mono); }

@@ -4,6 +4,35 @@
 [docs/codex-protocol-notes.md](docs/codex-protocol-notes.md)，当前阶段状态与排期见
 [docs/status.md](docs/status.md)。
 
+## 2026-08-23（日）— 模型配置 v2（快速模板 + 模型自动发现 + 选择持久化）
+
+对标 one-api / new-api / LiteLLM / Cherry Studio / LobeChat 的供应商配置体验，
+把 P0.5 Provider 模块补到「零手敲」水位（前后端契约见
+[docs/provider-contract.md](docs/provider-contract.md)）：
+
+- **快速模板**：新建服务一键预填。模板目录由后端统一维护（`GET /api/providers`
+  的 `presets`），只收录 Responses 协议原生或网关可达的服务：OpenAI 官方、
+  DeepSeek 官方（原生 Responses 端点）、OpenRouter（drop-in 兼容）、本机
+  LiteLLM（:4000）、本机 new-api/one-api（:3000）；模板附 API Key 获取地址。
+- **模型自动发现**：`POST /api/providers/discover` 调服务的 OpenAI 兼容目录
+  （`GET {base}/models`），表单「↧ 从接口拉取」把模型 ID 合并进列表（保留已填
+  显示名与默认选择）。已存服务用钥匙串凭证；草稿（未保存）用输入框里的 Key，
+  只用于本次请求、绝不落盘。失败按 outcome 分级提示（鉴权失败/端点不可达/
+  协议不兼容/参数无效）。
+- **选择持久化**：模型/推理强度选择写入 host 设置 ns `model-selection`
+  `{model, provider, reasoningEffort}`；`session.create` 按优先级应用
+  （显式参数 > 已存默认〔provider 匹配才生效〕> 服务 defaultModel > Codex
+  默认），重启不再丢、新会话自动沿用，且不会把 DeepSeek 的选择错钉到
+  ChatGPT 会话。
+- **Mission 模型钉选**：`POST /api/missions/create` 接受可选 `model`/`effort`，
+  该 mission 所有 planner/worker/evaluator 回合固定用它；目标对话框 Mission
+  模式下提供模型/强度选择（留空跟随默认）。
+- **设置页清理**：模型 tab 移除 DeepSeek 专用旧凭证行与 deepseek-official 耦合，
+  改为「当前模型服务 + 上次选择 + 管理入口 + 重新发现」。
+- **测试**：provider 套件 47 用例（新增 presets 校验、discover 全 outcome 路径、
+  session.create 优先级矩阵），mission 钉选 3 例；mock server 增加
+  `GET /v1/models` OpenAI 兼容目录。
+
 ## 2026-08-23（日）— Skills 配置模块（Codex 原生 skills RPC）
 
 设置 → Skills 从空壳只读列表升级为真实管理面。老墨不自建 skill 格式——

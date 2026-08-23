@@ -27,6 +27,9 @@ const state = {
   projection: null,
   models: [],
   modelDirectory: null,
+  // Host-persisted default selection {model, provider, reasoningEffort}
+  // (settings ns "model-selection"); survives restarts, pre-seeds sessions.
+  modelSelection: null,
   presets: [],
   pendingImages: [],
   imageUrls: new Map(),
@@ -70,6 +73,7 @@ const state = {
   queue: [],
   subagents: [],
   providers: [],
+  providerPresets: [],
   activeProviderId: null,
   providerTesting: {},
   providerTestResults: {},
@@ -1026,6 +1030,7 @@ async function loadAgentFoundation() {
   chooseInitialWorkspaceAndSession();
   renderWorkspaces();
   renderSessions();
+  await loadModelSelection();
   await loadModels();
   await loadPresets();
   if (state.sessionId) await loadSession(state.sessionId);
@@ -1171,7 +1176,7 @@ async function searchSessions(query) {
 
 async function loadModels() {
   if (!state.sessionId) {
-    state.models = [{ provider: state.host?.provider, model: state.host?.model }];
+    state.models = [{ provider: state.host?.provider, model: state.modelSelection?.model || state.host?.model }];
   } else {
     try {
       const value = await rpc("session.models", { sessionId: state.sessionId });
@@ -1187,7 +1192,7 @@ async function loadModels() {
     }
   }
   const select = $("#modelSelect");
-  const current = state.modelDirectory?.current?.model || state.host?.model;
+  const current = state.modelDirectory?.current?.model || state.modelSelection?.model || state.host?.model;
   select.innerHTML = state.models.map(item => {
     const model = typeof item === "string" ? item : item.model || item.id || item.name;
     const provider = typeof item === "string" ? "" : item.provider || item.providerId || "";
@@ -1217,15 +1222,35 @@ async function applyEffort() {
   try {
     const effort = $("#effortSelect").value;
     if (!state.sessionId) { toast("请先创建会话", true); return; }
-    if (!effort) { toast("已恢复默认推理强度"); return; }
+    if (!effort) { toast("已恢复默认推理强度"); }
     let model = null, provider = null;
     try { const selected = JSON.parse($("#modelSelect").value); model = selected.model; provider = selected.provider; } catch (_) {}
     const current = state.modelDirectory?.current || {};
     await rpc("session.selectModel", { sessionId: state.sessionId, model: model || current.model, provider: provider || current.provider, reasoningEffort: effort });
     if (state.modelDirectory?.current) state.modelDirectory.current.reasoningEffort = effort;
+    persistModelSelection({ reasoningEffort: effort || null });
     updateModelSummary();
-    toast(`推理强度已设为 ${effort}`);
+    if (effort) toast(`推理强度已设为 ${effort}`);
   } catch (error) { toast(error.message, true); }
+}
+
+// Host-persisted default model/effort (settings ns "model-selection", clean
+// mode only): the choice survives gateway restarts and session.create applies
+// it to every new session. Quiet by design — the selection itself already
+// succeeded; persistence is a background nicety and must never toast errors.
+async function persistModelSelection(patch = {}) {
+  if (state.mode !== "clean") return;
+  state.modelSelection = { ...(state.modelSelection || {}), ...patch };
+  try { await rpc("settings.update", { ns: "model-selection", patch: state.modelSelection }); } catch (_) {}
+}
+
+async function loadModelSelection() {
+  if (state.mode !== "clean") return;
+  try {
+    const described = await rpc("settings.describe", {});
+    const ns = (described.namespaces || []).find(item => item.ns === "model-selection");
+    if (ns?.data?.model) state.modelSelection = ns.data;
+  } catch (_) {}
 }
 
 async function createSession() {
@@ -2348,6 +2373,9 @@ async function selectModel() {
     if (state.modelDirectory?.current) state.modelDirectory.current.model = selected.model;
     renderEffortOptions(selected.model);
     updateModelSummary();
+    // Persist as the default for future sessions (effort untouched here: the
+    // option's reasoningEffort is the model's own default, not a user pick).
+    persistModelSelection({ model: selected.model, provider: selected.provider || state.modelDirectory?.current?.provider });
     toast(`已切换到 ${selected.model}`);
   } catch (error) { toast(error.message, true); }
 }
@@ -2547,6 +2575,16 @@ function syncGoalMissionMode() {
   const asMission = $("#goalMissionMode").checked;
   $("#goalRounds").disabled = asMission;
   $("#goalMissionNote").classList.toggle("hidden", !asMission);
+  $("#goalModelRow")?.classList.toggle("hidden", !asMission);
+  // Mission model pinning: the current catalogue feeds the picker; blank =
+  // follow the host/service default.
+  const modelSelect = $("#goalModelSelect");
+  if (asMission && modelSelect && state.models.length) {
+    const current = modelSelect.value;
+    modelSelect.innerHTML = ['<option value="">跟随默认模型</option>',
+      ...state.models.map(item => `<option value="${escapeHtml(item.model || item.id || "")}">${escapeHtml(item.name || item.model || item.id || "模型")}</option>`)].join("");
+    if ([...modelSelect.options].some(option => option.value === current)) modelSelect.value = current;
+  }
   $("#goalForm button[type='submit']").textContent = asMission ? "创建 Mission" : "保存目标";
 }
 
@@ -2560,7 +2598,12 @@ async function saveGoalAsMission(objective) {
     const created = await jsonFetch("/api/missions/create", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ objective, acceptanceCriteria: [] }),
+      body: JSON.stringify({
+        objective, acceptanceCriteria: [],
+        // Optional per-mission model pinning; blank = follow defaults.
+        model: $("#goalModelSelect")?.value || undefined,
+        effort: $("#goalEffortSelect")?.value || undefined,
+      }),
     });
     const mission = created.mission || created || {};
     try {
@@ -3716,13 +3759,19 @@ async function loadSettings(tab = "general") {
       state.workspaces = normalizeWorkspaces(value);
       content.innerHTML = state.workspaces.map((item, index) => `<div class="setting-card"><strong>${escapeHtml(workspaceTitle(item))}</strong><small>${escapeHtml(item.path)} · ${(item.sessionIds || []).length} 个会话</small><div class="setting-actions"><button data-workspace-action="open:${escapeHtml(item.id)}">Finder</button><button data-workspace-action="rename:${escapeHtml(item.id)}">重命名</button><button data-workspace-action="up:${escapeHtml(item.id)}" ${index === 0 ? "disabled" : ""}>上移</button><button data-workspace-action="down:${escapeHtml(item.id)}" ${index === state.workspaces.length - 1 ? "disabled" : ""}>下移</button><button data-workspace-action="delete:${escapeHtml(item.id)}">移除项目</button></div></div>`).join("") || '<p class="muted">暂无项目。</p>';
     } else if (tab === "models") {
-      const [providers, models, credentials] = await Promise.all([
-        rpc("llm.providers", {}).catch(() => []), rpc("llm.models", {}).catch(() => ({ groups: [] })), rpc("credentials.describe", { refs: ["DEEPSEEK_API_KEY"] }).catch(() => ({})),
+      const [providers, models] = await Promise.all([
+        rpc("llm.providers", {}).catch(() => ({})), rpc("llm.models", {}).catch(() => ({ groups: [] })),
       ]);
       const providerList = unpackList(providers, ["providers", "items"]);
+      const active = providerList.find(item => item.active) || providerList[0] || {};
       const modelList = (models.groups || []).flatMap(group => (group.models || []).map(item => ({ ...item, providerName: group.name })));
-      const credential = credentials.credentials?.DEEPSEEK_API_KEY;
-      content.innerHTML = `<div class="setting-card"><strong>供应商</strong><small>${escapeHtml(providerList.filter(item => item.active).map(item => item.displayName || item.provider).join(" · ") || "使用 Harness 默认供应商")}</small><div class="setting-actions"><button data-discover-models>重新发现模型</button></div></div>${modelList.slice(0,30).map(item => `<div class="setting-card"><strong>${escapeHtml(item.name || item.id)}</strong><small>${escapeHtml(item.providerName || "")}${item.reasoning?.efforts?.length ? ` · 推理 ${item.reasoning.efforts.map(e => e.name).join("/")}` : ""}</small></div>`).join("")}<div class="setting-card"><strong>DeepSeek API 凭证</strong><small>${credential?.configured ? `已配置 · ${escapeHtml(credential.source || "本地凭证库")}` : "未配置"}。Boujoy 绝不回显现有密钥。</small><div class="credential-row"><input id="credentialInput" type="password" autocomplete="off" placeholder="输入新 Key（不会写入 Vault）"><button data-credential-set>保存</button><button data-credential-unset>清除</button></div></div>`;
+      const selection = state.modelSelection || {};
+      const selectionLine = selection.model
+        ? ` · 上次选择 ${escapeHtml(selection.model)}${selection.reasoningEffort ? ` / ${escapeHtml(selection.reasoningEffort)}` : ""}（新会话自动沿用）`
+        : " · 在对话页选择模型后自动记住";
+      content.innerHTML = `
+        <div class="setting-card"><strong>当前模型服务</strong><small>${escapeHtml(active.displayName || active.provider || "ChatGPT / Codex（内置）")}${selectionLine}</small><div class="setting-actions"><button data-open-providers>管理模型服务</button><button data-discover-models>重新发现模型</button></div></div>
+        ${modelList.slice(0, 30).map(item => `<div class="setting-card"><strong>${escapeHtml(item.name || item.id)}</strong><small>${escapeHtml(item.providerName || "")}${item.reasoning?.efforts?.length ? ` · 推理 ${item.reasoning.efforts.map(e => e.name).join("/")}` : ""}</small></div>`).join("") || '<p class="muted">当前服务还没有模型目录：新建服务时可用「从接口拉取」。</p>'}`;
     } else if (tab === "presets") {
       const value = await rpc("agentPreset.list", {});
       const items = unpackList(value, ["presets", "items"]);
@@ -3896,9 +3945,7 @@ async function settingsAction(target) {
   try {
     if (target.matches("[data-open-settings-document]")) await rpc("settings.openDocument", {});
     if (target.matches("[data-setting-busy]")) { const described = await rpc("settings.describe", {}); const ns = described.namespaces?.find(item => item.ns === "ui-conversation"); await rpc("settings.update", { ns: "ui-conversation", patch: { busyEnter: target.dataset.settingBusy }, expectedRevision: ns?.revision }); setBusyMode(target.dataset.settingBusy); toast("输入行为已更新"); }
-    if (target.matches("[data-credential-set]")) { const value = $("#credentialInput")?.value.trim(); if (!value) return; await rpc("credentials.set", { ref: "DEEPSEEK_API_KEY", value }); $("#credentialInput").value = ""; toast("凭证已保存到 Harness 本地凭证库"); }
-    if (target.matches("[data-credential-unset]")) { if (!confirm("清除 DeepSeek API 凭证？")) return; await rpc("credentials.unset", { ref: "DEEPSEEK_API_KEY" }); toast("凭证已清除"); }
-    if (target.matches("[data-discover-models]")) { const value = await rpc("llm.discoverModels", { settingsNs: "llm-deepseek", provider: "deepseek-official" }); toast(`发现 ${value.models?.length || 0} 个模型`); }
+    if (target.matches("[data-discover-models]")) { const value = await rpc("llm.discoverModels", {}); await loadModels(); toast(`发现 ${value.models?.length || 0} 个模型`); }
     if (target.matches("[data-open-providers]")) { $("#settingsDialog")?.close(); openProviderDialog(); }
   } catch (error) { toast(error.message, true); }
 }
@@ -3916,6 +3963,7 @@ const PROVIDER_OUTCOME_LABELS = {
   "model-not-found": "模型不存在",
   "timeout": "超时",
   "runtime-error": "运行时错误",
+  "invalid": "参数无效",
 };
 
 function providerOutcomeLabel(outcome) {
@@ -3941,6 +3989,7 @@ async function loadProviders() {
     const value = await jsonFetch("/api/providers");
     state.providers = value.providers || [];
     state.activeProviderId = value.activeProviderId || null;
+    state.providerPresets = value.presets || [];
     renderProviders();
   } catch (error) {
     if (list) list.innerHTML = `<div class="setting-card setting-error" role="alert">
@@ -4038,8 +4087,62 @@ function syncProviderDefaultModelOptions(preferred = null, modelsOverride = null
   select.value = models.some(model => model.id === current) ? current : "";
 }
 
+function applyProviderPreset() {
+  const id = $("#providerPresetSelect")?.value || "";
+  const preset = state.providerPresets.find(item => item.id === id);
+  const note = $("#providerPresetNote");
+  if (!preset) { note?.classList.add("hidden"); return; }
+  if (!$("#providerName").value.trim()) $("#providerName").value = preset.name;
+  $("#providerBaseUrl").value = preset.baseUrl;
+  const stored = state.providers.find(item => item.id === $("#providerId").value);
+  $("#providerSecretHint").textContent = `${preset.keyUrl ? `API Key 获取：${preset.keyUrl} · ` : ""}${stored?.secretConfigured ? "已保存 API Key；留空保存即保留原值。" : "尚未保存 API Key。"}`;
+  if (note) { note.textContent = preset.note || ""; note.classList.toggle("hidden", !preset.note); }
+}
+
+// Pull the provider's OpenAI-compatible catalogue (GET {base}/models) and
+// merge the ids into the model rows — no more hand-typing Model IDs. Saved
+// providers authenticate with their stored key; drafts use the field value
+// for this request only.
+async function discoverProviderModels() {
+  const button = $("#providerModelDiscover");
+  const baseUrl = $("#providerBaseUrl").value.trim();
+  if (!baseUrl) { toast("先填写 Base URL（或选一个快速模板）", true); return; }
+  const secret = $("#providerSecret").value.trim();
+  const id = $("#providerId").value || undefined;
+  button.disabled = true;
+  button.textContent = "拉取中…";
+  try {
+    const value = await jsonFetch("/api/providers/discover", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id, baseUrl, secret: secret || undefined }) });
+    if (!value.ok) { toast(`${providerOutcomeLabel(value.outcome)}：${value.message || "拉取失败"}`, true); return; }
+    mergeProviderModelRows(value.models || []);
+    toast(`已拉取 ${(value.models || []).length} 个模型`);
+  } catch (error) { toast(error.message, true); }
+  finally { button.disabled = false; button.textContent = "↧ 从接口拉取"; }
+}
+
+// Rebuild the model rows from existing entries + discovered ids, preserving
+// labels the user already typed and the current default-model selection.
+function mergeProviderModelRows(ids) {
+  const merged = new Map();
+  collectProviderModels().forEach(model => merged.set(model.id, model.label));
+  ids.forEach(id => { if (id && !merged.has(id)) merged.set(id, ""); });
+  $("#providerModelRows").innerHTML = "";
+  [...merged.entries()].forEach(([id, label]) => addProviderModelRow(id, label === id ? "" : label));
+  syncProviderDefaultModelOptions();
+}
+
 function openProviderForm(provider = null) {
   const builtin = providerIsBuiltin(provider || {});
+  // Quick-start presets fill the form in one pick; options come from the
+  // provider list response (single source of truth, backend-curated).
+  const presetSelect = $("#providerPresetSelect");
+  if (presetSelect) {
+    presetSelect.innerHTML = ['<option value="">自定义（手动填写）</option>',
+      ...state.providerPresets.map(preset => `<option value="${escapeHtml(preset.id)}">${escapeHtml(preset.name)}</option>`)].join("");
+    presetSelect.value = "";
+    $("#providerPresetNote")?.classList.add("hidden");
+    $("#providerPresetWrap")?.classList.toggle("hidden", builtin);
+  }
   $("#providerId").value = provider?.id || "";
   $("#providerType").value = provider?.type || "custom";
   $("#providerName").value = provider?.name || "";
@@ -4496,6 +4599,8 @@ function bindEvents() {
   $("#providerEditCancel")?.addEventListener("click", showProviderList);
   $("#providerForm")?.addEventListener("submit", saveProvider);
   $("#providerModelAdd")?.addEventListener("click", () => addProviderModelRow());
+  $("#providerPresetSelect")?.addEventListener("change", applyProviderPreset);
+  $("#providerModelDiscover")?.addEventListener("click", discoverProviderModels);
   $("#providerModelRows")?.addEventListener("click", event => {
     const remove = event.target.closest("[data-provider-model-remove]");
     if (!remove) return;

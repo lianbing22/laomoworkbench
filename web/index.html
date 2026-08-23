@@ -459,6 +459,10 @@
       <label>最大回合（可选）<input id="goalRounds" type="number" min="1" max="100" placeholder="留空表示不限制"></label>
       <label class="check-row mission-toggle"><input id="goalMissionMode" type="checkbox"><span>作为 Mission 运行（持久循环，断电可恢复）</span></label>
       <p class="dialog-note hidden" id="goalMissionNote">Mission 由老墨控制面持久维护：自动规划 → 执行 → 评估 → 修复循环，断电后可恢复；启动后可在右侧信号卡暂停 / 继续 / 取消。</p>
+      <div class="goal-model-row hidden" id="goalModelRow">
+        <label>模型（可选）<select id="goalModelSelect"><option value="">跟随默认模型</option></select></label>
+        <label>推理强度（可选）<select id="goalEffortSelect"><option value="">跟随默认强度</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option></select></label>
+      </div>
       <p class="dialog-note">目标由 Harness 真实维护；首次保存会立即启动第一个目标回合。暂停、继续、完成与清除都可在右侧控制。</p>
       <footer><button type="button" class="ghost-button" data-close-dialog="goalDialog">取消</button><button type="submit" class="primary-cut">保存目标</button></footer>
     </form>
@@ -519,6 +523,8 @@
 
       <div id="providerFormPanel" class="hidden">
         <input id="providerId" type="hidden"><input id="providerType" type="hidden" value="custom">
+        <label id="providerPresetWrap">快速模板<select id="providerPresetSelect"><option value="">自定义（手动填写）</option></select></label>
+        <p class="dialog-note hidden" id="providerPresetNote"></p>
         <label>名称<input id="providerName" required maxlength="60" placeholder="例如：DeepSeek 官方"></label>
         <label>Base URL<input id="providerBaseUrl" placeholder="https://api.example.com/v1" autocomplete="off" spellcheck="false"></label>
         <div id="providerSecretWrap">
@@ -527,7 +533,10 @@
         </div>
         <div class="provider-models-head">
           <label>模型列表</label>
-          <button type="button" id="providerModelAdd" class="mini-cut">＋ 添加模型</button>
+          <div class="provider-models-tools">
+            <button type="button" id="providerModelDiscover" class="mini-cut" title="从服务的 /models 接口拉取模型列表，免去手敲 Model ID">↧ 从接口拉取</button>
+            <button type="button" id="providerModelAdd" class="mini-cut">＋ 添加模型</button>
+          </div>
         </div>
         <div id="providerModelRows"></div>
         <p class="dialog-note hidden" id="providerModelsNote">ChatGPT 内置服务的模型列表由 Codex 动态获取，无需手工配置。</p>

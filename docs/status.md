@@ -21,6 +21,7 @@ Usability 验收全部 PASS。**P2.0 Extension Platform v1（2026-08-23）：**
 | 阶段 | 内容 | 结论 |
 | --- | --- | --- |
 | P0 / P0.5 | 双运行时 RuntimeManager、Provider Profiles、钥匙串凭据 | 完成 |
+| P0.5.1 | 模型配置 v2：Provider 快速模板（Responses 兼容目录）、`/api/providers/discover` 模型自动发现、模型/强度选择持久化（ns `model-selection`，provider 匹配应用）、Mission 模型钉选 | 完成（`a152793`，provider 套件 47 用例） |
 | P1 | Durable Mission 引擎（目标→计划→作业→验收修复闭环→机器验收→终评→Evidence） | 完成（Gate A–E PASS） |
 | P1.1 | Mission Reliability：blocked 终态、作业全权生命周期、PID 复用检测、四桶时间账、机器验收门禁、manifest 不可变 | 完成（Gate A–E PASS，`scripts/gate_p11_driver.py`） |
 | P1.2 | 并行 DAG 调度 + Git worktree 隔离 + 集成事务 + 冲突解决 + 集成树终验（M1–M5-C） | 完成（Gate 0/A–J + Usability 全 PASS，`aaf2751`，`scripts/gate_p12_driver.py` + `scripts/gate_p12_runtime_concurrency.py`） |
