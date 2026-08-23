@@ -67,7 +67,10 @@ except Exception as _exc:  # mainline module not merged yet
 
 
 POLL_INTERVAL = 0.05
-POLL_TIMEOUT = 10.0
+# 30s: shared macOS CI runners routinely need >10s for state transitions
+# under load (flakes seen on 3.9/3.12 legs); failure cases simply wait
+# longer, assertions unchanged
+POLL_TIMEOUT = 30.0
 TERMINAL_STATES = {"done", "failed", "cancelled", "canceled", "blocked"}
 
 DEFAULT_OBJECTIVE = "完成示例项目并产出总结报告"
@@ -1032,13 +1035,16 @@ class TestNoProgressPersist(MissionLoopTest):
         self.adapter.hook = None   # no more freezes on the post-release turns
         release.set()
         if runner:
-            runner.join(timeout=15)
+            runner.join(timeout=45)  # CI load headroom
             self.assertFalse(runner.is_alive(), "释放后 runner 必须退出（暂停即停）")
 
         fresh = MissionManager(self.adapter, self.root)
         self.addCleanup(self._cancel_quiet, fresh, mid)
         fresh.resume(mid)     # crash-recovery: same adapter, fresh control plane
-        self.assertTrue(self.wait_state(fresh, mid, ["failed"], timeout=20),
+        # 60s: resume must re-run two full repair cycles before the breaker
+        # fires — loaded macOS CI runners need far more than 20s (flake
+        # seen on 3.9/3.12 legs with the old budget)
+        self.assertTrue(self.wait_state(fresh, mid, ["failed"], timeout=60),
                         "重启后无进展熔断应继续生效，实际: %s" % self.state_vals(fresh, mid))
         st2 = self.read_json(self.mdir(mid) / "state.json")
         self.assertGreaterEqual(int(st2.get("noProgress") or 0), no_before,
