@@ -950,6 +950,64 @@ class CodexRuntimeAdapter:
         # codex turns keep working to natural completion ("zombie writes").
         self._turns_lock = threading.Lock()
         self._active_turns: dict[str, dict] = {}  # threadId -> registration
+        # model directory cache (P0 model-selection recovery): validation
+        # must verify a model/effort actually exists before reporting
+        # success — WRITE→REFRESH→VERIFY, never registry-write→toast.
+        # provider_id -> {"ts": monotonic, "entries": {model: [efforts]}}
+        self._models_cache: dict[str, dict] = {}
+        self._models_cache_lock = threading.Lock()
+        self._MODELS_CACHE_TTL = 300.0
+
+    # -- model directory (P0 model-selection recovery) -----------------------
+
+    def _seed_models_cache(self, provider_id: str, entries: dict[str, list[str]]) -> None:
+        """Test seam + warm path: inject/refresh a provider's directory."""
+        with self._models_cache_lock:
+            self._models_cache[provider_id] = {"ts": time.monotonic(),
+                                               "entries": dict(entries)}
+
+    def _model_directory(self, provider_id: str) -> dict[str, list[str]] | None:
+        """provider_id -> {model: [supported efforts]} (empty list = no
+        effort support). Refreshes from the authoritative source when the
+        cache is cold: live codex model/list for the builtin, the provider
+        profile's configured models for customs. Returns None when the
+        directory cannot be verified (honest failure — callers reject)."""
+        with self._models_cache_lock:
+            cached = self._models_cache.get(provider_id)
+        if cached and (time.monotonic() - cached["ts"]) < self._MODELS_CACHE_TTL:
+            return cached["entries"]
+        profile = None
+        if self.providers is not None:
+            try:
+                profile = self.providers.get(provider_id)
+            except Exception:
+                profile = None
+        entries: dict[str, list[str]] | None = None
+        if profile is not None and profile.get("type") != "chatgpt":
+            entries = {str(m.get("id")): []
+                       for m in profile.get("models", []) if m.get("id")}
+        else:
+            try:
+                proc = self._ensure_process()
+                data = proc.rpc.request("model/list", {}, timeout=30) or {}
+                entries = {}
+                for m in data.get("data", []) or []:
+                    mid = m.get("id") or m.get("model")
+                    if not mid:
+                        continue
+                    efforts = [e.get("reasoningEffort") for e in
+                               (m.get("supportedReasoningEfforts") or [])
+                               if isinstance(e, dict)]
+                    entries[str(mid)] = [e for e in efforts if e]
+            except (TimeoutError, RuntimeError, AdapterUnavailable, OSError):
+                entries = None
+        if not entries:
+            # None/empty both mean "no verifiable catalog": keep any stale
+            # cache, else report unavailable. An empty catalog must never
+            # turn into reject-everything validation downstream.
+            return cached["entries"] if cached else None
+        self._seed_models_cache(provider_id, entries)
+        return entries
 
     # -- infra --
     def _debug_log(self, msg: str) -> None:
@@ -1240,7 +1298,16 @@ class CodexRuntimeAdapter:
         provider_id = "chatgpt"
         if self.providers is not None:
             provider_id = self.providers.active_id()
-            self._register_active_provider(provider_id)
+        # Explicit provider for the NEW session (settings/new-session flow);
+        # validated against the registry — never a silent unknown id.
+        explicit_provider = str(body.get("provider") or "").strip()
+        if explicit_provider:
+            if self.providers is not None:
+                known = {str(p.get("id")) for p in self.providers.list()}
+                if explicit_provider not in known:
+                    return err_value(f"未知的模型服务 {explicit_provider}", "unknown-provider")
+            provider_id = explicit_provider
+        self._register_active_provider(provider_id)
         params: dict[str, Any] = {"cwd": self.workspace_cwd()}
         params.update(self._provider_thread_params(provider_id))
         # Model precedence: explicit body > host-saved default (provider-
@@ -1252,6 +1319,24 @@ class CodexRuntimeAdapter:
             if saved.get("provider") in (None, "", provider_id):
                 model = model or (str(saved.get("model") or "").strip() or None)
                 effort = effort or (str(saved.get("reasoningEffort") or "").strip() or None)
+        # P0 model-selection recovery: whatever ends up applied must exist in
+        # the provider's directory — create fails closed on unknown values
+        # instead of handing the session a model the runtime will reject.
+        directory = self._model_directory(provider_id)
+        if directory is not None:
+            effective_model = model or params.get("model")
+            if effective_model and effective_model not in directory:
+                return err_value(f"模型 {effective_model} 不在服务目录中", "unknown-model")
+            if effort:
+                target = effective_model or (next(iter(directory)) if directory else None)
+                supported = directory.get(target or "", [])
+                if not supported:
+                    return err_value(f"{target or '该服务'} 不支持推理强度（自定义服务）",
+                                     "unsupported-effort")
+                if effort not in supported:
+                    return err_value(
+                        f"{target} 不支持推理强度 {effort}（支持：{'/'.join(supported)}）",
+                        "unsupported-effort")
         if model:
             params["model"] = model
         if effort:
@@ -1268,7 +1353,12 @@ class CodexRuntimeAdapter:
             # the new session's model correctly right after creation.
             self.registry.set_model(tid, model, effort)
         self._emit(self.translator.session_added(tid))
-        return ok_value({"sessionId": tid, "id": tid, "providerId": provider_id})
+        # effective readback: what this session will actually run with
+        # (None = the runtime's own default — stated honestly, never guessed)
+        return ok_value({"sessionId": tid, "id": tid, "providerId": provider_id,
+                         "effective": {"provider": provider_id,
+                                       "model": params.get("model"),
+                                       "reasoningEffort": params.get("effort")}})
 
     def run_turn(self, *, prompt: str, cwd: str | None = None, read_only: bool = False,
                  model: str | None = None, effort: str | None = None,
@@ -1655,8 +1745,16 @@ class CodexRuntimeAdapter:
         sid = str(body.get("sessionId", ""))
         reg = self.registry.get(sid) or {}
         # Bound sessions only ever see their own provider's models; fresh
-        # sessions see the active provider's.
+        # sessions see the active provider's. An explicit providerId query
+        # (settings default editor) is honored only without a bound session.
         provider_id = reg.get("providerId") or (self.providers.active_id() if self.providers else "chatgpt")
+        requested = str(body.get("providerId") or "").strip()
+        if requested and not reg.get("providerId") and requested != provider_id:
+            if self.providers is not None:
+                known = {str(p.get("id")) for p in self.providers.list()}
+                if requested not in known:
+                    return err_value(f"未知的模型服务 {requested}", "unknown-provider")
+            provider_id = requested
         profile = self.providers.get(provider_id) if self.providers else None
         if profile is None:  # no manager (tests) or unknown id -> builtin
             profile = {"id": "chatgpt", "name": "ChatGPT / Codex", "type": "chatgpt"}
@@ -1707,7 +1805,17 @@ class CodexRuntimeAdapter:
 
     # session.selectModel
     def _rpc_session_selectModel(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
+        """P0 model-selection recovery: VALIDATE → APPLY → AUTHORITATIVE
+        READBACK. A model must exist in the provider's directory and the
+        effort must be one the model supports; unknown values are rejected
+        instead of written to the registry with a success toast. Only the
+        fields the caller sent are applied (switching the model never
+        touches the effort and vice versa)."""
         sid = str(body.get("sessionId", ""))
+        # Unbound/unknown ids are tolerated (registry.ensure mirrors the
+        # historical contract): the readback below still reports the
+        # AUTHORITATIVE applied state from the registry entry.
+        self.registry.ensure(sid)
         reg = self.registry.get(sid) or {}
         target_provider = str(body.get("provider") or "")
         bound_provider = reg.get("providerId")
@@ -1715,8 +1823,36 @@ class CodexRuntimeAdapter:
         # conversation history belongs to its provider.
         if bound_provider and target_provider and target_provider != bound_provider:
             return err_value("模型服务变更将在新会话中生效", "provider-change-requires-new-session")
-        self.registry.set_model(sid, body.get("model"), body.get("reasoningEffort"))
-        return ok_value({"selected": True})
+        provider_id = target_provider or bound_provider \
+            or (self.providers.active_id() if self.providers else "chatgpt")
+        model = str(body.get("model") or "").strip() or None
+        effort = str(body.get("reasoningEffort") or "").strip() or None
+        if not model and not effort:
+            return err_value("需要 model 或 reasoningEffort 至少一个", "invalid-argument")
+        directory = self._model_directory(provider_id)
+        if directory is None:
+            return err_value("无法验证模型目录（运行时不可用），稍后重试", "directory-unavailable")
+        if model is not None and model not in directory:
+            return err_value(f"模型 {model} 不在当前服务目录中", "unknown-model")
+        if effort is not None:
+            target_model = model or reg.get("model")
+            if not target_model or target_model not in directory:
+                return err_value("先选择有效模型再设置推理强度", "unknown-model")
+            supported = directory[target_model]
+            if not supported:
+                return err_value(f"{target_model} 不支持推理强度（自定义服务）",
+                                 "unsupported-effort")
+            if effort not in supported:
+                return err_value(
+                    f"{target_model} 不支持推理强度 {effort}（支持：{'/'.join(supported)}）",
+                    "unsupported-effort")
+        self.registry.set_model(sid, model, effort)
+        applied = self.registry.get(sid) or {}
+        return ok_value({"selected": True, "applied": {
+            "provider": applied.get("providerId") or provider_id,
+            "model": applied.get("model"),
+            "reasoningEffort": applied.get("effort"),
+        }})
 
     # workspace.*
     def _workspace_id_for(self, cwd: str | None) -> str:
@@ -1988,8 +2124,13 @@ class CodexRuntimeAdapter:
     def _rpc_settings_update(self, body: dict[str, Any], rpc_id: str = "") -> dict[str, Any]:
         ns = str(body.get("ns", ""))
         patch = body.get("patch")
-        if ns != "ui-conversation" or not isinstance(patch, dict):
-            return err_value("仅支持 ui-conversation 命名空间")
+        # P0 model-selection recovery: "model-selection" is the Layer-B home
+        # for new-session defaults. It was missing from this whitelist — every
+        # persistModelSelection call failed while the frontend swallowed the
+        # error, so the default never survived (masked only by the provider
+        # profile's own defaultModel).
+        if ns not in ("ui-conversation", "model-selection") or not isinstance(patch, dict):
+            return err_value("仅支持 ui-conversation / model-selection 命名空间")
         expected = body.get("expectedRevision")
         result = self._state.settings_update(ns, patch,
                                              None if expected is None else int(expected))

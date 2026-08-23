@@ -189,6 +189,7 @@
                     <button id="providerButton" class="composer-tool attach-tool provider-tool" type="button" title="模型服务" aria-label="模型服务"><span>⚙</span><small>服务</small></button>
                     <select id="modelSelect" class="inline-select model-select" aria-label="模型"><option>读取模型…</option></select>
                     <select id="effortSelect" class="inline-select effort-select" aria-label="推理强度" title="推理强度"><option value="">强度…</option></select>
+                    <button type="button" class="mini-cut" data-pin-model-default title="把当前模型/强度设为以后新会话的默认（不影响本会话）">⌒ 设为新会话默认</button>
                     <select id="workModeSelect" class="inline-select" aria-label="工作模式" title="工作模式：计划=只规划不执行（自动切只读）；自动=自主执行到底（自动切全自动）；聊天=普通对话">
                       <option value="chat">聊天</option>
                       <option value="plan">计划</option>
@@ -540,6 +541,7 @@
         </div>
         <div id="providerModelRows"></div>
         <p class="dialog-note hidden" id="providerModelsNote">ChatGPT 内置服务的模型列表由 Codex 动态获取，无需手工配置。</p>
+        <p class="dialog-note" id="providerWireNote">自定义服务必须支持 OpenAI <b>Responses</b> 协议（<code>POST {base}/responses</code>）。只支持 chat/completions 的中转无法使用——Codex 运行时已移除 chat 格式（wire_api=chat 于 0.149 起不再支持）。「测试连接」会如实暴露不兼容（404 /responses）。</p>
         <label>默认模型<select id="providerDefaultModel"><option value="">（跟随服务默认）</option></select></label>
         <label class="check-row"><input id="providerEnabled" type="checkbox" checked><span>启用这个服务</span></label>
         <details class="provider-advanced" id="providerAdvanced">

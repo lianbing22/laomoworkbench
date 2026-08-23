@@ -474,9 +474,103 @@ class TestAdapterStatics(unittest.TestCase):
 
     def test_select_model_stored(self):
         adapter = make_adapter()
-        adapter.rpc("clean", "session.selectModel", {"sessionId": "s1", "model": "gpt-5.5", "reasoningEffort": "high"})
+        adapter.registry.ensure("s1", cwd="/tmp")
+        adapter._seed_models_cache("chatgpt", {"gpt-5.5": ["low", "medium", "high"]})
+        result = adapter.rpc("clean", "session.selectModel",
+                             {"sessionId": "s1", "model": "gpt-5.5", "reasoningEffort": "high"})
+        r = result["result"]
+        self.assertTrue(r["ok"])
+        self.assertTrue(r["value"]["selected"])
         m, e = adapter._session_model_overrides("s1")
         self.assertEqual((m, e), ("gpt-5.5", "high"))
+
+    def test_model_selection_namespace_is_writable(self):
+        # P0 root cause: settings.update whitelisted ONLY ui-conversation, so
+        # every persistModelSelection failed silently (frontend swallowed the
+        # error) — new-session defaults never survived anything. The ns must
+        # be writable AND read back; other namespaces stay rejected.
+        adapter = make_adapter()
+        result = adapter.rpc("clean", "settings.update",
+                             {"ns": "model-selection",
+                              "patch": {"provider": "chatgpt", "model": "gpt-5.5"}})
+        self.assertTrue(result["result"]["ok"], result)
+        described = adapter.rpc("clean", "settings.describe", {})
+        namespaces = (described["result"]["value"].get("namespaces") or [])
+        ns = next((n for n in namespaces if n.get("ns") == "model-selection"), None)
+        self.assertIsNotNone(ns, "model-selection ns 必须出现在 settings.describe")
+        self.assertEqual(ns.get("data", {}).get("model"), "gpt-5.5")
+        other = adapter.rpc("clean", "settings.update",
+                            {"ns": "random-namespace", "patch": {"x": 1}})
+        self.assertFalse(other["result"]["ok"], "未列入白名单的 ns 仍必须拒绝")
+
+    def test_select_model_unknown_rejected(self):
+        # P0 model-selection: WRITE->VERIFY — a model outside the provider's
+        # directory must be rejected, never written with a success toast.
+        adapter = make_adapter()
+        adapter.registry.ensure("s1", cwd="/tmp")
+        adapter._seed_models_cache("chatgpt", {"gpt-5.5": ["low", "medium", "high"]})
+        result = adapter.rpc("clean", "session.selectModel",
+                             {"sessionId": "s1", "model": "not-a-model"})
+        self.assertFalse(result["result"]["ok"])
+        m, _ = adapter._session_model_overrides("s1")
+        self.assertIsNone(m, "未知模型不得写入 registry")
+
+    def test_select_model_effort_validated(self):
+        adapter = make_adapter()
+        adapter.registry.ensure("s1", cwd="/tmp")
+        adapter._seed_models_cache("chatgpt", {"gpt-5.5": ["low", "high"]})
+        result = adapter.rpc("clean", "session.selectModel",
+                             {"sessionId": "s1", "model": "gpt-5.5", "reasoningEffort": "medium"})
+        r = result["result"]
+        self.assertFalse(r["ok"])
+        self.assertIn("不支持推理强度", r["error"]["message"])
+
+    def test_select_model_no_effort_support_rejects_effort(self):
+        adapter = make_adapter()
+        adapter.registry.ensure("s1", cwd="/tmp")
+        adapter._seed_models_cache("chatgpt", {"relay-x": []})
+        result = adapter.rpc("clean", "session.selectModel",
+                             {"sessionId": "s1", "model": "relay-x", "reasoningEffort": "high"})
+        self.assertFalse(result["result"]["ok"])
+
+    def test_select_model_switch_preserves_effort(self):
+        # switching ONLY the model must not touch the session's effort —
+        # the old frontend silently applied the new model's default effort
+        adapter = make_adapter()
+        adapter.registry.ensure("s1", cwd="/tmp")
+        adapter._seed_models_cache("chatgpt",
+                                   {"gpt-5.5": ["low", "high"], "gpt-5.6": ["low", "medium", "high"]})
+        adapter.rpc("clean", "session.selectModel",
+                    {"sessionId": "s1", "model": "gpt-5.5", "reasoningEffort": "high"})
+        result = adapter.rpc("clean", "session.selectModel",
+                             {"sessionId": "s1", "model": "gpt-5.6"})
+        value = result["result"]["value"]
+        self.assertTrue(value["selected"])
+        self.assertEqual(value["applied"]["model"], "gpt-5.6")
+        self.assertEqual(value["applied"]["reasoningEffort"], "high",
+                         "仅切模型不得改动 effort")
+        self.assertEqual(value["applied"]["provider"], "chatgpt")
+
+    def test_select_model_readback_is_authoritative(self):
+        adapter = make_adapter()
+        adapter.registry.ensure("s1", cwd="/tmp")
+        adapter._seed_models_cache("chatgpt", {"gpt-5.5": ["low", "high"]})
+        adapter.rpc("clean", "session.selectModel",
+                    {"sessionId": "s1", "model": "gpt-5.5"})
+        result = adapter.rpc("clean", "session.selectModel",
+                             {"sessionId": "s1", "reasoningEffort": "low"})
+        applied = result["result"]["value"]["applied"]
+        self.assertEqual(applied["reasoningEffort"], "low")
+        self.assertIn("model", applied)
+    def test_select_model_unbound_sid_tolerated(self):
+        # historical contract (provider_test): unknown/unbound session ids
+        # are ensured, not rejected — the readback stays authoritative
+        adapter = make_adapter()
+        adapter._seed_models_cache("chatgpt", {"gpt-5.5": ["low"]})
+        result = adapter.rpc("clean", "session.selectModel",
+                             {"sessionId": "ghost", "model": "gpt-5.5"})
+        self.assertTrue(result["result"]["ok"])
+        self.assertEqual(result["result"]["value"]["applied"]["model"], "gpt-5.5")
 
     def test_full_auto_permission_never_asks_inside_sandbox(self):
         # 全自动 = the mission runtime's contract for interactive use: the

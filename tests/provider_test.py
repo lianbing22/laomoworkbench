@@ -416,6 +416,10 @@ class TestSelectModelProviderGuard(unittest.TestCase):
 
     def test_same_provider_and_unbound_sessions_allowed(self):
         adapter = self._adapter()
+        # P0 model-selection: selectModel validates against the provider's
+        # catalog — seed it (no real runtime in unit tests).
+        adapter._seed_models_cache("p1", {"m1": [], "m2": []})
+        adapter._seed_models_cache("pX", {"m1": []})
         adapter.registry.set_provider("s1", "p1")
         same = adapter.rpc("clean", "session.selectModel",
                            {"sessionId": "s1", "model": "m2", "provider": "p1"})
@@ -805,7 +809,8 @@ class TestSessionCreateModelDefaults(unittest.TestCase):
                              reasoningEffort="high")
         res = adapter.rpc("clean", "session.create", {})
         self.assertTrue(res["result"]["ok"])
-        params = adapter.process.rpc.requests[0]["params"]
+        start = next(r for r in adapter.process.rpc.requests if r["method"] == "thread/start")
+        params = start["params"]
         self.assertEqual(params.get("model"), "gpt-5.6-luna")
         self.assertEqual(params.get("effort"), "high")
         # registry mirrors it, so session.models reports the right current
@@ -817,7 +822,8 @@ class TestSessionCreateModelDefaults(unittest.TestCase):
         self._save_selection(adapter, model="deepseek-chat", provider="deepseek",
                              reasoningEffort="low")
         adapter.rpc("clean", "session.create", {})
-        params = adapter.process.rpc.requests[0]["params"]
+        start = next(r for r in adapter.process.rpc.requests if r["method"] == "thread/start")
+        params = start["params"]
         self.assertNotIn("model", params)
         self.assertNotIn("effort", params)
 
@@ -827,14 +833,16 @@ class TestSessionCreateModelDefaults(unittest.TestCase):
                              reasoningEffort="high")
         adapter.rpc("clean", "session.create", {"model": "explicit-model",
                                                 "reasoningEffort": "low"})
-        params = adapter.process.rpc.requests[0]["params"]
+        start = next(r for r in adapter.process.rpc.requests if r["method"] == "thread/start")
+        params = start["params"]
         self.assertEqual(params.get("model"), "explicit-model")
         self.assertEqual(params.get("effort"), "low")
 
     def test_no_saved_default_leans_on_provider_params(self):
         adapter = self._adapter()
         adapter.rpc("clean", "session.create", {})
-        params = adapter.process.rpc.requests[0]["params"]
+        start = next(r for r in adapter.process.rpc.requests if r["method"] == "thread/start")
+        params = start["params"]
         self.assertNotIn("model", params)
         self.assertNotIn("effort", params)
 

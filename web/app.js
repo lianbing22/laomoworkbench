@@ -1176,7 +1176,16 @@ async function searchSessions(query) {
 
 async function loadModels() {
   if (!state.sessionId) {
-    state.models = [{ provider: state.host?.provider, model: state.modelSelection?.model || state.host?.model }];
+    // No session yet: the selector shows the ACTIVE provider's real
+    // directory (session.models works unbound) and its meaning is "the
+    // next session's default" — not a fake one-entry dropdown.
+    try {
+      const value = await rpc("session.models", {});
+      state.modelDirectory = value;
+      state.models = (value.groups || []).flatMap(group => (group.models || []).map(model => ({ ...model, provider: group.id, providerName: group.name })));
+    } catch (_) {
+      state.models = [{ provider: state.host?.provider, model: state.modelSelection?.model || state.host?.model }];
+    }
   } else {
     try {
       const value = await rpc("session.models", { sessionId: state.sessionId });
@@ -1226,22 +1235,31 @@ async function applyEffort() {
     let model = null, provider = null;
     try { const selected = JSON.parse($("#modelSelect").value); model = selected.model; provider = selected.provider; } catch (_) {}
     const current = state.modelDirectory?.current || {};
-    await rpc("session.selectModel", { sessionId: state.sessionId, model: model || current.model, provider: provider || current.provider, reasoningEffort: effort });
-    if (state.modelDirectory?.current) state.modelDirectory.current.reasoningEffort = effort;
-    persistModelSelection({ reasoningEffort: effort || null });
+    if (!state.sessionId) {
+      await persistModelSelection({ reasoningEffort: effort || null });
+      toast(effort ? `新会话默认强度 ${effort}` : "已清除新会话默认强度");
+      return;
+    }
+    const value = await rpc("session.selectModel",
+      { sessionId: state.sessionId, model: model || current.model, provider: provider || current.provider, reasoningEffort: effort });
+    const applied = (value && value.applied) || {};
+    if (state.modelDirectory?.current) {
+      state.modelDirectory.current.reasoningEffort = applied.reasoningEffort ?? effort;
+    }
     updateModelSummary();
-    if (effort) toast(`推理强度已设为 ${effort}`);
+    if (effort) toast(`推理强度已应用 · ${applied.reasoningEffort || effort}`);
   } catch (error) { toast(error.message, true); }
 }
 
-// Host-persisted default model/effort (settings ns "model-selection", clean
-// mode only): the choice survives gateway restarts and session.create applies
-// it to every new session. Quiet by design — the selection itself already
-// succeeded; persistence is a background nicety and must never toast errors.
+// Host-persisted NEW-SESSION default (settings ns "model-selection", clean
+// mode only) — Layer B. P0 recovery: this is now written ONLY by deliberate
+// actions (no-session composer pick / ⌒设为默认 / settings editor), always
+// awaited, and failures surface to the caller (no silent catch). Session
+// model switches never touch it.
 async function persistModelSelection(patch = {}) {
   if (state.mode !== "clean") return;
   state.modelSelection = { ...(state.modelSelection || {}), ...patch };
-  try { await rpc("settings.update", { ns: "model-selection", patch: state.modelSelection }); } catch (_) {}
+  await rpc("settings.update", { ns: "model-selection", patch: state.modelSelection });
 }
 
 async function loadModelSelection() {
@@ -1255,9 +1273,20 @@ async function loadModelSelection() {
 
 async function createSession() {
   try {
+    // Explicit model config for the new session (P0 recovery): the UI states
+    // what it wants instead of relying on the backend's implicit fallback —
+    // the response's `effective` readback tells us what actually applied.
+    const defaults = state.modelSelection || {};
     const payload = state.workspaceId ? { workspaceId: state.workspaceId } : {};
+    if (defaults.provider) payload.provider = defaults.provider;
+    if (defaults.model) payload.model = defaults.model;
+    if (defaults.reasoningEffort) payload.reasoningEffort = defaults.reasoningEffort;
     const value = await rpc("session.create", payload);
     const createdId = value.id || value.sessionId || value.session?.id || value.session?.sessionId;
+    if (value.effective) {
+      state.modelDirectory = state.modelDirectory || {};
+      state.modelDirectory.current = { ...(state.modelDirectory.current || {}), ...value.effective };
+    }
     if (!createdId) throw new Error("Harness 没有返回新会话 ID");
     // Treat creation exactly like a session switch. Reusing the previous
     // session's history/projection/live buffer until the first blank history
@@ -2366,17 +2395,47 @@ async function pollForDelivery(submission, attempts = 15, intervalMs = 2000) {
 }
 
 async function selectModel() {
+  // P0 model-selection semantics — two deliberate layers:
+  // · 有会话：本选择只影响当前会话（Layer C）。只发 model，绝不动 effort，
+  //   绝不写 Host 默认；成功以服务端 authoritative readback 为准。
+  // · 无会话：本选择 = 新会话默认（Layer B），显式 awaited 持久化。
   try {
     const selected = JSON.parse($("#modelSelect").value);
-    if (!state.sessionId || !selected.model) return;
-    await rpc("session.selectModel", { sessionId: state.sessionId, model: selected.model, provider: selected.provider, reasoningEffort: selected.reasoningEffort || undefined });
-    if (state.modelDirectory?.current) state.modelDirectory.current.model = selected.model;
-    renderEffortOptions(selected.model);
+    if (!selected.model) return;
+    if (!state.sessionId) {
+      await persistModelSelection({ model: selected.model, provider: selected.provider });
+      if (state.modelDirectory?.current) state.modelDirectory.current.model = selected.model;
+      renderEffortOptions(selected.model);
+      updateModelSummary();
+      toast(`新会话将使用 ${selected.model}`);
+      return;
+    }
+    const value = await rpc("session.selectModel",
+      { sessionId: state.sessionId, model: selected.model, provider: selected.provider });
+    const applied = value.applied || {};
+    if (state.modelDirectory?.current) {
+      state.modelDirectory.current.model = applied.model || selected.model;
+      state.modelDirectory.current.provider = applied.provider || selected.provider;
+    }
+    renderEffortOptions(applied.model || selected.model);
     updateModelSummary();
-    // Persist as the default for future sessions (effort untouched here: the
-    // option's reasoningEffort is the model's own default, not a user pick).
-    persistModelSelection({ model: selected.model, provider: selected.provider || state.modelDirectory?.current?.provider });
-    toast(`已切换到 ${selected.model}`);
+    toast(`已应用 · ${applied.model || selected.model}`);
+  } catch (error) { toast(error.message, true); }
+}
+
+async function pinCurrentSelectionAsDefault() {
+  // 显式动作：把当前会话正在用的配置设为「以后新会话默认」。与切换会话
+  // 模型完全解耦——默认值只有这里和设置页两个入口会写。
+  try {
+    const current = state.modelDirectory?.current || {};
+    let model = current.model, provider = current.provider;
+    try { const sel = JSON.parse($("#modelSelect").value); model = model || sel.model; provider = provider || sel.provider; } catch (_) {}
+    if (!model) { toast("还没有可固定的模型选择", true); return; }
+    await persistModelSelection({
+      model, provider,
+      reasoningEffort: $("#effortSelect")?.value || current.reasoningEffort || null,
+    });
+    toast(`已设为新会话默认 · ${model}`);
   } catch (error) { toast(error.message, true); }
 }
 
@@ -3766,12 +3825,24 @@ async function loadSettings(tab = "general") {
       const active = providerList.find(item => item.active) || providerList[0] || {};
       const modelList = (models.groups || []).flatMap(group => (group.models || []).map(item => ({ ...item, providerName: group.name })));
       const selection = state.modelSelection || {};
-      const selectionLine = selection.model
-        ? ` · 上次选择 ${escapeHtml(selection.model)}${selection.reasoningEffort ? ` / ${escapeHtml(selection.reasoningEffort)}` : ""}（新会话自动沿用）`
-        : " · 在对话页选择模型后自动记住";
+      const defaultProviderId = selection.provider || active.id || "chatgpt";
+      const providerOptions = providerList.map(item =>
+        `<option value="${escapeHtml(item.id)}" ${item.id === defaultProviderId ? "selected" : ""}>${escapeHtml(item.displayName || item.name || item.id)}</option>`).join("");
+      const effModel = modelList.find(item => (item.model || item.id) === (selection.model || ""));
+      const effortOptions = (effModel?.reasoning?.efforts || []).map(e =>
+        `<option value="${escapeHtml(String(e.name || e))}" ${String(e.name || e) === String(selection.reasoningEffort || "") ? "selected" : ""}>${escapeHtml(String(e.name || e))}</option>`).join("");
       content.innerHTML = `
-        <div class="setting-card"><strong>当前模型服务</strong><small>${escapeHtml(active.displayName || active.provider || "ChatGPT / Codex（内置）")}${selectionLine}</small><div class="setting-actions"><button data-open-providers>管理模型服务</button><button data-discover-models>重新发现模型</button></div></div>
+        <div class="setting-card"><strong>新会话默认模型</strong><small>只影响之后新建的会话；当前会话的模型在对话页选择器里单独切换，互不影响。</small>
+          <div class="model-default-editor">
+            <label>默认服务<select id="defaultProviderSelect">${providerOptions}</select></label>
+            <label>默认模型<select id="defaultModelSelect"><option value="">${escapeHtml(selection.model || "（选择模型…）")}</option></select></label>
+            <label>默认推理强度<select id="defaultEffortSelect"><option value="">（跟随模型默认）</option>${effortOptions}</select></label>
+          </div>
+          <div class="setting-actions"><button data-save-model-defaults>保存为新会话默认</button></div>
+        </div>
+        <div class="setting-card"><strong>当前模型服务</strong><small>${escapeHtml(active.displayName || active.provider || "ChatGPT / Codex（内置）")}${selection.model ? ` · 默认 ${escapeHtml(selection.model)}` : ""}</small><div class="setting-actions"><button data-open-providers>管理模型服务</button><button data-discover-models>重新发现模型</button></div></div>
         ${modelList.slice(0, 30).map(item => `<div class="setting-card"><strong>${escapeHtml(item.name || item.id)}</strong><small>${escapeHtml(item.providerName || "")}${item.reasoning?.efforts?.length ? ` · 推理 ${item.reasoning.efforts.map(e => e.name).join("/")}` : ""}</small></div>`).join("") || '<p class="muted">当前服务还没有模型目录：新建服务时可用「从接口拉取」。</p>'}`;
+      wireModelDefaultsEditor();
     } else if (tab === "presets") {
       const value = await rpc("agentPreset.list", {});
       const items = unpackList(value, ["presets", "items"]);
@@ -3786,6 +3857,45 @@ async function loadSettings(tab = "general") {
       <span class="setting-error-detail">${escapeHtml(error.message)}</span>
     </div>`;
   }
+}
+
+// 新会话默认编辑器（设置页 · 模型 tab）：选服务 → 按需拉取该服务的真实模型
+// 目录（session.models 支持 providerId 查询）→ 选模型/强度 → 显式保存到
+// model-selection ns。这是 Layer B 的规范写入口之一。
+function wireModelDefaultsEditor() {
+  const providerSelect = $("#defaultProviderSelect");
+  const modelSelect = $("#defaultModelSelect");
+  if (!providerSelect || !modelSelect) return;
+  providerSelect.addEventListener("change", async () => {
+    modelSelect.innerHTML = '<option value="">加载中…</option>';
+    try {
+      const value = await rpc("session.models", { providerId: providerSelect.value });
+      const models = (value.groups || []).flatMap(g => (g.models || []).map(m => ({ ...m, providerName: g.name })));
+      modelSelect.innerHTML = models.map(m => `<option value="${escapeHtml(m.model || m.id)}">${escapeHtml(m.name || m.id)}</option>`).join("")
+        || '<option value="">（该服务暂无模型目录）</option>';
+    } catch (error) {
+      modelSelect.innerHTML = `<option value="">（读取失败：${escapeHtml(error.message)}）</option>`;
+    }
+  });
+  // 初次进入时若默认服务不是当前服务，也拉一份目录（不覆盖已保存的选择文案）
+  if (providerSelect.value && providerSelect.value !== (state.modelSelection?.provider || "")) {
+    if (!state.modelSelection?.model) providerSelect.dispatchEvent(new Event("change"));
+    else modelSelect.innerHTML = `<option value="${escapeHtml(state.modelSelection.model)}" selected>${escapeHtml(state.modelSelection.model)}</option>`;
+  } else if (state.modelSelection?.model) {
+    modelSelect.innerHTML = `<option value="${escapeHtml(state.modelSelection.model)}" selected>${escapeHtml(state.modelSelection.model)}</option>`;
+  }
+}
+
+async function saveModelDefaults() {
+  try {
+    const provider = $("#defaultProviderSelect")?.value || "";
+    const model = $("#defaultModelSelect")?.value || "";
+    const reasoningEffort = $("#defaultEffortSelect")?.value || null;
+    if (!provider || !model) { toast("请选择默认服务和默认模型", true); return; }
+    await persistModelSelection({ provider, model, reasoningEffort });
+    toast(`新会话默认已保存 · ${model}`);
+    loadSettings("models");
+  } catch (error) { toast(error.message, true); }
 }
 
 // --- Skills 管理（Codex 原生 skills/list + skills/config/write）--------------
@@ -4597,6 +4707,10 @@ function bindEvents() {
   $("#providerNewButton")?.addEventListener("click", () => openProviderForm(null));
   $("#providerListDone")?.addEventListener("click", () => $("#providerDialog")?.close());
   $("#providerEditCancel")?.addEventListener("click", showProviderList);
+  document.addEventListener("click", event => {
+    if (event.target.closest("[data-save-model-defaults]")) { saveModelDefaults(); return; }
+    if (event.target.closest("[data-pin-model-default]")) { pinCurrentSelectionAsDefault(); }
+  });
   $("#providerForm")?.addEventListener("submit", saveProvider);
   $("#providerModelAdd")?.addEventListener("click", () => addProviderModelRow());
   $("#providerPresetSelect")?.addEventListener("change", applyProviderPreset);
@@ -4900,6 +5014,7 @@ function updateModelSummary() {
   if (!model && state.host) model = state.host.model || "";
   let effort = current.reasoningEffort || selected?.reasoning?.defaultEffort || current.reasoning?.defaultEffort || "";
   const parts = [];
+  if (!state.sessionId) parts.push("新会话");
   if (provider) parts.push(String(provider));
   if (model) parts.push(String(model));
   if (effort) parts.push(String(effort)[0].toUpperCase() + String(effort).slice(1));
