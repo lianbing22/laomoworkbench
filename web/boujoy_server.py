@@ -2021,7 +2021,8 @@ class BoujoyHandler(BaseHTTPRequestHandler):
                           "CAPABILITY_UNAVAILABLE": 501,
                           "POSTCONDITION_FAILED": 502,
                           "invalid-argument": 400,
-                          "invalid-name": 400}.get(exc.code, 400)
+                          "invalid-name": 400,
+                          "market-not-git": 400}.get(exc.code, 400)
                 self._json({"ok": False, "code": exc.code, "error": str(exc)},
                            status=status)
             except (json.JSONDecodeError, ValueError) as exc:

@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "web"))
 
@@ -175,6 +177,51 @@ class TestInventory(unittest.TestCase):
         inv = ExtensionService(t)._plugins.inventory(None)
         self.assertEqual(inv["marketplaces"][0]["kind"], "remote")
 
+    def test_plugin_views_use_marketplace_manifest_path(self):
+        manifest = "/fake/runtime/.agents/plugins/marketplace.json"
+        t = FakeTransport({
+            "plugin/list": plugin_list_response([
+                marketplace("local-a", [summary("docs@local-a", "documents", "local-a",
+                                                  installed=True)], path=manifest),
+            ]),
+            "plugin/installed": plugin_list_response([
+                marketplace("local-a", [summary("docs@local-a", "documents", "local-a",
+                                                  installed=True)], path=manifest),
+            ]),
+        })
+        inv = ExtensionService(t)._plugins.inventory(None)
+        self.assertEqual(
+            inv["marketplaces"][0]["plugins"][0]["marketplacePath"], manifest)
+        self.assertEqual(
+            inv["installed"][0]["plugins"][0]["marketplacePath"], manifest)
+
+    def test_git_marketplace_exposes_mutation_capabilities_only_for_git(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            git_root = root / "git-market"
+            local_root = root / "bundled-market"
+            for item in (git_root, local_root):
+                (item / ".agents" / "plugins").mkdir(parents=True)
+                (item / ".agents" / "plugins" / "marketplace.json").touch()
+            (git_root / ".git").mkdir()
+            mps = [
+                marketplace("git-market", [],
+                            path=str(git_root / ".agents/plugins/marketplace.json")),
+                marketplace("bundled-market", [],
+                            path=str(local_root / ".agents/plugins/marketplace.json")),
+            ]
+            t = FakeTransport({
+                "plugin/list": plugin_list_response(mps),
+                "plugin/installed": plugin_list_response([]),
+            })
+            rows = ExtensionService(t)._plugins.inventory(None)["marketplaces"]
+            self.assertTrue(rows[0]["canUpgrade"])
+            self.assertTrue(rows[0]["canRemove"])
+            self.assertEqual(rows[0]["sourceKind"], "git")
+            self.assertFalse(rows[1]["canUpgrade"])
+            self.assertFalse(rows[1]["canRemove"])
+            self.assertEqual(rows[1]["sourceKind"], "local")
+
 
 class TestPluginMutationPostcondition(unittest.TestCase):
     def _transport(self, installed_before, installed_after):
@@ -273,6 +320,21 @@ class TestMarketplaceMutation(unittest.TestCase):
         with self.assertRaises(ExtensionError) as ctx:
             ExtensionService(t).market_upgrade("x")
         self.assertEqual(ctx.exception.code, "upgrade-failed")
+
+    def test_upgrade_rejects_existing_non_git_marketplace_before_rpc(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = Path(tmp) / ".agents" / "plugins" / "marketplace.json"
+            manifest.parent.mkdir(parents=True)
+            manifest.touch()
+            t = FakeTransport({
+                "plugin/list": plugin_list_response([
+                    marketplace("bundled", [], path=str(manifest)),
+                ]),
+            })
+            with self.assertRaises(ExtensionError) as ctx:
+                ExtensionService(t).market_upgrade("bundled")
+            self.assertEqual(ctx.exception.code, "market-not-git")
+            self.assertNotIn("marketplace/upgrade", [c["method"] for c in t.calls])
 
 
 class TestPluginDetail(unittest.TestCase):

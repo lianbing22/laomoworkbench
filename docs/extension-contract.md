@@ -60,6 +60,8 @@ plugin/read 返回的 `hooks/apps/mcpServers/scheduledTasks` 数量 +
 - `openai-bundled`（local，path 有）：9 插件
 - `openai-curated-remote`（**remote，无 path**）：3073 插件——`plugin/read`
   对它必须传 `remoteMarketplaceName: "openai-curated-remote"`
+- `marketplace/upgrade` / `marketplace/remove` 只适用于 Git-backed marketplace；
+  Codex 内置 local 源和 remote 目录是只读目录，调用前必须先做能力判断。
 - `plugin/list` 不传 `cwds` 只看 home-scope；**必须**传 active workspace cwd
   才能发现 repo marketplace（workspace-aware）
 

@@ -2739,10 +2739,12 @@ function renderMission() {
   const card = $("#signalCard");
   const view = $("#missionView");
   const kicker = $("#signalKicker");
+  const inline = $("#missionInlinePanel");
   if (!card || !view) return;
   const mission = state.mission;
   if (!mission) {
     card.classList.remove("has-mission");
+    inline?.classList.add("hidden");
     if (kicker) kicker.textContent = "当前目标";
     state.missionElapsedBase = null;
     return;
@@ -2750,6 +2752,7 @@ function renderMission() {
   card.classList.add("has-mission");
   if (kicker) kicker.textContent = "MISSION LOOP";
   const detail = state.missionDetail?.id === mission.id ? state.missionDetail : null;
+  const phaseLabel = MISSION_PHASE_LABELS[mission.state] || mission.state || "未知";
   $("#missionPhase").textContent = MISSION_PHASE_LABELS[mission.state] || mission.state || "未知";
   $("#missionPhase").className = `mission-phase ${MISSION_PHASE_TONES[mission.state] || "tone-muted"}`;
   const chips = [`循环 ${Number(mission.cycles) || 0}`];
@@ -2758,6 +2761,14 @@ function renderMission() {
   $("#missionCycles").textContent = chips.join(" · ");
   $("#missionObjective").textContent = mission.objective || "（未填写目标）";
   const task = missionCurrentTaskText(mission, detail);
+  if (inline) {
+    inline.classList.remove("hidden");
+    $("#missionInlinePhase").textContent = phaseLabel;
+    $("#missionInlineCycles").textContent = chips.join(" · ");
+    $("#missionInlineElapsed").textContent = missionElapsedText(mission);
+    $("#missionInlineObjective").textContent = mission.objective || "（未填写目标）";
+    $("#missionInlineTask").textContent = task || "等待当前单元开始";
+  }
   $("#missionTaskRow").classList.toggle("hidden", !task);
   $("#missionTask").textContent = task || "—";
   const waiting = mission.waiting && (mission.waiting.command || mission.waiting.jobId) ? mission.waiting : null;
@@ -4343,11 +4354,22 @@ function extBusyKey(kind, id) { return `${kind}:${id}`; }
 
 function extIsBusy(key) { return ext.busy.has(key); }
 
+function extErrorMessage(err) {
+  const raw = String(err && err.message ? err.message : err || "操作失败");
+  if (/not configured as a Git marketplace|不是 Git.*市场源|market-not-git/i.test(raw)) {
+    return "该市场源不是 Git marketplace，不能升级或移除。";
+  }
+  if (/Is a directory|failed to read marketplace file/i.test(raw)) {
+    return "插件来源路径无效：需要 marketplace.json，而不是插件目录。请先刷新扩展列表。";
+  }
+  return raw;
+}
+
 function extWithBusy(key, button, work) {
   if (ext.busy.has(key)) return;
   ext.busy.add(key);
   if (button) { button.disabled = true; button.dataset.label = button.textContent; button.textContent = "…"; }
-  work().catch(err => toast(err && err.message ? err.message : "操作失败", true))
+  work().catch(err => toast(extErrorMessage(err), true))
     .finally(() => {
       ext.busy.delete(key);
       if (button) { button.disabled = false; if (button.dataset.label) button.textContent = button.dataset.label; }
@@ -4451,16 +4473,17 @@ function renderExtMarkets(pluginsBlock) {
   el.innerHTML = extCapRow("markets", pluginsBlock, () => {
     const mps = pluginsBlock.marketplaces || [];
     if (!mps.length) return `<p class="muted">尚未添加任何市场源。</p>`;
+    const sourceLabels = { git: "Git", local: "本地内置", remote: "远程目录" };
     return mps.map(mp => `
       <div class="ext-card" data-market="${escapeHtml(mp.name)}">
         <div class="ext-card-main">
           <b>${escapeHtml(mp.name)}</b>
-          <span class="ext-badge ${mp.kind === "remote" ? "" : "on"}">${mp.kind === "remote" ? "远程目录" : "本地"}</span>
+          <span class="ext-badge ${mp.sourceKind === "git" ? "on" : ""}">${escapeHtml(sourceLabels[mp.sourceKind] || (mp.kind === "remote" ? "远程目录" : "本地"))}</span>
           ${mp.plugins && mp.plugins.length ? `<small>${mp.plugins.length} 个插件${mp.pluginCount && mp.pluginCount > mp.plugins.length ? `（已截断，共 ${mp.pluginCount}）` : ""}</small>` : ""}
         </div>
         <div class="ext-card-actions">
-          <button class="mini-cut" data-ext-upgrade="${escapeHtml(mp.name)}">升级</button>
-          <button class="mini-cut" data-ext-market-remove="${escapeHtml(mp.name)}">移除</button>
+          ${mp.canUpgrade ? `<button class="mini-cut" data-ext-upgrade="${escapeHtml(mp.name)}">升级</button>` : `<span class="ext-action-note" title="只有 Git marketplace 支持升级">只读</span>`}
+          ${mp.canRemove ? `<button class="mini-cut" data-ext-market-remove="${escapeHtml(mp.name)}">移除</button>` : ""}
         </div>
       </div>`).join("");
   });
@@ -4623,7 +4646,11 @@ function submitMcpSave(event) {
 
 (function initExtensionsPage() {
   $$(".ext-tab").forEach(tab => tab.addEventListener("click", () => {
-    $$(".ext-tab").forEach(t => t.classList.toggle("active", t === tab));
+    $$(".ext-tab").forEach(t => {
+      const active = t === tab;
+      t.classList.toggle("active", active);
+      t.setAttribute("aria-selected", active ? "true" : "false");
+    });
     $$(".ext-tabpanel").forEach(p => p.classList.toggle("hidden", p.id !== `extTab${tab.dataset.extTab === "plugins" ? "Plugins" : tab.dataset.extTab === "markets" ? "Markets" : "Mcp"}`));
   }));
   $("#extRefresh").addEventListener("click", () => loadExtensions(true));
@@ -4674,7 +4701,8 @@ function submitMcpSave(event) {
       });
     }
   });
-  $("#extMarketAddBtn").addEventListener("click", () => {
+  $("#extMarketAddForm").addEventListener("submit", event => {
+    event.preventDefault();
     const source = $("#extMarketSource").value.trim();
     if (!source) return toast("请填写市场源地址", true);
     extWithBusy(extBusyKey("market-add", source), $("#extMarketAddBtn"), async () => {

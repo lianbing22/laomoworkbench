@@ -6,6 +6,7 @@ docs/extension-contract.md.
 from __future__ import annotations
 
 import time
+from pathlib import Path
 from typing import Any, Callable
 
 from .models import (CapabilityUnavailable, ExtensionError, PostconditionFailed,
@@ -21,6 +22,27 @@ _UPSTREAM_UNKNOWN_HINTS = ("unknown variant", "unknown method", "unrecognized")
 
 def _is_capability_error(exc: BaseException) -> bool:
     return any(h in str(exc) for h in _UPSTREAM_UNKNOWN_HINTS)
+
+
+def _is_git_marketplace(path: str | None) -> bool:
+    """Return whether a marketplace manifest belongs to a Git checkout.
+
+    Codex exposes local bundled/runtime marketplaces with the same shape as
+    user-added marketplaces, but marketplace/upgrade only accepts the latter
+    when their checkout is Git-backed. The RPC response does not expose that
+    distinction, so inspect the manifest's repository root without touching
+    or modifying it.
+    """
+    if not path:
+        return False
+    try:
+        manifest = Path(path).expanduser()
+        # <root>/.agents/plugins/marketplace.json
+        root = manifest.parent.parent.parent
+        marker = root / ".git"
+        return marker.is_dir() or marker.is_file()
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return False
 
 
 class CodexPluginClient:
@@ -92,17 +114,27 @@ class CodexPluginClient:
         marketplaces: list[dict[str, Any]] = []
         available_by_name: dict[str, dict[str, Any]] = {}
         for mp in (available.get("marketplaces") or []):
+            marketplace_path = mp.get("path")
+            is_git = _is_git_marketplace(marketplace_path)
             entry = {
                 "name": mp.get("name"),
                 "kind": "remote" if not mp.get("path") else "local",
-                "path": mp.get("path"),
+                "path": marketplace_path,
                 "interface": mp.get("interface"),
+                "sourceKind": "git" if is_git else ("remote" if not marketplace_path else "local"),
+                "canUpgrade": is_git,
+                "canRemove": is_git,
                 "plugins": [],
             }
             available_by_name[str(mp.get("name"))] = entry
             for summary in (mp.get("plugins") or []):
                 enriched = dict(summary)
                 enriched["_marketplace"] = mp.get("name")
+                # plugin/read and plugin/install require the marketplace
+                # manifest, not PluginSummary.source.path (the plugin
+                # directory). Keeping this at marketplace aggregation time
+                # also fixes installed rows, whose summary has the same trap.
+                enriched["_marketplacePath"] = marketplace_path
                 enriched["_canonicalId"] = plugin_canonical_id(enriched)
                 entry["plugins"].append(self._plugin_view(enriched))
             marketplaces.append(entry)
@@ -110,11 +142,13 @@ class CodexPluginClient:
         installed_marketplaces: list[dict[str, Any]] = []
         for mp in (installed.get("marketplaces") or []):
             entry = {"name": mp.get("name"), "plugins": []}
+            marketplace_path = mp.get("path")
             for summary in (mp.get("plugins") or []):
                 if not summary.get("installed"):
                     continue
                 enriched = dict(summary)
                 enriched["_marketplace"] = mp.get("name")
+                enriched["_marketplacePath"] = marketplace_path
                 try:
                     cid = plugin_canonical_id(enriched)
                 except ExtensionError:
@@ -135,6 +169,9 @@ class CodexPluginClient:
 
     def _plugin_view(self, summary: dict[str, Any]) -> dict[str, Any]:
         canonical = summary.get("_canonicalId") or plugin_canonical_id(summary)
+        # The marketplace path is authoritative. The old source.path fallback
+        # pointed at <marketplace>/plugins/<name>, which makes plugin/read
+        # fail with "Is a directory" for installed local plugins.
         return {
             "id": canonical,
             "name": summary.get("name"),
@@ -148,8 +185,7 @@ class CodexPluginClient:
             "mustShowInstallationInterstitial":
                 bool(summary.get("mustShowInstallationInterstitial")),
             "description": ((summary.get("interface") or {}) or {}).get("shortDescription"),
-            "marketplacePath": (summary.get("source") or {}).get("path")
-                if (summary.get("source") or {}).get("type") == "local" else None,
+            "marketplacePath": summary.get("_marketplacePath"),
         }
 
     # -- mutations (postcondition-verified) ----------------------------------
@@ -253,6 +289,7 @@ class CodexPluginClient:
                 "installedRoot": result.get("installedRoot")}
 
     def market_remove(self, marketplace_name: str) -> dict[str, Any]:
+        self._assert_git_marketplace(marketplace_name, "移除")
         self._rpc("marketplace/remove", {"marketplaceName": marketplace_name},
                   timeout=60.0)
         listing = self.list_marketplaces(None)
@@ -269,6 +306,8 @@ class CodexPluginClient:
         re-verify against, so we validate the upstream's own result (errors
         empty, or upgradedRoots non-empty) instead of WRITE->REFETCH->VERIFY.
         docs/extension-contract.md states this distinction explicitly."""
+        if marketplace_name:
+            self._assert_git_marketplace(marketplace_name, "升级")
         params: dict[str, Any] = {}
         if marketplace_name:
             params["marketplaceName"] = marketplace_name
@@ -280,3 +319,28 @@ class CodexPluginClient:
         return {"upgradedRoots": result.get("upgradedRoots") or [],
                 "selected": result.get("selectedMarketplaces") or [],
                 "errors": errors}
+
+    def _assert_git_marketplace(self, marketplace_name: str, operation: str) -> None:
+        """Avoid sending a known non-Git marketplace to a Git-only RPC.
+
+        Missing paths in test doubles or a concurrently removed marketplace
+        are left to upstream, but an existing local manifest and a known
+        remote marketplace are safe to classify before mutation.
+        """
+        listing = self.list_marketplaces(None)
+        target = next((mp for mp in (listing.get("marketplaces") or [])
+                       if mp.get("name") == marketplace_name), None)
+        if target is None:
+            return
+        path = target.get("path")
+        path_exists = False
+        if path:
+            try:
+                path_exists = Path(path).expanduser().exists()
+            except (OSError, RuntimeError, TypeError, ValueError):
+                path_exists = False
+        if not path or path_exists:
+            if not _is_git_marketplace(path):
+                raise ExtensionError(
+                    f"市场源 {marketplace_name} 不是 Git marketplace，不能{operation}",
+                    "market-not-git")

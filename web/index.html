@@ -5,8 +5,30 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="color-scheme" content="dark light">
   <title>老墨工作台</title>
+  <script>
+    /* Theme bootstrap (vanilla port of next-themes' no-flash script): resolve
+       the saved mode → data-theme before first paint so light users never see
+       a dark frame. data-theme holds the RESOLVED theme; app.js's theme module
+       owns everything after boot. The html[data-theme="dark"] above stays as
+       the no-JS fallback. Brand default is dark: the OS only pulls light when
+       it explicitly prefers light. */
+    (function () {
+      var mode = "system";
+      try {
+        var saved = localStorage.getItem("boujoy-theme");
+        mode = saved === "system" || saved === "light" || saved === "dark" ? saved : "system";
+      } catch (_) { /* storage blocked: stay on system */ }
+      var resolved = mode !== "system" ? mode
+        : window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+      var root = document.documentElement;
+      root.dataset.theme = resolved;
+      root.style.colorScheme = resolved;
+      var meta = document.querySelector('meta[name="theme-color"]');
+      if (meta) meta.setAttribute("content", resolved === "light" ? "#f1eadc" : "#080a0d");
+    })();
+  </script>
   <link rel="manifest" href="manifest.json">
-  <meta name="theme-color" content="#0a0a12">
+  <meta name="theme-color" content="#080a0d">
   <link rel="icon" type="image/png" sizes="192x192" href="icon-192.png">
   <link rel="apple-touch-icon" href="icon-192.png">
   <link rel="stylesheet" href="app.css">
@@ -125,6 +147,17 @@
             <div id="runState" class="run-state idle"><i></i><span>待命</span></div>
           </div>
           <div id="thinkingStatus" class="thinking-status" aria-live="polite"><b>THINKING</b><span>分析上下文 → 核对约束 → 选择下一步</span></div>
+
+          <section id="missionInlinePanel" class="mission-inline-panel hidden" aria-live="polite" aria-label="当前 Mission 状态">
+            <div class="mission-inline-head">
+              <div class="mission-inline-title"><span>MISSION LOOP</span><strong id="missionInlinePhase">—</strong></div>
+              <div class="mission-inline-stats"><span id="missionInlineCycles">循环 0</span><span id="missionInlineElapsed">—</span></div>
+            </div>
+            <div class="mission-inline-body">
+              <strong id="missionInlineObjective">—</strong>
+              <div><span>当前任务</span><b id="missionInlineTask">—</b></div>
+            </div>
+          </section>
 
           <div id="emptyAgent" class="empty-agent">
             <div class="burst" aria-hidden="true">✦</div>
@@ -296,7 +329,7 @@
 
       <section id="extensionsPage" class="page page-extensions" data-page-panel="extensions">
         <div class="ext-hero">
-          <div><p class="section-kicker">EXTENSIONS / 07</p><h2>扩展</h2><p>插件、市场源与 MCP 全部使用 Codex 原生能力。老墨不托管、不审核第三方插件——安装即信任其 Skills / Hooks / MCP 等全部能力。</p></div>
+          <div><p class="section-kicker">EXTENSIONS / 07</p><h2>扩展</h2><p>浏览、安装和管理 Codex 插件、marketplace 与 MCP。第三方插件会在安装前展示能力与风险。</p></div>
           <div class="ext-actions"><button id="extRefresh" class="mini-cut">↻ 刷新</button><span id="extUpdated" class="news-updated">—</span></div>
         </div>
         <div id="extUnavailable" class="ext-unavailable hidden">
@@ -304,31 +337,32 @@
         </div>
         <div id="extBody">
           <div class="ext-tabs" role="tablist">
-            <button class="ext-tab active" data-ext-tab="plugins" role="tab">插件</button>
-            <button class="ext-tab" data-ext-tab="markets" role="tab">市场源</button>
-            <button class="ext-tab" data-ext-tab="mcp" role="tab">MCP</button>
+            <button id="extTabPluginsButton" class="ext-tab active" data-ext-tab="plugins" role="tab" aria-selected="true" aria-controls="extTabPlugins">插件</button>
+            <button id="extTabMarketsButton" class="ext-tab" data-ext-tab="markets" role="tab" aria-selected="false" aria-controls="extTabMarkets">市场源</button>
+            <button id="extTabMcpButton" class="ext-tab" data-ext-tab="mcp" role="tab" aria-selected="false" aria-controls="extTabMcp">MCP</button>
           </div>
 
-          <div id="extTabPlugins" class="ext-tabpanel">
+          <div id="extTabPlugins" class="ext-tabpanel" role="tabpanel" aria-labelledby="extTabPluginsButton">
             <div class="ext-subhead"><h3>已安装</h3><span id="extInstalledCount" class="ext-count">0</span></div>
             <div id="extInstalledList" class="ext-plugin-list"><p class="muted">读取中…</p></div>
             <div class="ext-subhead"><h3>可安装</h3><span id="extAvailableCount" class="ext-count">0</span></div>
             <div id="extAvailableList" class="ext-plugin-list"><p class="muted">读取中…</p></div>
           </div>
 
-          <div id="extTabMarkets" class="ext-tabpanel hidden">
+          <div id="extTabMarkets" class="ext-tabpanel hidden" role="tabpanel" aria-labelledby="extTabMarketsButton">
             <div class="ext-subhead">
               <h3>市场源</h3>
-              <div class="ext-market-add">
-                <input id="extMarketSource" type="text" placeholder="git URL 或本地路径" spellcheck="false">
-                <input id="extMarketRef" type="text" placeholder="名称（可选）" spellcheck="false">
-                <button id="extMarketAddBtn" class="mini-cut">添加市场源</button>
-              </div>
+              <form id="extMarketAddForm" class="ext-market-add">
+                <input id="extMarketSource" type="text" placeholder="Git URL 或本地路径" aria-label="Git URL 或本地路径" spellcheck="false" required>
+                <input id="extMarketRef" type="text" placeholder="分支 / tag（可选）" aria-label="分支或 tag" spellcheck="false">
+                <button id="extMarketAddBtn" type="submit" class="mini-cut">添加市场源</button>
+              </form>
             </div>
+            <p class="ext-note">只有 Git marketplace 支持升级和移除；Codex 内置源、远程目录会以只读方式展示。</p>
             <div id="extMarketList" class="ext-market-list"><p class="muted">读取中…</p></div>
           </div>
 
-          <div id="extTabMcp" class="ext-tabpanel hidden">
+          <div id="extTabMcp" class="ext-tabpanel hidden" role="tabpanel" aria-labelledby="extTabMcpButton">
             <div class="ext-subhead">
               <h3>MCP 服务器</h3>
               <button id="extMcpAddBtn" class="mini-cut">＋ 新建 MCP</button>
