@@ -1,0 +1,13 @@
+{
+  "project": "#3 wisp (refactor/fix + tests nature)",
+  "repo": "/Users/lianb/Documents/wisp",
+  "preDogfoodHead": "4b2e892",
+  "preDogfoodBranch": "main",
+  "preDogfoodPorcelain": ["M Sources/Wisp/App/AppDelegate.swift", "M Sources/Wisp/App/HotkeyMonitor.swift", "M Sources/Wisp/UI/OnboardingWindow.swift", "M scripts/make-app.sh"],
+  "baselineTests": "139 passed via make test (19s COLD from clean git archive — gate-compatible)",
+  "verificationCommand": "make test",
+  "verificationSetupBurden": "LOW",
+  "burdenReason": "make test 是项目自有命令，冷构建实测 19s，远低于 120s 机器门禁；dev-env.sh 自愈 CLT 问题且只写 ~/.cache/wisp",
+  "knownRisk": "unit evaluator 只读沙箱无法跑 swift test（需写 .build）；machine gate 承担真实执行验证——正好检验 verification-centered 设计",
+  "userWIPConstraint": "4 个脏文件区域列入禁触名单"
+}

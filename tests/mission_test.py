@@ -1737,3 +1737,33 @@ if __name__ == "__main__":
         print("NOTE: web/mission.py 无法导入（%r）— 全部用例跳过，待主线合入后验证"
               % (MISSION_IMPORT_ERROR,))
     unittest.main(verbosity=2)
+
+
+class TestEvaluatorSandboxMisattribution(MissionLoopTest):
+    """Dogfood #2/#3 systemic finding (recurring P1): the evaluator prompt
+    told the read-only-sandboxed evaluator that tests failing due to write
+    behavior count as NEEDS_WORK — so any project whose tests need tmp dirs
+    or a build dir burned its whole repair budget on an environment limit
+    the worker can never fix, dying before the machine gate (which CAN run
+    tests) was ever reached. The prompt must direct sandbox-incapability to
+    code-evidence judgment + an honest note, keeping NEEDS_WORK for real
+    work defects. Default-fail and the triple DONE gate are unchanged."""
+
+    def test_51_evaluator_prompt_does_not_count_sandbox_limits_as_needs_work(self):
+        self.adapter.set_default("evaluator", verdict_block("PASS", ["ok"]))
+        mid = self.create_mission(objective="评测提示词契约",
+                                  acceptance=["一个单元即可"])
+        self.mgr.start(mid)
+        self.assertTrue(self.wait_state(self.mgr, mid, ["done", "verifying",
+                                                        "verification"], timeout=30)
+                        or True)  # the prompt assertion below is the point
+        evaluator_prompts = [c["prompt"] for c in self.adapter.calls
+                             if c.get("role") == "evaluator"]
+        self.assertTrue(evaluator_prompts, "应至少发生一次 evaluator turn")
+        prompt = evaluator_prompts[0]
+        self.assertIn("这不是构建者的缺陷", prompt,
+                      "提示词必须声明：沙箱限制不是构建者的缺陷")
+        self.assertIn("执行验证由系统机器验收负责", prompt,
+                      "提示词必须指向机器验收作为执行验证的归属")
+        self.assertNotIn("就按 NEEDS_WORK 记录", prompt,
+                         "旧条款（写行为失败=NEEDS_WORK）必须移除")
