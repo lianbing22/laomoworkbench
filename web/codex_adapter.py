@@ -975,6 +975,23 @@ class CodexRuntimeAdapter:
                 raise AdapterUnavailable(f"codex runtime not ready: {proc.status}")
             return proc
 
+    def _runtime_busy(self) -> bool:
+        """True while ANY turn is in flight — chat sessions AND mission unit
+        turns. Dogfood #3: a deferred provider restart checked only the
+        chat-session running flags, saw idle, and stopped codex mid-way
+        through a mission evaluator turn (unit CRASH, mission failed). The
+        Gate F _active_turns registry is the authoritative in-flight signal;
+    both checks must consult it."""
+        if any(s.get("running") for s in self.registry._sessions.values()):
+            return True
+        with self._turns_lock:
+            for reg in self._active_turns.values():
+                done = reg.get("done")
+                finished = done.is_set() if hasattr(done, "is_set") else bool(done)
+                if not finished:
+                    return True
+            return False
+
     def note_provider_change(self) -> None:
         """Provider secret/config changed: restart the codex subprocess when
         it is safe (no active turns). Running work is never killed silently."""
@@ -982,7 +999,7 @@ class CodexRuntimeAdapter:
             proc = self.process
             if proc is None:
                 return
-            if any_running := any(s.get("running") for s in self.registry._sessions.values()):
+            if self._runtime_busy():
                 self._pending_restart = True
                 self._debug_log("provider change deferred: active turns running")
                 return
@@ -993,7 +1010,7 @@ class CodexRuntimeAdapter:
     def _maybe_apply_pending_restart(self) -> None:
         if not self._pending_restart:
             return
-        if any(s.get("running") for s in self.registry._sessions.values()):
+        if self._runtime_busy():
             return
         self._pending_restart = False
         with self._proc_lock:

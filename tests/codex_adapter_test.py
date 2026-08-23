@@ -525,3 +525,63 @@ class TestAdapterStatics(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestProviderRestartMissionSafety(unittest.TestCase):
+    """Dogfood #3 retry crash: a deferred provider restart checked only the
+    chat-session running flags, saw idle, and stopped codex mid-way through
+    a mission evaluator turn — unit CRASH, mission failed. The busy check
+    must also consult the Gate F _active_turns registry (mission turns)."""
+
+    def _adapter(self):
+        adapter = CodexRuntimeAdapter.__new__(CodexRuntimeAdapter)  # no process
+        adapter._pending_restart = False
+        adapter._active_turns = {}
+        import threading
+        adapter._turns_lock = threading.Lock()
+        adapter._proc_lock = threading.Lock()
+        adapter.registry = SessionRegistry()
+        adapter.process = None
+        adapter._debug_sink = lambda msg: None
+        return adapter
+
+    def test_pending_restart_deferred_while_mission_turn_in_flight(self):
+        import threading
+        adapter = self._adapter()
+        stopped = []
+        fake_proc = types.SimpleNamespace(status="ready", stop=lambda: stopped.append(1))
+        adapter.process = fake_proc
+        adapter._pending_restart = True
+        # a mission unit turn is registered (Event not yet set) while the
+        # chat-session registry is completely idle
+        done = threading.Event()
+        with adapter._turns_lock:
+            adapter._active_turns["t-mission"] = {"threadId": "t-mission",
+                                                  "turnId": "turn-1",
+                                                  "done": done, "startedAt": 0}
+        adapter._maybe_apply_pending_restart()
+        self.assertEqual(stopped, [], "mission turn in flight: restart must defer")
+        self.assertTrue(adapter._pending_restart)
+        # turn finishes -> restart may apply
+        done.set()
+        adapter._maybe_apply_pending_restart()
+        self.assertEqual(stopped, [1], "idle runtime: restart should apply")
+        self.assertFalse(adapter._pending_restart)
+
+    def test_note_provider_change_defers_with_mission_turn(self):
+        import threading
+        adapter = self._adapter()
+        stopped = []
+        fake_proc = types.SimpleNamespace(status="ready", stop=lambda: stopped.append(1))
+        adapter.process = fake_proc
+        done = threading.Event()
+        with adapter._turns_lock:
+            adapter._active_turns["t2"] = {"threadId": "t2", "turnId": "x",
+                                           "done": done, "startedAt": 0}
+        adapter.note_provider_change()
+        self.assertEqual(stopped, [], "mission turn active: change must defer")
+        self.assertTrue(adapter._pending_restart)
+
+    def test_runtime_busy_false_when_registry_and_turns_idle(self):
+        adapter = self._adapter()
+        self.assertFalse(adapter._runtime_busy())
